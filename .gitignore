@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+.venv/
+# test results and technical logs (the folders stay, the content is not committed)
+logs/*
+!logs/.gitkeep
+.logs/*
+!.logs/README.txt

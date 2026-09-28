@@ -1,0 +1,900 @@
+"""Command line: arguments, interactive questions and building the test."""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import shutil
+import sys
+import time
+from typing import Callable, Optional
+
+import secrets
+from pathlib import Path
+
+from . import background, compare, debuglog, parallel, series
+from .kube import Kubectl, KubectlError
+from .models import (COOLDOWN_DEFAULT, COOLDOWN_MAX, DEFAULT_MAX_TEMP, MASTER_CPU_CAP,
+                     MAX_MAX_TEMP, MAX_NODE_BUSY_PCT, MIN_MAX_TEMP, MIN_STEP_TIME,
+                     PROFILE_CLASSIC, PROFILE_STEPPED, STEP_TIME_DEFAULT, STEPS_DEFAULT,
+                     StressConfig)
+from .parsing import (describe_duration, describe_steps, format_workload, parse_duration,
+                      parse_steps)
+from .paths import make_private_dir, user_log_dir
+from .runner import EXIT_ERROR, RunnerError, StressRunner
+
+YES = {"y", "yes"}
+log = logging.getLogger(__name__)
+
+
+def duration_arg(text: str) -> int:
+    try:
+        return parse_duration(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+
+
+def steps_arg(text: str) -> tuple[int, ...]:
+    try:
+        return parse_steps(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+
+
+def cooldown_arg(text: str) -> int:
+    """Cooldown duration: 0 (off), seconds or 30s, 1m."""
+    if text.strip().lower() in ("0", "0s", "0m"):
+        return 0
+    try:
+        return parse_duration(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+
+
+def schedule_arg(text: str) -> float:
+    """When to start the test: 'HH:MM' (the nearest occurrence, today/tomorrow) or a duration from now (30m, 2h)."""
+    text = text.strip()
+    now = time.time()
+    if ":" in text:
+        hh_txt, _, mm_txt = text.partition(":")
+        try:
+            hh, mm = int(hh_txt), int(mm_txt)
+        except ValueError:
+            raise argparse.ArgumentTypeError("Enter the time as HH:MM (e.g. 22:30) or a duration "
+                                             "from now (e.g. 30m, 2h).")
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            raise argparse.ArgumentTypeError("Invalid time, use HH:MM (0-23:0-59).")
+        t = time.localtime(now)
+        target = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hh, mm, 0, 0, 0, -1))
+        if target <= now:
+            target += 86400                        # already passed today -> tomorrow
+        return target
+    try:
+        delay = parse_duration(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+    return now + delay
+
+
+QUICK_DURATION = 600       # s, duration of the quick test (--quick)
+
+HELP_EPILOG = """\
+examples:
+  ./stress.sh --quick                          quick test: pick a node and it runs right away
+  ./stress.sh --quick --workers                quick test of all workers one after another
+  ./stress.sh                                  interactively: asks what and how to test
+  ./stress.sh --node dell-9020-sff-i7 --time 10m
+                                               one node, 10 minutes, full CPU load
+  ./stress.sh --workers --parallel --time 20m  all workers at once
+  ./stress.sh --cluster --profile stepped      the whole cluster one after another, gradually 25-100 %
+  ./stress.sh --node hp-g2-celeron --time 1h -b
+                                               in the background (survives closing the terminal)
+  ./stress.sh --status                         what is running right now
+  ./stress.sh --stop hp-g2-celeron             stop a test running in the background
+  ./stress.sh --compare dell-9020-sff-i7       compare the two latest tests of a node
+  ./stress.sh --list-nodes                     list the cluster's nodes and exit
+  ./stress.sh --node dell-9020-sff-i7 --time 10m --dry-run
+                                               show the test settings, start nothing
+  ./stress.sh --node dell-9020-sff-i7 --time 20m --schedule 22:30 -b
+                                               start today at 22:30, in the background
+  ./stress.sh --node dell-9020-sff-i7 --time 10m --allow-busy-node
+                                               start even on a node the preflight finds busy
+
+preflight (checks before EVERY test, including --quick):
+  1) another test of this tool on the same node -> always refused (cannot be turned off)
+  2) node usage (kubectl top, CPU/RAM) above --max-busy-pct -> --allow-busy-node / --no-capacity-check
+  3) CPU temperature above --max-temp already BEFORE the load -> let the node cool down, or
+     --allow-no-sensor only handles a missing sensor, not a high temperature
+
+language (root ~/cluster-testing/stress.sh only):
+  --cz / --eng as the FIRST switch, or the variable STRESS_LANG=CZ|ENG (default CZ)
+
+environment variables:
+  FORCE=1        same as --force
+  KUBECTL=path   a kubectl other than the one in PATH
+
+durations are given as seconds or 30s, 5m, 1h, 1h30m.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="./stress.sh",
+        usage="%(prog)s [options]      (no options = interactive)",
+        description="Stress test of a node in a k3s/Kubernetes cluster (CPU, RAM, disk)\n"
+                    "with temperature measurement and automatic stop on overheating.",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False)
+
+    g = p.add_argument_group("quick test")
+    g.add_argument("-q", "--quick", action="store_true",
+                   help=f"asks only for the node and starts right away: {describe_duration(QUICK_DURATION)}, "
+                        f"CPU 100 %%, no RAM or disk, limit {DEFAULT_MAX_TEMP} °C, cooldown "
+                        f"{describe_duration(COOLDOWN_DEFAULT)}, logged. Can be combined with "
+                        f"--node / --workers / --cluster / --nodes; other options override the values. "
+                        f"A preflight check always runs before the start (even with --quick): another "
+                        f"test on the node, node usage (--max-busy-pct, default {MAX_NODE_BUSY_PCT} %%) "
+                        f"and CPU temperature (--max-temp) - see the 'safety' group")
+
+    g = p.add_argument_group("what to test (asks if not given)")
+    g.add_argument("--node", metavar="NODE", help="one node")
+    g.add_argument("--workers", action="store_true",
+                   help="all workers one after another (without the master)")
+    g.add_argument("--cluster", action="store_true",
+                   help="the whole cluster one after another, master always last (CPU cap "
+                        f"{MASTER_CPU_CAP} %%); always logged")
+    g.add_argument("--nodes", metavar="A,B,C",
+                   help="selected nodes one after another (a master name in the list includes it)")
+    g.add_argument("--include-master", action="store_true",
+                   help="also include the master with --workers; in the stepped test without a question")
+    g.add_argument("--parallel", action=argparse.BooleanOptionalAction, default=None,
+                   help="test workers AT ONCE (each in a subprocess); the master after them, alone. "
+                        "Without the flag it asks interactively, otherwise one after another")
+
+    g = p.add_argument_group("what kind of test")
+    g.add_argument("--time", type=duration_arg, dest="duration", metavar="DURATION",
+                   help="test duration: seconds or 30s, 5m, 1h, 1h30m")
+    g.add_argument("--profile", choices=[PROFILE_CLASSIC, PROFILE_STEPPED], default=None,
+                   help="test type: classic = one load for the whole time (default), "
+                        "stepped = gradually 25/50/75/100 %% (always logged)")
+    g.add_argument("--steps", type=steps_arg, default=None, metavar="LIST",
+                   help=f"stages of the stepped test in %%, e.g. 25,50,75,100 "
+                        f"(default {describe_steps(STEPS_DEFAULT)})")
+    g.add_argument("--step-time", type=duration_arg, default=None, metavar="DURATION",
+                   help=f"length of one stage of the stepped test (default "
+                        f"{describe_duration(STEP_TIME_DEFAULT)}, min {MIN_STEP_TIME} s); "
+                        f"total time = stages x stage time")
+    g.add_argument("--cpu-load", type=int, metavar="%", help="CPU load in %% (default 100)")
+    g.add_argument("--ram-pct", type=int, metavar="%",
+                   help="enables the RAM test: how many %% of FREE memory to allocate")
+    g.add_argument("--hdd", action=argparse.BooleanOptionalAction, default=None,
+                   help="stress the disk")
+    g.add_argument("--cooldown", type=cooldown_arg, default=None, metavar="DURATION",
+                   help=f"after the load ends keep measuring CPU temperature and clock (cooldown): "
+                        f"seconds or 30s, 1m; 0 = off (default {COOLDOWN_DEFAULT} s, "
+                        f"max {COOLDOWN_MAX} s)")
+
+    g = p.add_argument_group("safety")
+    g.add_argument("--max-temp", type=int, metavar="°C",
+                   help=f"CPU temperature to stop at ({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C, "
+                        f"default {DEFAULT_MAX_TEMP}); also checked before the test "
+                        f"(preflight) - if the node is already at this temperature, "
+                        f"the test is refused until it cools down")
+    g.add_argument("--api-limit", type=float, default=3.0, metavar="SEC",
+                   help="when running in parallel: API response (kubectl) slower than this many seconds, or "
+                        "a failure, twice in a row stops all tests (default 3)")
+    g.add_argument("--force", action="store_true",
+                   help="bypass the master protection (or the environment variable FORCE=1)")
+    g.add_argument("--allow-no-sensor", action="store_true",
+                   help="continue even without a CPU temperature sensor")
+    g.add_argument("--max-busy-pct", type=int, default=MAX_NODE_BUSY_PCT, metavar="%",
+                   help="preflight check: if the node is already using this many %% of CPU or "
+                        f"RAM according to 'kubectl top', the test is refused (default "
+                        f"{MAX_NODE_BUSY_PCT})")
+    g.add_argument("--allow-busy-node", action="store_true",
+                   help="continue even on a node that the check above finds already busy")
+    g.add_argument("--no-capacity-check", action="store_true",
+                   help="skip the node usage preflight check entirely")
+
+    g = p.add_argument_group("background run and management")
+    g.add_argument("-b", "--background", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="run the test in the background (survives closing the terminal; logging "
+                        "is turned on automatically). Default: no")
+    g.add_argument("--status", action="store_true",
+                   help="show tests running in the background and the tool's pods in the cluster")
+    g.add_argument("--stop", metavar="ID|NODE|PID",
+                   help="stop a test running in the background (gracefully, cleaning up pods)")
+
+    g = p.add_argument_group("logs and results")
+    g.add_argument("--log", action=argparse.BooleanOptionalAction, default=None,
+                   help="save metrics to a file")
+    g.add_argument("--compare", nargs="+", metavar="LOG|NODE",
+                   help="compare two tests from logs: either two logs (older and newer; path or "
+                        "name in the logs folder), or just a node name (compares its two "
+                        "newest tests)")
+    g.add_argument("--log-dir", default="logs", metavar="DIR",
+                   help="folder with test results (default 'logs' in the project directory "
+                        "python-stress-test, wherever you run it from; a relative path "
+                        "is taken from the project, an absolute one unchanged)")
+    g.add_argument("--notes", metavar="TEXT", help="a note about the test (goes into the log)")
+
+    g = p.add_argument_group("scheduling and information")
+    g.add_argument("--schedule", type=schedule_arg, metavar="TIME",
+                   help="start the test later: HH:MM (the nearest occurrence, today/tomorrow) or "
+                        "a duration from now (30m, 2h); can be combined with -b/--background "
+                        "(will keep running even after closing the terminal)")
+    g.add_argument("--dry-run", action="store_true",
+                   help="just show what would be started (node, test settings) and exit "
+                        "without touching the cluster")
+    g.add_argument("--list-nodes", action="store_true",
+                   help="list the cluster's nodes (role, state) and exit")
+
+    g = p.add_argument_group("other")
+    g.add_argument("-h", "--help", action="help", help="show this help and exit")
+    g.add_argument("-y", "--yes", action="store_true",
+                   help="confirm questions automatically (e.g. for the master)")
+    g.add_argument("--non-interactive", action="store_true",
+                   help="do not ask anything, take missing values from the defaults")
+    g.add_argument("--no-hw", action="store_true",
+                   help="do not detect node hardware (the hw-info pod is not started)")
+    g.add_argument("--hw-privileged", action="store_true",
+                   help="the hw-info pod runs privileged (needed to list RAM modules "
+                        "via dmidecode; default is without privileged)")
+    g.add_argument("--interval", type=float, default=5.0, metavar="SEC",
+                   help="measurement interval in seconds (default 5)")
+    g.add_argument("--remaining-every", type=int, default=3, metavar="N",
+                   help="every Nth measurement print how much is left "
+                        "(default 3, 0 = do not print)")
+
+    p.add_argument("--log-file", default=None, help=argparse.SUPPRESS)      # internal (subprocess)
+    p.add_argument("--concurrent", type=int, default=1, help=argparse.SUPPRESS)  # internal
+    return p
+
+
+# --- questions ------------------------------------------------------------------
+def ask(prompt: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raise SystemExit("\nInput ended.")
+    return answer or (default or "")
+
+
+def ask_int(prompt: str, default: int) -> int:
+    while True:
+        raw = ask(prompt, str(default))
+        try:
+            return int(raw)
+        except ValueError:
+            print("  Enter a whole number.")
+
+
+def ask_duration(prompt: str, default: str) -> int:
+    while True:
+        raw = ask(prompt, default)
+        try:
+            seconds = parse_duration(raw)
+        except ValueError as exc:
+            print(f"  {exc}")
+            continue
+        print(f"  -> {describe_duration(seconds)}")
+        return seconds
+
+
+def ask_yes_no(prompt: str, default: bool = False) -> bool:
+    raw = ask(f"{prompt} (y/n)", "y" if default else "n")
+    return raw.lower() in YES
+
+
+def ask_scope() -> str:
+    """What to test: one node, all workers, or the whole cluster."""
+    print("What to test?")
+    print("  [1] one node")
+    print("  [2] all workers (without the master)")
+    print(f"  [3] the whole cluster (workers, the master last with a CPU cap of {MASTER_CPU_CAP} %)")
+    while True:
+        raw = ask("Choose", "1")
+        if raw in ("1", "2", "3"):
+            return {"1": "single", "2": "workers", "3": "cluster"}[raw]
+        print("  Invalid choice.")
+
+
+def ask_profile() -> str:
+    """Test type: classic or stepped."""
+    print("Test type:")
+    print("  [1] classic (one load for the given time)")
+    print(f"  [2] stepped ({describe_steps(STEPS_DEFAULT)} % in stages, always logged)")
+    while True:
+        raw = ask("Choose", "1")
+        if raw in ("1", "2"):
+            return PROFILE_CLASSIC if raw == "1" else PROFILE_STEPPED
+        print("  Invalid choice.")
+
+
+COOLDOWN_CHOICES = {"1": 60, "2": 180, "3": 300, "4": COOLDOWN_MAX}
+
+
+def ask_cooldown() -> int:
+    """Cooldown after the test: preset, custom duration, or off (0)."""
+    print("Cooldown after the test (measuring CPU temperature and clock):")
+    for key, seconds in COOLDOWN_CHOICES.items():
+        note = (" (default)" if seconds == COOLDOWN_DEFAULT
+                else " (max)" if seconds == COOLDOWN_MAX else "")
+        print(f"  [{key}] {describe_duration(seconds)}{note}")
+    print("  [5] custom duration")
+    print("  [0] off")
+    default = next((k for k, v in COOLDOWN_CHOICES.items() if v == COOLDOWN_DEFAULT), "1")
+    while True:
+        raw = ask("Choose", default)
+        if raw == "0":
+            return 0
+        if raw in COOLDOWN_CHOICES:
+            return COOLDOWN_CHOICES[raw]
+        if raw == "5":
+            break
+        print("  Invalid choice.")
+    while True:
+        seconds = ask_duration(f"Cooldown duration (e.g. 90, 2m; max "
+                               f"{describe_duration(COOLDOWN_MAX)})", "2m")
+        if seconds <= COOLDOWN_MAX:
+            return seconds
+        print(f"  The maximum is {describe_duration(COOLDOWN_MAX)}.")
+
+
+def choose_node(kube: Kubectl) -> str:
+    names = kube.list_node_names()
+    if not names:
+        raise SystemExit("❌ No nodes were found in the cluster.")
+    for i, name in enumerate(names, 1):
+        print(f"[{i}] {name}")
+    while True:
+        raw = ask("Pick a node number or type the name")
+        if raw.isdigit() and 1 <= int(raw) <= len(names):
+            return names[int(raw) - 1]
+        if raw in names:
+            return raw
+        print("  Invalid choice.")
+
+
+# --- building the configuration -----------------------------------------------------
+def build_config(args: argparse.Namespace, node_name: str,
+                 master_mode: bool, series: bool = False) -> StressConfig:
+    interactive = not (args.non_interactive or args.quick)
+
+    def pick(value, question: Callable[[], object], default):
+        if value is not None:
+            return value
+        return question() if interactive else default
+
+    profile = args.profile
+    if profile is None:
+        profile = ask_profile() if interactive else PROFILE_CLASSIC
+    stepped = profile == PROFILE_STEPPED
+    steps = args.steps or STEPS_DEFAULT
+    step_time = STEP_TIME_DEFAULT
+    if stepped:
+        step_time = pick(args.step_time,
+                         lambda: ask_duration("Duration of one stage (e.g. 90, 3m)", "3m"),
+                         STEP_TIME_DEFAULT)
+        duration = len(steps) * step_time
+        if args.duration is not None:
+            print("ℹ️  For the stepped test the time is set with --step-time, --time is ignored.")
+    else:
+        duration = pick(args.duration,
+                        lambda: ask_duration(
+                            "Test duration (e.g. 90, 30s, 5m, 1h, 1h30m)", "1m"), 60)
+    max_temp = pick(args.max_temp,
+                    lambda: ask_int(
+                        f"CPU temperature for automatic stop "
+                        f"({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C)", DEFAULT_MAX_TEMP),
+                    DEFAULT_MAX_TEMP)
+    cooldown = pick(args.cooldown, ask_cooldown, COOLDOWN_DEFAULT)
+    cpu_load = 100 if stepped else pick(args.cpu_load,
+                                         lambda: ask_int("CPU load in %", 100), 100)
+
+    ram_pct = args.ram_pct
+    hdd = args.hdd
+    if stepped:           # the stepped test loads only the CPU
+        if ram_pct is not None or hdd:
+            print("ℹ️  The stepped test loads only the CPU, RAM and disk are ignored.")
+        ram_pct, hdd = None, False
+    elif not master_mode:   # on the master RAM and disk are not used anyway
+        if ram_pct is None and interactive:
+            if ask_yes_no("Stress RAM?"):
+                ram_pct = ask_int("How many % of FREE RAM to allocate", 80)
+        if hdd is None and interactive:
+            hdd = ask_yes_no("Stress disk / IO?")
+
+    run_bg = args.background
+    if run_bg is None:
+        run_bg = (ask_yes_no("Run in the background? (survives closing the terminal, "
+                             "logging turns on by itself)") if interactive else False)
+
+    why = [w for w, on in (("background test", run_bg), ("stepped test", stepped),
+                           ("multi-node test", series)) if on]
+    if why:
+        reason = ", ".join(why)
+        if args.log is False:
+            print(f"ℹ️  --no-log is ignored: {reason} is always logged.")
+        else:
+            print(f"ℹ️  Logging turned on automatically ({reason}).")
+        log = True
+    else:
+        log = pick(args.log, lambda: ask_yes_no("Save metrics to a file?"), False)
+    notes = args.notes
+    if notes is None:
+        notes = ask("Note about the test", "") if (interactive and log) else ""
+
+    return StressConfig(node=node_name, duration=duration, max_temp=max_temp,
+                        cpu_load=cpu_load, ram_pct=ram_pct, hdd=bool(hdd),
+                        log=bool(log), notes=notes, background=bool(run_bg),
+                        cooldown=cooldown, profile=profile, steps=tuple(steps),
+                        step_time=step_time)
+
+
+def confirm_workload(kube: Kubectl, node, args: argparse.Namespace,
+                     already_confirmed: bool) -> bool:
+    """Prints what is running on the node and asks for confirmation for foreign services.
+
+    Pods in kube-system are only counted. already_confirmed = the user already confirmed
+    (on the master), the second question is not asked. -y confirms, --non-interactive without -y refuses.
+    """
+    try:
+        work = kube.list_node_workload(node.name)
+    except KubectlError as exc:
+        print(f"⚠️  Could not find out what is running on the node ({exc}). Continuing.")
+        log.warning("list_node_workload failed: %s", exc)
+        return True
+    log.info("Node workload: %s", work)
+    if not work.user_pods:
+        if work.system_count:
+            print(f"ℹ️  Only system pods are running on the node ({work.system_count}× kube-system).")
+        return True
+    print(f"⚠️  Node {node.name} runs these services (the test loads them, "
+          f"they may slow down or be interrupted):")
+    for line in format_workload(work):
+        print(f"    {line}")
+    if work.system_count:
+        print(f"    (+ {work.system_count} system pods in kube-system)")
+    if already_confirmed or args.yes:
+        return True
+    if args.non_interactive:
+        print("Test refused: services are running on the node, confirm with --yes.")
+        return False
+    return ask_yes_no("Continue with the test?")
+
+
+def _out(line: str) -> None:
+    """Prints to the screen and at the same time writes to the hidden debug log."""
+    print(line)
+    log.info("OUT %s", line)
+
+
+def cmd_status() -> int:
+    print(background.format_running(background.list_running()))
+    if shutil.which(os.environ.get("KUBECTL", "kubectl")):
+        try:
+            pods = Kubectl().list_tool_pods()
+        except KubectlError as exc:
+            print(f"(could not find out the pods in the cluster: {exc})")
+        else:
+            print("\nThe tool's pods in the cluster:" if pods else "\nNo pods of the tool in the cluster.")
+            for pod in pods:
+                print(f"  {pod.name:<28} node {pod.node or '?':<18} {pod.phase}")
+    return 0
+
+
+def cmd_list_nodes() -> int:
+    kube = Kubectl()
+    try:
+        names = kube.list_node_names()
+    except KubectlError as exc:
+        print(f"❌ {exc}")
+        return EXIT_ERROR
+    if not names:
+        print("No nodes were found in the cluster.")
+        return 0
+    for name in names:
+        try:
+            node = kube.get_node(name)
+        except KubectlError as exc:
+            print(f"  {name:<38} ? ({exc})")
+            continue
+        role = "master" if node.is_control_plane else "worker"
+        state = "Ready" if node.ready else "NotReady"
+        print(f"  {name:<38} {role:<7} {state}")
+    return 0
+
+
+def _wait_until(target: Optional[float]) -> None:
+    """Waits until the scheduled start (--schedule). No effect if the time has already passed."""
+    if target is None:
+        return
+    remaining = target - time.time()
+    if remaining <= 0:
+        return
+    until = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target))
+    print(f"⏳ Waiting until {until} ({describe_duration(int(remaining))})…")
+    log.info("Waiting for the scheduled start until %s (%.0f s)", until, remaining)
+    time.sleep(remaining)
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    log_dir = user_log_dir(args.log_dir)
+    try:
+        first, second = compare.resolve_logs(args.compare, log_dir)
+        lines = compare.compare_files(first, second)
+    except compare.CompareError as exc:
+        print(f"❌ {exc}")
+        log.error("Comparison failed: %s", exc)
+        return EXIT_ERROR
+    for line in lines:
+        print(line)
+    log.info("Comparison of logs %s and %s done", first, second)
+    return 0
+
+
+def cmd_stop(target: str) -> int:
+    ok, message = background.stop(target)
+    print(("✅ " if ok else "❌ ") + message)
+    return 0 if ok else EXIT_ERROR
+
+
+def _print_background_info(node_label: str, duration_text: str, run_id: str, pid: int,
+                           log_path: str, console_path: str) -> None:
+    print("=" * 52)
+    print("🚀 TEST RUNNING IN THE BACKGROUND (detached from the terminal, survives closing the window)")
+    print("=" * 52)
+    rows = [
+        ("Node", node_label),
+        ("Test duration", duration_text),
+        ("Run id / PID", f"{run_id} / {pid}"),
+        ("Results", log_path),
+        ("Live output", f"tail -f {console_path}"),
+        ("Status", "python3 -m stress_test --status   (or ./stress.sh --status)"),
+        ("Stop", f"python3 -m stress_test --stop {run_id}"),
+    ]
+    for key, value in rows:
+        print(f"  {key + ':':<15}{value}")
+    print("\nIf the test does not start (missing sensor, cannot pull the image...), "
+          "the cause will be in the live output.")
+
+
+def _choose_scope(args: argparse.Namespace) -> str:
+    """single / workers / cluster / nodes based on flags (or a question)."""
+    chosen = [flag for flag, on in (("--workers", args.workers), ("--cluster", args.cluster),
+                                     ("--nodes", bool(args.nodes))) if on]
+    if len(chosen) > 1:
+        raise ValueError("Give only one of the options --workers, --cluster, --nodes.")
+    if chosen and args.node:
+        raise ValueError("--node cannot be combined with --workers, --cluster or --nodes.")
+    if args.cluster:
+        return "cluster"
+    if args.workers:
+        return "workers"
+    if args.nodes:
+        return "nodes"
+    if args.node or args.non_interactive or args.quick:
+        return "single"
+    return ask_scope()
+
+
+def _keep_master(args: argparse.Namespace, template: StressConfig) -> bool:
+    """In the stepped test we ask whether to keep the master (CPU cap 70 %)."""
+    if args.include_master or not template.stepped:
+        return True                       # explicitly, or confirmed by the overview before the start
+    capped = tuple(sorted({min(s, MASTER_CPU_CAP) for s in template.steps}))
+    if args.yes:
+        return True
+    if args.non_interactive:
+        print("ℹ️  Master left out of the stepped test (no confirmation; add --include-master "
+              "or --yes).")
+        return False
+    return ask_yes_no(f"Keep the master in the stepped test (stages capped at max "
+                      f"{MASTER_CPU_CAP} %: {describe_steps(capped)})?")
+
+
+def _choose_parallel(args: argparse.Namespace, nodes) -> bool:
+    """Workers at once or one after another (--parallel/--no-parallel, otherwise a question)."""
+    workers = [n for n in nodes if not n.is_control_plane]
+    if args.parallel is False:
+        return False
+    if len(workers) < 2:
+        if args.parallel:
+            print("ℹ️  Running in parallel makes sense from two workers, testing one after another.")
+        return False
+    if args.parallel is True:
+        return True
+    if args.yes or args.non_interactive or args.quick:
+        return False
+    return ask_yes_no("Test the workers AT ONCE? (y = at once, n = one after another)")
+
+
+def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
+    """Test of several nodes one after another (workers / whole cluster / list)."""
+    names = ([n.strip() for n in args.nodes.split(",") if n.strip()]
+             if scope == "nodes" else None)
+    nodes, skipped = series.select_nodes(kube, scope, names, include_master=args.include_master)
+    for name, reason in skipped:
+        print(f"⚠️  Node {name} skipped: {reason}.")
+    template = build_config(args, "*", master_mode=False, series=True)
+    template.validate()
+    if any(n.is_control_plane for n in nodes) and not _keep_master(args, template):
+        nodes = [n for n in nodes if not n.is_control_plane]
+        print("ℹ️  The master is left out of the test.")
+    if not nodes:
+        print("❌ Nothing to test (no node is Ready).")
+        return EXIT_ERROR
+    if args.api_limit <= 0:
+        raise ValueError("--api-limit must be greater than 0.")
+    run_parallel = _choose_parallel(args, nodes)
+
+    workloads = {}
+    for node in nodes:
+        try:
+            workloads[node.name] = kube.list_node_workload(node.name)
+        except KubectlError as exc:
+            log.warning("Could not find out the workload of node %s: %s", node.name, exc)
+    print("-" * 52)
+    for line in series.plan_lines(template, nodes, workloads, parallel=run_parallel):
+        print(line)
+    if run_parallel:
+        print(f"API guard: kubectl response slower than {args.api_limit:g} s (or a failure) "
+              f"twice in a row stops all tests.")
+    if args.schedule:
+        print(f"🕒 Scheduled for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(args.schedule))}.")
+    print("-" * 52)
+    if args.dry_run:
+        print("🔎 Dry run, nothing is being started.")
+        return 0
+    if not (args.yes or args.quick):
+        if args.non_interactive:
+            print("Test refused: confirm with --yes.")
+            print("Exiting.")
+            return 0
+        if not ask_yes_no("Start the test?"):
+            print("Exiting.")
+            return 0
+    if template.background and not background.supported():
+        print("❌ Running in the background is not supported on this system (no fork).")
+        return EXIT_ERROR
+    series.preflight(kube, nodes)
+
+    directory = make_private_dir(user_log_dir(args.log_dir))
+    log_path = series.new_series_log_path(directory)
+    options = series.SeriesOptions(
+        log_dir=directory, out=_out, interval=args.interval,
+        remaining_every=max(args.remaining_every, 0), allow_no_sensor=args.allow_no_sensor,
+        max_busy_pct=args.max_busy_pct, allow_busy_node=args.allow_busy_node,
+        skip_capacity_check=args.no_capacity_check,
+        hw_privileged=args.hw_privileged, skip_hw=args.no_hw)
+    if run_parallel:
+        runner = parallel.ParallelSeriesRunner(kube, template, nodes, skipped, options,
+                                               log_path, api_limit=args.api_limit)
+    else:
+        runner = series.SeriesRunner(kube, template, nodes, skipped, options, log_path)
+    if not template.background:
+        _wait_until(args.schedule)
+        return runner.run()
+
+    # --- in the background: the whole series runs in a detached process
+    console_path = log_path[:-4] + ".console.txt"
+    run_id = secrets.token_hex(3)
+    total = series.estimate_total(template, nodes, run_parallel)
+    pid = background.detach(console_path)
+    if pid:                                       # PARENT: prints the info and exits
+        log.info("Series moved to the background: run_id=%s, PID=%s", run_id, pid)
+        _print_background_info(f"cluster ({len(nodes)} nodes: " + ", ".join(n.name for n in nodes)
+                               + ")", f"about {describe_duration(total)} in total", run_id, pid,
+                               log_path, console_path)
+        sys.stdout.flush()
+        os._exit(0)
+    log.info("Child detached from the terminal (PID %s)", os.getpid())
+    _wait_until(args.schedule)
+    background.register(run_id, "cluster", total, log_path, console_path)
+    try:
+        return runner.run()
+    finally:
+        background.unregister(run_id)
+
+
+def apply_quick(args: argparse.Namespace) -> None:
+    """--quick: fills in values the user did not give (explicitly given options take priority)."""
+    if not args.quick:
+        return
+    if args.profile is None:
+        args.profile = PROFILE_CLASSIC
+    if args.duration is None:
+        args.duration = QUICK_DURATION
+    if args.cooldown is None:
+        args.cooldown = COOLDOWN_DEFAULT
+    if args.log is None:
+        args.log = True
+    if args.notes is None:
+        args.notes = "quick"
+
+
+def quick_summary(cfg: StressConfig) -> str:
+    parts = [cfg.node, describe_duration(cfg.duration)]
+    parts.append("stepped " + describe_steps(cfg.steps) + " %" if cfg.stepped
+                 else f"CPU {cfg.cpu_load} %")
+    if cfg.ram_pct:
+        parts.append(f"RAM {cfg.ram_pct} %")
+    if cfg.hdd:
+        parts.append("disk")
+    parts.append(f"limit {cfg.max_temp} °C")
+    parts.append(f"cooldown {describe_duration(cfg.cooldown)}" if cfg.cooldown
+                 else "no cooldown")
+    parts.append("logged" if cfg.log else "not logged")
+    if cfg.background:
+        parts.append("in background")
+    return " · ".join(parts)
+
+
+def _main(args: argparse.Namespace) -> int:
+    apply_quick(args)
+    if args.status:
+        return cmd_status()
+    if args.stop:
+        return cmd_stop(args.stop)
+    if args.compare:
+        return cmd_compare(args)
+    if args.list_nodes:
+        return cmd_list_nodes()
+    if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
+        print("❌ Error: 'kubectl' was not found.")
+        log.error("kubectl was not found in PATH")
+        return EXIT_ERROR
+
+    kube = Kubectl()
+    print("=" * 52)
+    print("   KUBERNETES STRESS TEST (Python)")
+    print("=" * 52)
+    try:
+        scope = _choose_scope(args)
+        if scope != "single":
+            return _run_series(args, kube, scope)
+        node_name = args.node
+        if not node_name:
+            if args.non_interactive:
+                print("❌ In --non-interactive mode --node must be given.")
+                return EXIT_ERROR
+            node_name = choose_node(kube)
+        node = kube.get_node(node_name)
+        log.info("Node: %s", node)
+        if not node.ready:
+            print(f"❌ Node '{node.name}' is not Ready!")
+            log.error("Node %s is not Ready", node.name)
+            return EXIT_ERROR
+
+        # master protection
+        force = args.force or os.environ.get("FORCE") == "1"
+        master_mode = node.is_control_plane and not force
+        log.info("control-plane=%s force=%s -> master_mode=%s",
+                 node.is_control_plane, force, master_mode)
+        if master_mode:
+            print(f"⚠️  '{node.name}' is the MASTER (control-plane). The load may slow down "
+                  f"the API and services.\n    CPU will be limited to at most {MASTER_CPU_CAP} %, "
+                  f"RAM and disk are not tested (bypass: --force or FORCE=1).")
+            if not args.yes and (args.non_interactive or not ask_yes_no("Continue?")):
+                print("Exiting.")
+                log.info("The user did not confirm the test on the master")
+                return 0
+
+        if not confirm_workload(kube, node, args, already_confirmed=master_mode):
+            print("Exiting.")
+            log.info("The user did not confirm the test on a node with services")
+            return 0
+
+        cfg = build_config(args, node.name, master_mode)
+        if master_mode:
+            for msg in cfg.apply_master_limits():
+                print(f"⚠️  {msg}")
+                log.info("master limit: %s", msg)
+        cfg.validate()
+        if args.quick:
+            print(f"⚡ Quick test: {quick_summary(cfg)}")
+        if args.schedule:
+            print(f"🕒 Scheduled for "
+                  f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(args.schedule))}.")
+        if args.dry_run:
+            print(f"🔎 Dry run, nothing is being started: {quick_summary(cfg)}")
+            return 0
+
+        if args.log_file:                         # subprocess of the parallel test: fixed path to the log
+            cfg.log = True
+        log_path = None
+        if args.log_file:
+            make_private_dir(Path(args.log_file).parent)
+            log_path = args.log_file
+        elif cfg.log:
+            directory = make_private_dir(user_log_dir(args.log_dir))
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            log_path = str(directory / f"{node.name}-{cfg.duration}s-{stamp}.log")
+
+        if cfg.background and not background.supported():
+            print("❌ Running in the background is not supported on this system (no fork).")
+            return EXIT_ERROR
+
+        runner = StressRunner(
+            kube, node, cfg, log_path=log_path,
+            interval=args.interval, remaining_every=max(args.remaining_every, 0),
+            hw_privileged=args.hw_privileged, skip_hw=args.no_hw, concurrent=args.concurrent,
+            allow_no_sensor=args.allow_no_sensor,
+            max_busy_pct=args.max_busy_pct, allow_busy_node=args.allow_busy_node,
+            skip_capacity_check=args.no_capacity_check,
+            confirm_no_sensor=(None if (args.non_interactive or cfg.background) else
+                               lambda: ask_yes_no("Continue without temperature protection?")),
+            out=_out)
+
+        if not cfg.background:
+            _wait_until(args.schedule)
+            return runner.run()
+
+        # --- in the background: quick checks first, we want to see errors right away in the terminal
+        runner.preflight()
+        console_path = log_path[:-4] + ".console.txt"
+        pid = background.detach(console_path)
+        if pid:                                   # PARENT: prints the info and exits
+            log.info("Test moved to the background: run_id=%s, child PID=%s, output=%s",
+                     runner.names.run_id, pid, console_path)
+            _print_background_info(
+                node.name, f"{describe_duration(cfg.duration)}  (+ 1–3 min preparation)",
+                runner.names.run_id, pid, log_path, console_path)
+            sys.stdout.flush()
+            os._exit(0)                           # without cleanup: the child does that
+        # CHILD: detached, stdout goes to console_path
+        log.info("Child detached from the terminal (PID %s)", os.getpid())
+        _wait_until(args.schedule)
+        background.register(runner.names.run_id, node.name, cfg.duration,
+                            log_path, console_path)
+        try:
+            return runner.run()
+        finally:
+            background.unregister(runner.names.run_id)
+    except RunnerError as exc:
+        print(f"❌ {exc}")
+        log.error("Pre-start check failed: %s", exc)
+        return EXIT_ERROR
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        log.error("Invalid settings: %s", exc)
+        return EXIT_ERROR
+    except KubectlError as exc:
+        print(f"❌ {exc}")
+        log.error("KubectlError: %s", exc)
+        return EXIT_ERROR
+    except OSError as exc:
+        print(f"❌ Cannot create the log folder '{args.log_dir}': {exc}")
+        log.exception("OSError while working with the log folder")
+        return EXIT_ERROR
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    debug_path = debuglog.setup(argv_list)      # hidden debug log of every run
+    code = EXIT_ERROR
+    try:
+        code = _main(build_parser().parse_args(argv_list))
+        return code
+    except SystemExit as exc:                   # --help, argparse error, EOF on input
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else EXIT_ERROR)
+        log.info("SystemExit(%r)", exc.code)
+        raise
+    except Exception as exc:                    # unexpected error -> traceback to the log
+        log.exception("Unexpected error")
+        print(f"❌ Unexpected error: {exc}")
+        code = EXIT_ERROR
+        return code
+    finally:
+        log.info("===== END, exit code %s =====", code)
+        if code == EXIT_ERROR and debug_path is not None:
+            print(f"ℹ️  Technical details for debugging: {debug_path}")
+        debuglog.shutdown()
+
+
+if __name__ == "__main__":   # pragma: no cover
+    sys.exit(main())

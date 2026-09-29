@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icons/k3s-cluster-stress-test-icon-256.png" width="128" height="128" alt="Kubernetes stress test icon">
+</p>
+
 # Kubernetes stress test (Python)
 
 > **Version 1.15.0 (English).** New here? Start with [`HELPDESK.md`](HELPDESK.md) — a step-by-step

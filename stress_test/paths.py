@@ -53,8 +53,11 @@ def running_dir() -> Path:
 
 
 def open_private(path, mode: str = "a", encoding: str = "utf-8"):
-    """Opens a file with permissions 0600 (only the owner can read it; an existing file is not changed)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | (os.O_APPEND if "a" in mode else os.O_TRUNC), 0o600)
+    """Opens a file with permissions 0600 (only the owner can read it; an existing file is not changed).
+
+    A symlink in place of the file is refused (O_NOFOLLOW): a planted link must not redirect the write elsewhere.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if "a" in mode else os.O_TRUNC), 0o600)
     return os.fdopen(fd, mode, encoding=encoding)
 
 

@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.15.0
+- **Main menu:** `./stress.sh` typed without any option in a terminal shows a menu (CPU load, Disk, Network, Quick test,
+  Results, Management) with the cluster state in the header. Every entry only builds the usual options (printed as
+  `▶ ./stress.sh --profile disk --smart`) and runs the normal program, which asks the rest; afterwards you are back in the menu
+  (`0` = quit). With any option, on a pipe/cron, or with `STRESS_NO_MENU=1` nothing changes.
+- The network test now asks for the network (nodes' / pod) and the extra jobs when run interactively.
+
+## 1.14.0
+More network tools.
+- **`--net-matrix`:** ping + iperf3 between EVERY ordered pair of nodes (all Ready nodes, or `--nodes a,b,c`), printed as two tables
+  (Mbit/s and ping ms; row = client, column = server) with plain-language findings (slow pair, weak node, asymmetric directions,
+  loss, NIC below 1 Gb/s, half duplex). One helper pod per node (iperf3 installed once, commands via exec), `--net-time` per test
+  (default 5 s), the master capped at 300 Mbit/s, refuses while another test runs, asks before it loads the network (`--yes`).
+  Saves `logs/net-matrix-<date>.log` and `.json`.
+- **`--net-watch [NODE]` (any test):** the probe also pings another node (default the master; a worker when the master is tested)
+  once per reading. The log line ends with `| Ping: 0.42 ms` / `| Ping: lost`, the summary shows latency under load against idle and
+  says when the load disturbs the network.
+- **`--net-extra LIST` (network test):** optional jobs: `dns` (CoreDNS and external lookups), `internet` (ping 1.1.1.1 + a bounded
+  download from the Ubuntu mirror), `mtr` (hops, loss and latency to the peer), `service` (TCP through a Kubernetes Service =
+  kube-proxy path, needs `--net-mode pod`), or `all`. Wi-Fi interfaces report their signal (weak below -70 dBm).
+
+## 1.13.0
+- **Network test (`--profile net`, menu item 5):** the tested node runs an iperf3 client and ping against a peer node
+  (an iperf3 server pod on the peer; `--net-peer NODE`, default: another Ready worker, the master only as the last option).
+  Jobs: NIC link speed and duplex, ping (50 x 0.2 s: avg/min/max/jitter/loss), path MTU probe, TCP upload, TCP download,
+  TCP with 4 streams, UDP at 100 Mbit/s (jitter, loss), and the NIC error/drop counters before vs after.
+  `--net-time` (5-60 s per iperf3 test, default 10), `--net-mode host|pod` (the nodes' real network, or the pod network
+  = what workloads really use through flannel/CNI), `--net-rate MBIT` (TCP cap; 300 Mbit/s automatically when the master
+  is on either end). The summary explains problems in plain words (link negotiated 100 Mb/s, half duplex, packet loss,
+  asymmetric up/down, single-stream limit, retransmits, UDP loss). Results go to the log, the JSON and the baseline check
+  (TCP -10 %, ping +50 %, new loss).
+
+## 1.12.0
+- **CPU power (RAPL):** the probe reads the Intel RAPL energy counter (no privileged mode needed) and every
+  measurement line ends with `| Power: 17.3 W`. The log header has `Power limits: PL1 25 W, PL2 51 W`, the summary
+  shows average/max power next to the limits and says when the average sits at PL1 (the clock is then held
+  down by the power limit, not by heat). The baseline check warns when power draw is 10 % higher. CSV has `power_w`.
+  Machines without RAPL (AMD, ARM) simply show nothing.
+- **Disk health (`--smart`):** preflight step with a PRIVILEGED pod (`smartctl -j`): health verdict, temperature,
+  power-on hours, reallocated/pending sectors, NVMe wear and errors. A failed health check refuses the test
+  (`--allow-bad-disk` overrides); warnings only print. Results go to the log ("DISK HEALTH (SMART)") and the JSON.
+- **Disk benchmark (`--profile disk`, menu item 4):** fio in the pod (file in an emptyDir on the node's disk,
+  direct I/O): sequential read/write (1M) and random read/write (4k, QD32), MB/s, IOPS, average and p99 latency.
+  `--disk-size MiB` (128-8192, default 1024), `--disk-job-time` (5-120 s, default 15 s). Always logged, exported,
+  and compared with the baseline (throughput -10 %, p99 latency +25 %). The master runs read jobs only, 256 MiB.
+
+## 1.11.0
+- **Spike test** (`--profile spike`, menu item 3): repeating jump between a low load (10 %) and a target
+  (`--spike-target 25/50/75/100`), phases set with `--spike-low-time` / `--spike-high-time` (default 5 s each,
+  1-300 s); `--time` is rounded to whole cycles. CPU only, the master is capped at 70 %.
+  `--compare` and the log reader understand spike logs (stage targets are read from `▶ Low` / `▶ Spike!`).
+- **Export:** every logged test also writes `<log>.json` (metadata, computed statistics, all measurements,
+  stage data) next to the log. `--export json|csv|both|none` picks the format (csv = measurements only).
+  `--export-log LOG|NODE` creates the export of older logs.
+- **Baseline and regression:** `--set-baseline LOG|NODE` saves a finished test as the "golden" result of its
+  node (`logs/baselines/<node>.json`). Every later test of that node is checked against it at the end:
+  max temperature (+5 °C), average clock (-5 %), performance (-5 %), new throttling -> verdict OK or REGRESSION
+  (also stored in the JSON). Tests with a different profile or stages are reported as not comparable.
+  `--no-baseline-check` turns the check off.
+
 ## 1.10.0
 Preflight check of node usage before the test (adds to the already existing check for a concurrent test and temperature).
 - **Node usage:** before EVERY test (including `--quick`) `kubectl top` checks the node's CPU and RAM.

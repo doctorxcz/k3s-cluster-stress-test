@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-from .models import TOOL_LABEL, PodNames, StressConfig
+from .disk import build_disk_command
+from .net import NET_SERVER_SCRIPT, build_net_command
+from .models import SPIKE_LOW_PCT, TOOL_LABEL, PodNames, StressConfig
 
 # image versions pinned firmly (no "latest", behaviour does not change by itself)
 IMAGE_UBUNTU = "ubuntu:24.04"
@@ -37,6 +39,23 @@ done
 if [ "$c" -gt 0 ]; then echo "freq $((f/c/1000))"; fi
 # CPU counters of the whole node (utilisation in % is computed from the difference of two readings)
 awk '/^cpu / {t=0; for (i=2; i<=9; i++) t+=$i; print "cpu_stat " t " " ($5+$6)}' /proc/stat 2>/dev/null
+# CPU package power (Intel RAPL, needs no privileged mode: the probe runs as root): energy counter
+# in µJ (power = its growth over time) and the PL1/PL2 limits; sums all packages, subzones are skipped
+e=0; m=0; pl1=0; pl2=0; found=0
+for z in /host-sys/class/powercap/intel-rapl:*; do
+    case "${z##*/}" in intel-rapl:*:*) continue ;; esac
+    v=$(cat "$z/energy_uj" 2>/dev/null) || continue
+    [ -n "$v" ] || continue
+    found=1; e=$((e+v)); m=$((m+$(cat "$z/max_energy_range_uj" 2>/dev/null || echo 0)))
+    pl1=$((pl1+$(cat "$z/constraint_0_power_limit_uw" 2>/dev/null || echo 0)))
+    pl2=$((pl2+$(cat "$z/constraint_1_power_limit_uw" 2>/dev/null || echo 0)))
+done
+if [ "$found" = 1 ]; then echo "rapl_uj $e $m $pl1 $pl2"; fi
+# latency to the watched node (--net-watch): one ping per reading, PING_TARGET is set by the caller
+if [ -n "$PING_TARGET" ]; then
+    r=$(ping -c 1 -W 1 "$PING_TARGET" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p')
+    if [ -n "$r" ]; then echo "ping_ms $r"; else echo "ping_ms lost"; fi
+fi
 # host memory (inside a container /proc/meminfo shows the values of the whole node)
 awk '/^MemTotal:/ {print "mem_total_kb " $2} /^MemAvailable:/ {print "mem_available_kb " $2}' /proc/meminfo 2>/dev/null
 exit 0
@@ -74,6 +93,20 @@ dmidecode -t memory 2>/dev/null | awk -F': ' -v priv="$HW_PRIVILEGED" '
 """
 
 
+# Disk health: SMART data of all disks as JSON between SMART-BEGIN/SMART-END markers (privileged pod).
+SMART_SCRIPT = r"""
+export DEBIAN_FRONTEND=noninteractive
+if ! { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq smartmontools >/dev/null 2>&1; }; then
+    echo "SMART-UNAVAILABLE apt"; exit 0
+fi
+for dev in $(smartctl --scan 2>/dev/null | awk '{print $1}'); do
+    echo "SMART-BEGIN $dev"
+    smartctl -j -H -A -i "$dev" 2>/dev/null
+    echo "SMART-END"
+done
+"""
+
+
 def stress_memory_limit_mib(ram_target_mib: Optional[int]) -> int:
     """Memory limit of the load pod: RAM test target + overhead, otherwise a fixed base."""
     if ram_target_mib:
@@ -95,10 +128,39 @@ def build_stepped_command(steps: Sequence[int], step_time: int) -> str:
             f"--timeout {step_time}s --metrics-brief || break; done")
 
 
-def build_stress_command(cfg: StressConfig, ram_target_mib: Optional[int]) -> str:
+def build_spike_command(target_pct: int, cycles: int, low_time: int, high_time: int,
+                        low_pct: int = SPIKE_LOW_PCT) -> str:
+    """Spike test: repeating low/high cycles (e.g. 10 % <-> target %), on and off.
+
+    One shell loop, `cycles` repetitions of two back-to-back stress-ng runs (low phase,
+    then an abrupt jump to the high phase) - no restart delay beyond the ~1 s it takes a
+    new process to start. Same marker format as the stepped test
+    (`STRESS-STAGE i/n P%`, n = cycles * 2), so the tool's stage parsing works unchanged.
+    """
+    total = cycles * 2
+    return (f'i=0; c=1; while [ $c -le {cycles} ]; do '
+            f'i=$((i+1)); echo "STRESS-STAGE $i/{total} {low_pct}%"; '
+            f"stress-ng --cpu 0 --cpu-method matrixprod --cpu-load {low_pct} "
+            f"--timeout {low_time}s --metrics-brief || break; "
+            f'i=$((i+1)); echo "STRESS-STAGE $i/{total} {target_pct}%"; '
+            f"stress-ng --cpu 0 --cpu-method matrixprod --cpu-load {target_pct} "
+            f"--timeout {high_time}s --metrics-brief || break; "
+            f"c=$((c+1)); done")
+
+
+def build_stress_command(cfg: StressConfig, ram_target_mib: Optional[int],
+                         net_target: str = "", net_port: int = 5201, net_service_ip: str = "") -> str:
     """Builds the stress-ng command from the test settings."""
     if cfg.stepped:
         return build_stepped_command(cfg.steps, cfg.step_time)
+    if cfg.net:
+        return build_net_command(net_target, net_port, cfg.net_mode, cfg.net_time, cfg.net_rate,
+                                 cfg.net_extra, net_service_ip)
+    if cfg.disk:
+        return build_disk_command(cfg.disk_size, cfg.disk_job_time, cfg.disk_read_only)
+    if cfg.spike:
+        return build_spike_command(cfg.spike_target, cfg.spike_cycles, cfg.spike_low_time,
+                                   cfg.spike_high_time)
     if cfg.cpu_load == 100:
         args = ["--cpu 0 --cpu-method matrixprod --matrix 0"]
     else:
@@ -152,6 +214,45 @@ def hw_pod(node: str, names: PodNames, deadline: int = 300,
     return pod
 
 
+def smart_pod(node: str, names: PodNames, deadline: int = 300) -> dict:
+    """Pod reading SMART data. Always privileged (smartctl needs raw access to the disks) and read-only."""
+    pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
+    pod["spec"]["containers"] = [{
+        "name": "smart",
+        "image": IMAGE_UBUNTU,
+        "securityContext": {"privileged": True},
+        "command": ["bash", "-c", SMART_SCRIPT],
+        "resources": {"requests": {"memory": "64Mi"},
+                      "limits": {"memory": f"{HW_LIMIT_MIB}Mi"}},
+    }]
+    return pod
+
+
+def net_server_pod(node: str, names: PodNames, deadline: int, port: int, host_network: bool) -> dict:
+    """iperf3 server of the network test on the peer node (reuses the name of the hw pod, which is finished by then)."""
+    pod = _base_pod(names.hw, node, deadline, names.run_id, "net-server")
+    pod["spec"]["containers"] = [{
+        "name": "net-server",
+        "image": IMAGE_UBUNTU,
+        "securityContext": {"allowPrivilegeEscalation": False},
+        "command": ["bash", "-c", NET_SERVER_SCRIPT.replace("PORT", str(port))],
+        "resources": {"requests": {"memory": "64Mi"},
+                      "limits": {"memory": f"{HW_LIMIT_MIB}Mi"}},
+    }]
+    if host_network:
+        pod["spec"]["hostNetwork"] = True
+        pod["spec"]["dnsPolicy"] = "ClusterFirstWithHostNet"
+    return pod
+
+
+def net_service(name: str, run_id: str, port: int) -> dict:
+    """ClusterIP Service in front of the iperf3 server pod (network test extra `service`: the kube-proxy path)."""
+    return {"apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": name, "labels": {"app": TOOL_LABEL, "run-id": run_id}},
+            "spec": {"selector": {"run-id": run_id, "role": "net-server"},
+                     "ports": [{"port": port, "targetPort": port, "protocol": "TCP"}]}}
+
+
 def probe_pod(node: str, names: PodNames, deadline: int) -> dict:
     pod = _base_pod(names.probe, node, deadline, names.run_id, "probe")
     pod["spec"]["containers"] = [{
@@ -168,11 +269,12 @@ def probe_pod(node: str, names: PodNames, deadline: int) -> dict:
 
 
 def stress_pod(node: str, names: PodNames, deadline: int, stress_cmd: str,
-               memory_limit_mib: int = STRESS_BASE_LIMIT_MIB) -> dict:
+               memory_limit_mib: int = STRESS_BASE_LIMIT_MIB, package: str = "stress-ng",
+               scratch_mib: int = 0, host_network: bool = False) -> dict:
     script = (
         "export DEBIAN_FRONTEND=noninteractive; "
         "if apt-get update -qq >/dev/null 2>&1 && "
-        "apt-get install -y -qq stress-ng >/dev/null 2>&1; then "
+        f"apt-get install -y -qq {package} >/dev/null 2>&1; then "
         f"echo '{STARTED_MARKER}'; {stress_cmd}; "
         f"else echo '{FAILED_MARKER}'; fi"
     )
@@ -187,4 +289,10 @@ def stress_pod(node: str, names: PodNames, deadline: int, stress_cmd: str,
         "resources": {"requests": {"memory": "64Mi"},
                       "limits": {"memory": f"{memory_limit_mib}Mi"}},
     }]
+    if host_network:      # network test: the pod uses the node's own network
+        pod["spec"]["hostNetwork"] = True
+        pod["spec"]["dnsPolicy"] = "ClusterFirstWithHostNet"
+    if scratch_mib:       # disk benchmark: an emptyDir = a directory on the node's own disk, removed with the pod
+        pod["spec"]["containers"][0]["volumeMounts"] = [{"name": "bench", "mountPath": "/bench"}]
+        pod["spec"]["volumes"] = [{"name": "bench", "emptyDir": {"sizeLimit": f"{scratch_mib}Mi"}}]
     return pod

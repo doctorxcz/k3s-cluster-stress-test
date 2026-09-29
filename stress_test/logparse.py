@@ -14,16 +14,22 @@ from pathlib import Path
 from typing import Optional
 
 from .models import Sample
+from .disk import parse_result_line
+from .net import parse_result_line as parse_net_line
 from .summary import StressMetric
 
 HEADER = "=== KUBERNETES STRESS-NG LOG ==="
+MAX_LINE = 4000
 
 _LINE_RE = re.compile(r"^(?P<cool>\[cooldown\]\s+)?\[(?P<h>\d\d):(?P<m>\d\d):(?P<s>\d\d)\]\s+"
-                      r"CPU:\s*(?P<load>.*?)\|\s*Temp:\s*(?P<temps>.*?)\|\s*Clock:\s*(?P<freq>\S+)\s*MHz")
+                      r"CPU:\s*(?P<load>.*?)\|\s*Temp:\s*(?P<temps>.*?)\|\s*Clock:\s*(?P<freq>\S+)\s*MHz"
+                      r"(?:\s*\|\s*Power:\s*(?P<power>[\d.]+)\s*W)?"
+                      r"(?:\s*\|\s*Ping:\s*(?P<ping>[\d.]+\s*ms|lost))?")
+_POWER_LIMITS_RE = re.compile(r"^Power limits:\s*PL1\s+([\d.]+)\s*W(?:,\s*PL2\s+([\d.]+)\s*W)?")
 _CPU_PCT_RE = re.compile(r"(?:^|\s)(\d+)%|\((\d+)%\)")
 _RAM_RE = re.compile(r"RAM:\s*(\d+)\s*Mi(?:B)?\s*\((\d+)%\)")
 _CPU_TEMP_RE = re.compile(r"CPU:\s*(\d+)\s*°C")
-_STAGE_RE = re.compile(r"▶ Stage (\d+)/(\d+):\s*(\d+)\s*%")
+_STAGE_RE = re.compile(r"▶ (?:Stage|Low|Spike!) (\d+)/(\d+):\s*(\d+)\s*%")
 _CONCURRENT_RE = re.compile(r"^Concurrency:\s*yes\s*\((\d+)")
 _STAGE_ROW_RE = re.compile(r"^(\d+)/(\d+)\s+\d+\s*%\s*→.*?([\d.]+)\s*bogo ops/s\s*$")
 _BASELINE_RE = re.compile(r"idle before test\s+(\d+)\s*°C")
@@ -41,9 +47,15 @@ class RunData:
     notes: str = ""
     concurrent: int = 1                          # how many nodes were tested at once (the Concurrency: line)
     stage_ops: dict[int, float] = field(default_factory=dict)   # bogo ops/s of cpu per stage
-    profile: str = "classic"                     # "classic" or "stepped" (the Profile: line)
+    profile: str = "classic"                     # "classic", "stepped" or "spike" (the Profile: line)
     stage_targets: list[int] = field(default_factory=list)   # stage targets in %, in order
     baseline_temp: Optional[int] = None          # idle before the test (from the summary in the log)
+    net_results: list = field(default_factory=list)         # NetResult of the network test
+    net_peer: str = ""
+    net_watch: str = ""                                       # "name (ip)" from the header (--net-watch)
+    disk_results: list = field(default_factory=list)        # DiskResult of the disk benchmark
+    disk_health: list[str] = field(default_factory=list)   # lines of the "DISK HEALTH (SMART)" section
+    power_limits: tuple[Optional[float], Optional[float]] = (None, None)   # (PL1, PL2) in W from the header
     metrics: list[StressMetric] = field(default_factory=list)
     samples: list[Sample] = field(default_factory=list)
 
@@ -70,7 +82,10 @@ def _parse_sample_line(line: str) -> Optional[tuple[int, Sample]]:
         t=0.0, phase="cooldown" if match["cool"] else "test",
         cpu_temp=int(temp.group(1)) if temp else None, freq_mhz=freq, cpu_pct=cpu_pct,
         mem_used_mib=int(ram.group(1)) if ram else None,
-        mem_used_pct=float(ram.group(2)) if ram else None)
+        mem_used_pct=float(ram.group(2)) if ram else None,
+        power_w=float(match["power"]) if match["power"] else None,
+        ping_ms=float(match["ping"].split()[0]) if match["ping"] and match["ping"] != "lost" else None,
+        ping_lost=match["ping"] == "lost")
 
 
 def _parse_metrics(text: str) -> list[StressMetric]:
@@ -94,8 +109,16 @@ def parse_log(text: str, path: str = "") -> RunData:
     run = RunData(path=path)
     raw: list[tuple[int, Sample, int]] = []
     current_stage = 0
+    in_smart = False
     for line in lines:
-        stripped = line.strip()
+        stripped = line.strip()[:MAX_LINE]        # a hostile very long line must not make the regexes crawl
+        if stripped.startswith("==="):
+            in_smart = stripped == "=== DISK HEALTH (SMART) ==="
+            continue
+        if in_smart:
+            if stripped:
+                run.disk_health.append(stripped)
+            continue
         if stripped.startswith("Node:") and run.node == "?":
             run.node = stripped.split(":", 1)[1].strip()
         elif stripped.startswith("Started:") and not run.started:
@@ -109,8 +132,26 @@ def parse_log(text: str, path: str = "") -> RunData:
         elif _STAGE_ROW_RE.match(stripped):
             row = _STAGE_ROW_RE.match(stripped)
             run.stage_ops[int(row.group(1))] = float(row.group(3))
+        elif stripped.startswith("Net result:"):
+            net_result = parse_net_line(stripped)
+            if net_result:
+                run.net_results.append(net_result)
+        elif stripped.startswith("Network watch:"):
+            run.net_watch = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Network peer:"):
+            run.net_peer = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Disk result:"):
+            result = parse_result_line(stripped)
+            if result:
+                run.disk_results.append(result)
+        elif _POWER_LIMITS_RE.match(stripped):
+            pl = _POWER_LIMITS_RE.match(stripped)
+            run.power_limits = (float(pl.group(1)), float(pl.group(2)) if pl.group(2) else None)
         elif stripped.startswith("Profile:"):
-            run.profile = "stepped" if "stepped" in stripped.lower() else "classic"
+            low = stripped.lower()
+            word = low.split(":", 1)[1].split()[0] if low.split(":", 1)[1].split() else ""
+            run.profile = {"stepped": "stepped", "spike": "spike", "disk": "disk",
+                           "network": "net"}.get(word, "classic")
         stage = _STAGE_RE.search(stripped)
         if stage:
             current_stage = int(stage.group(1))
@@ -140,7 +181,8 @@ def parse_log(text: str, path: str = "") -> RunData:
                 t=float(offset), phase=sample.phase, cpu_temp=sample.cpu_temp,
                 freq_mhz=sample.freq_mhz, cpu_pct=sample.cpu_pct,
                 mem_used_mib=sample.mem_used_mib, mem_used_pct=sample.mem_used_pct,
-                stage=stage_no))
+                stage=stage_no, power_w=sample.power_w,
+                ping_ms=sample.ping_ms, ping_lost=sample.ping_lost))
     return run
 
 

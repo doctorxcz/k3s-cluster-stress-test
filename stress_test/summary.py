@@ -233,6 +233,12 @@ class RunStats:
     recovery_s: float
     cool_span: float
     stages: tuple[StageStats, ...] = ()
+    power_avg: Optional[float] = None       # W, CPU package (RAPL), test phase
+    power_max: Optional[float] = None
+    ping_n: int = 0                          # --net-watch: pings sent during the test
+    ping_lost: int = 0
+    ping_avg: Optional[float] = None         # ms
+    ping_max: Optional[float] = None
 
 
 def run_stats(samples: Sequence[Sample], base_temp: Optional[int],
@@ -244,6 +250,9 @@ def run_stats(samples: Sequence[Sample], base_temp: Optional[int],
     temps = [s.cpu_temp for s in test if s.cpu_temp is not None]
     freqs = [s.freq_mhz for s in test if s.freq_mhz is not None]
     loads = [s.cpu_pct for s in test if s.cpu_pct is not None]
+    watts = [s.power_w for s in test if s.power_w is not None]
+    pings = [s.ping_ms for s in test if s.ping_ms is not None]
+    lost = sum(1 for s in test if s.ping_lost)
     suspected, text, stages = _throttling(test, stage_targets, stage_metrics)
     reached, recovery = recovery_time(test, cool, base_temp)
     return RunStats(
@@ -260,7 +269,10 @@ def run_stats(samples: Sequence[Sample], base_temp: Optional[int],
         phases=cooldown_phases(test, cool), baseline_temp=base_temp,
         recovery_reached=reached, recovery_s=recovery,
         cool_span=(cool[-1].t - test[-1].t) if (cool and test) else 0.0,
-        stages=tuple(stages))
+        stages=tuple(stages),
+        power_avg=_mean(watts) if watts else None, power_max=max(watts) if watts else None,
+        ping_n=len(pings) + lost, ping_lost=lost,
+        ping_avg=_mean(pings) if pings else None, ping_max=max(pings) if pings else None)
 
 
 def _cooldown_lines(test: Sequence[Sample], cool: Sequence[Sample],
@@ -354,6 +366,28 @@ def build_summary(samples: Sequence[Sample], baseline: Optional[ProbeData],
     if loads:
         out.append(row("CPU load (test)",
                        f"avg {_mean(loads):.0f} % | max {max(loads):.0f} %"))
+    watts = [s.power_w for s in test if s.power_w is not None]
+    if watts:
+        limits = ""
+        if baseline and baseline.pl1_w:
+            limits = f"   (limit PL1 {baseline.pl1_w:.0f} W" + (
+                f", PL2 {baseline.pl2_w:.0f} W)" if baseline.pl2_w else ")")
+        out.append(row("CPU power (test)", f"avg {_mean(watts):.1f} | max {max(watts):.1f} W{limits}"))
+        if baseline and baseline.pl1_w and _mean(watts) >= 0.95 * baseline.pl1_w and freqs:
+            notes.append(f"The average power ({_mean(watts):.0f} W) is at the PL1 limit ({baseline.pl1_w:.0f} W): "
+                         f"the clock is held down by the power limit (BIOS/firmware), not necessarily by heat.")
+    pings = [s.ping_ms for s in test if s.ping_ms is not None]
+    lost = sum(1 for s in test if s.ping_lost)
+    if pings or lost:
+        idle = f"   (idle before test {baseline.ping_ms:.2f} ms)" if baseline and baseline.ping_ms is not None else ""
+        avg = f"avg {_mean(pings):.2f} | max {max(pings):.2f} ms, " if pings else ""
+        out.append(row("Network latency (test)", f"{avg}lost {lost} of {len(pings) + lost}{idle}"))
+        if lost:
+            notes.append(f"{lost} of {len(pings) + lost} pings to the watched node got no reply while the node was "
+                         f"loaded: the load disturbs the network (or the node cannot keep up).")
+        elif pings and baseline and baseline.ping_ms and _mean(pings) > 3 * baseline.ping_ms and _mean(pings) > 1.0:
+            notes.append(f"Latency to the watched node rose from {baseline.ping_ms:.2f} ms (idle) to "
+                         f"{_mean(pings):.2f} ms (average under load).")
     rams = [s for s in test if s.mem_used_mib is not None]
     if rams:
         peak = max(rams, key=lambda s: s.mem_used_mib)

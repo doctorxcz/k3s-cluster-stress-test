@@ -172,10 +172,33 @@ def child_args(cfg: StressConfig, options: SeriesOptions, log_file: str, concurr
             "--log-file", log_file, "--max-temp", str(cfg.max_temp),
             "--cooldown", str(cfg.cooldown), "--interval", str(options.interval),
             "--remaining-every", str(options.remaining_every),
-            "--concurrent", str(concurrent), "--notes", cfg.notes]
+            "--concurrent", str(concurrent), "--notes", cfg.notes, "--export", cfg.export]
+    if not cfg.baseline_check:
+        args.append("--no-baseline-check")
+    if cfg.net_watch:
+        args += ["--net-watch", cfg.net_watch]
+    if cfg.smart:
+        args.append("--smart")
+    if cfg.allow_bad_disk:
+        args.append("--allow-bad-disk")
     if cfg.stepped:
         args += ["--profile", "stepped", "--steps", ",".join(str(s) for s in cfg.steps),
                  "--step-time", str(cfg.step_time)]
+    elif cfg.net:
+        args += ["--profile", "net", "--net-time", str(cfg.net_time), "--net-mode", cfg.net_mode,
+                 "--net-rate", str(cfg.net_rate)]
+        if cfg.net_peer:
+            args += ["--net-peer", cfg.net_peer]
+        if cfg.net_extra:
+            args += ["--net-extra", ",".join(cfg.net_extra)]
+    elif cfg.disk:
+        args += ["--profile", "disk", "--disk-size", str(cfg.disk_size),
+                 "--disk-job-time", str(cfg.disk_job_time)]
+    elif cfg.spike:
+        args += ["--profile", "spike", "--spike-target", str(cfg.spike_target),
+                 "--spike-low-time", str(cfg.spike_low_time),
+                 "--spike-high-time", str(cfg.spike_high_time),
+                 "--time", str(cfg.duration)]
     else:
         args += ["--profile", "classic", "--time", str(cfg.duration),
                  "--cpu-load", str(cfg.cpu_load)]
@@ -206,9 +229,9 @@ def outcome_from_log(node: NodeInfo, cfg: StressConfig, log_path: str,
     except (OSError, ValueError) as exc:
         outcome.reason = f"could not read the log ({exc})"
         return outcome
-    targets = run.stage_targets if cfg.stepped and run.stage_targets else None
+    targets = run.stage_targets if cfg.multi_stage and run.stage_targets else None
     outcome.stats = run_stats(run.samples, run.baseline_temp, WARN_TEMP, stage_targets=targets)
-    if cfg.stepped and run.stage_ops:
+    if cfg.multi_stage and run.stage_ops:
         outcome.metrics = [StressMetric("cpu", 0, 0.0, run.stage_ops[max(run.stage_ops)])]
     else:
         outcome.metrics = list(run.metrics)

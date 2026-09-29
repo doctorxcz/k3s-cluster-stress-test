@@ -78,6 +78,22 @@ def unregister(run_id: str) -> None:
         pass
 
 
+def _is_ours(pid: int) -> bool:
+    """Is this PID really a stress_test process? (A stale record's PID may have been given to an unrelated process.)
+
+    Without /proc (macOS) it cannot be checked and the PID is trusted, like before.
+    """
+    if pid == os.getpid():
+        return True
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return not Path("/proc/self").exists()
+    except OSError:
+        return False
+    return b"stress_test" in cmdline or b"stress.sh" in cmdline
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -99,7 +115,7 @@ def list_running() -> list[dict]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if _alive(int(data.get("pid", 0))):
+        if _alive(int(data.get("pid", 0))) and _is_ours(int(data.get("pid", 0))):
             running.append(data)
         else:
             try:

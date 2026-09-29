@@ -1,39 +1,43 @@
 # Kubernetes stress test (Python)
 
-> **English build 1.6.1a** — functionally identical to 1.6.0, with every message, log line, help text,
-> document, comment and test translated to English. Result logs written by this build are in English.
+> **Version 1.15.0 (English).** New here? Start with [`HELPDESK.md`](HELPDESK.md) — a step-by-step
+> installation and troubleshooting guide. Quick start: `./stress.sh --list-nodes`, then
+> `./stress.sh --node <worker> --time 60 --cpu-load 50` (a safe first test) or just `./stress.sh` for the menu.
 
 Load test of a node in a k3s/Kubernetes cluster. It starts `stress-ng` in a pod directly on the chosen
 node, measures load, temperatures and CPU clock during the test and **stops the test by itself when the node
 overheats**. It is a rewrite of the original script `stress-node-v5.sh` in Python (no external
 dependencies, only the standard library and `kubectl`).
 
+## Main menu (since 1.15.0)
+```
+==============================================
+   KUBERNETES STRESS TEST          v1.15.0
+   cluster: 4 nodes (3 workers + 1 master), all Ready
+==============================================
+  [1] CPU load             classic · stepped · spike
+  [2] Disk                 fio: MB/s, IOPS, latency · SMART
+  [3] Network              one node · matrix of all nodes
+  [4] Quick test           one node, 10 min, few questions
+  [5] Results              compare · baseline · export
+  [6] Management           what runs · stop · nodes
+  [0] Quit
+```
+Run `./stress.sh` with no options. Each entry (some open a submenu) only picks WHAT to do; the program then asks the usual
+questions (node, duration, ...). The chosen options are printed as the equivalent command, so you learn the flags, and after the
+test you are back in the menu. The menu is skipped when you give any option, when the input is not a terminal, or with
+`STRESS_NO_MENU=1`.
+
 ## Requirements
 - Python 3.9+ (tested on 3.12)
 - `kubectl` with access to the cluster (k3s ships a symlink `/usr/local/bin/kubectl`)
 - `metrics-server` (for the `kubectl top` fallback of the RAM test; default in k3s)
 - a node with internet access (the pods pull the image and install `stress-ng` via `apt`)
-
-## Getting started on your own cluster
-1. **Clone/download** this repo onto a machine that can reach your cluster (typically the master, but
-   any machine with a working `kubectl` context works).
-2. **Point `kubectl` at your cluster** — this tool has no config of its own, it just runs `kubectl` with
-   whatever context/kubeconfig is already active (`kubectl config current-context` to check,
-   `kubectl get nodes` to confirm access).
-3. **List your node names** with `kubectl get nodes` — that's exactly what you pass to `--node NAME`
-   (or just run the tool without `--node` and pick from the interactive list).
-4. **Master/control-plane detection is automatic** — the tool reads the node's role from Kubernetes
-   itself (no node names are hardcoded anywhere), so master protection (lower CPU cap, lower temperature
-   limit, confirmation prompt) applies to whichever node actually has the control-plane role in *your*
-   cluster.
-5. **Run it**: `python3 -m stress_test` (interactive) or `./stress.sh` — see options below. Start with a
-   short, low-impact run (e.g. `--time 60 --cpu-load 50`) on one worker node before testing the whole
-   cluster or the master.
-6. **Requirements on the node being tested**: internet access (the pod installs `stress-ng` via `apt`)
-   and, for the RAM test fallback, `metrics-server` in the cluster (`kubectl top nodes` should work).
-
-No cloud credentials, tokens or external accounts are needed — everything runs through your own
-`kubectl` access.
+- nothing to install on the nodes themselves: the tools the tests need (`stress-ng`, `fio`, `smartctl`, `iperf3`,
+  `ping`, optionally `mtr`/`curl`) are installed by the pods with `apt` at run time and removed with the pod
+- `--smart` and `--hw-privileged` start a **privileged** pod — the cluster must allow privileged pods
+- network tests need open TCP/UDP ports 30000–32767 between the nodes (see the warning below)
+- installation step by step: [`HELPDESK.md`](HELPDESK.md)
 
 ## Usage
 From the project folder (e.g. `~/cluster-testing/python-stress-test-en`):
@@ -59,7 +63,14 @@ python3 -m stress_test --help
 | `--status` | shows tests running in the background and the tool's pods in the cluster |
 | `--stop ID\|NODE\|PID` | gracefully stops a test running in the background (pod cleanup) |
 | `--compare LOG [LOG]` | compare two tests from logs (or just a node name = its two newest), see below |
-| `--profile classic\|stepped` | classic test (default), or stepped 25/50/75/100 % (always logged) |
+| `--profile classic\|stepped\|spike\|disk\|net` | classic test (default), stepped 25/50/75/100 % (always logged), spike (repeating jump between a low and a high load), disk benchmark (fio) or network test (iperf3) |
+| `--spike-target %` | spike test: target CPU load of the high phase (see `--help` for the allowed values) |
+| `--spike-low-time DURATION` / `--spike-high-time DURATION` | spike test: length of the low (10 %) and the high phase in every cycle |
+| `--net-time DURATION` | network test: length of one iperf3 test (5–60 s) |
+| `--schedule HH:MM` | start the test later (the nearest occurrence of that time), typically together with `-b` |
+| `--dry-run` | only show what would be started (node, settings) and exit; nothing runs on the cluster |
+| `--list-nodes` | list the cluster's nodes (role, state) and exit |
+| `--no-background` | run in the foreground (the opposite of `-b`) |
 | `--steps 25,50,75,100` | stages of the stepped test in % |
 | `--step-time DURATION` | length of one stage (default 3 min) |
 | `--workers` / `--cluster` / `--nodes a,b` | test several nodes one after another (workers / the whole cluster / a list) |
@@ -160,6 +171,73 @@ enough (temperature 2 °C, performance 2 %, time above 80 °C 10 s, return to id
   test length, a different load (other stressors), missing cooldown. Compare runs with the same settings and
   at a similar ambient temperature.
 - It does not need `kubectl`, it only reads files. Change the logs folder with `--log-dir`.
+
+## Export and baseline (since 1.11.0)
+Every logged test also produces a machine-readable `<log>.json` next to the log (`--export json|csv|both|none`,
+csv holds only the measurements: `t, phase, stage, cpu_temp, freq_mhz, cpu_pct, mem_used_mib, mem_used_pct`).
+Older logs: `./stress.sh --export-log dell-9020-sff-i7` (a log or a node = its newest log).
+
+Baseline = a saved reference result of a node:
+```bash
+./stress.sh --set-baseline dell-9020-sff-i7     # the newest test of the node becomes its baseline
+```
+At the end of every later test of that node a `BASELINE CHECK` is printed: max temperature, average clock,
+performance and throttling against the baseline, with the verdict `OK` or `REGRESSION` (limits: +5 °C,
+-5 % clock, -5 % performance). Different profile or stages = "not comparable". `--no-baseline-check` skips it.
+The baselines are in `logs/baselines/<node>.json`.
+
+## CPU power, disk health and disk benchmark (since 1.12.0)
+- **Power:** on Intel machines the measurement line ends with `| Power: 17.3 W` (RAPL, no privileged mode).
+  The log header and summary show the PL1/PL2 limits; if the average power sits at PL1, the summary says the
+  clock is limited by power. Not available on AMD/ARM (nothing is printed).
+- **`--smart`** (preflight, PRIVILEGED pod): reads SMART of all disks. A failed health check refuses the test,
+  `--allow-bad-disk` tests anyway. Reallocated sectors, NVMe wear >= 90 %, media errors and a hot disk are warnings.
+- **`--profile disk`** (menu item 2): an fio benchmark instead of a CPU load - sequential and random read/write.
+  `--disk-size MiB`, `--disk-job-time`. The file lives in an emptyDir on the node's disk and is removed with the pod.
+  On the master only read jobs with a 256 MiB file run. Results (MB/s, IOPS, latency) are in the log, the JSON
+  and in the baseline check.
+
+## ⚠️ Network tests: open TCP/UDP ports 30000–32767 between the nodes
+`--profile net` and `--net-matrix` run an `iperf3` server on one node and a client on another. The port comes from the
+Kubernetes **NodePort range** (32000–32699; the matrix uses 32100 and up). **A node firewall that lets in only chosen ports
+makes these tests fail** (the pair shows `x`, "iperf3 failed (peer unreachable / port blocked?)") - even though ping works.
+
+| Protocol | Ports | For |
+|---|---|---|
+| TCP | 30000-32767 | iperf3 TCP tests |
+| UDP | 30000-32767 | iperf3 UDP test (jitter, loss) |
+| ICMP | echo | ping, MTU probe, `--net-watch`, `mtr` |
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 30000:32767 proto tcp   # replace with your subnet
+sudo ufw allow from 192.168.1.0/24 to any port 30000:32767 proto udp
+```
+That range is usually open on a Kubernetes node already (NodePort Services use it). The pods also need internet access once
+(`apt` installs `iperf3`, `iputils-ping`, optionally `curl`/`mtr-tiny`). Details and troubleshooting: `HELPDESK.md` (step 8).
+
+## Network test (since 1.13.0)
+```bash
+./stress.sh --node dell-9020-sff-i7 --profile net                       # against an automatically chosen peer
+./stress.sh --node hp-g2-celeron --profile net --net-peer hp-705-g4-a10 --net-mode pod
+```
+An iperf3 server pod starts on the peer, the tested node runs the client (both pods `hostNetwork` in `host` mode, so the
+real NIC is measured; `pod` mode goes through the pod network). Jobs: link speed/duplex, ping (latency, jitter, loss), path MTU,
+TCP up/down, TCP with 4 streams, UDP (jitter, loss), NIC error counters. Typical findings the summary points out: a link
+negotiated at 100 Mb/s (bad cable/port), half duplex, packet loss, big difference between up and down, retransmits.
+`--net-rate` caps the TCP tests; when the master is on either end they are capped at 300 Mbit/s so the API keeps its network.
+Needs internet on both nodes (apt installs iperf3 and iputils-ping) and a free TCP/UDP port (5201 + a per-run offset).
+
+### More network tools (since 1.14.0)
+```bash
+./stress.sh --net-matrix --yes                          # every pair of nodes, tables + findings
+./stress.sh --node hp-g2-celeron --time 5m --net-watch  # any test + ping to the master during the load
+./stress.sh --node dell-9020-sff-i7 --profile net --net-mode pod --net-extra all
+```
+- `--net-matrix` needs at least two Ready nodes, refuses while another test of the tool runs and asks before loading the network
+  (`--yes`); the master is capped at 300 Mbit/s. Results: `logs/net-matrix-<date>.log` + `.json`.
+- `--net-watch` adds `| Ping: X ms` (or `lost`) to every measurement line and a "Network latency" row to the summary.
+- `--net-extra dns,internet,mtr,service|all` adds jobs to the network test (the `service` job goes through a temporary Kubernetes
+  Service that is deleted at the end).
 
 ## Stepped test and testing several nodes (since 1.5.0)
 **What to test** and **which test** are chosen at startup (interactively by questions, or by options):
@@ -353,11 +431,20 @@ stress_test/
   parallel.py   workers at once (subprocesses), live table, API response guard
   paths.py      where logs are stored (logs/, .logs/debug/, .logs/tests/)
   debuglog.py   the hidden technical log of every run
+  menu.py       the main menu (since 1.15.0)
+  export.py     export of results (--export, --export-log)
+  baseline.py   baseline of a node and the comparison with it (--set-baseline)
+  smart.py      SMART disk health (--smart)
+  disk.py       fio disk benchmark (--profile disk)
+  net.py        network test of one node (--profile net, --net-extra, --net-watch)
+  netmatrix.py  network matrix of all nodes (--net-matrix)
 conftest.py     writes the history of pytest runs to .logs/tests/
 tests/
   test_parsing.py, test_models.py, test_monitor.py, test_summary.py, test_compare.py,
   test_series.py, test_parallel.py, test_background.py,
-  test_paths_and_debuglog.py                          unit tests
+  test_paths_and_debuglog.py, test_spike.py, test_export_baseline.py, test_smart.py, test_disk.py,
+  test_net.py, test_net_extras.py, test_net_watch.py, test_netmatrix.py, test_power.py,
+  test_menu.py, test_security.py                      unit tests
   fake_kubectl.py + test_integration.py               the whole flow against a fake kubectl
 ```
 

@@ -78,7 +78,8 @@ def test_force_env_skips_master_protection(tmp_path):
     res = run_tool(tmp_path, "--time", "5",
                    env_extra={"FAKE_MASTER": "1", "FORCE": "1", "FAKE_RUN": "2"})
     assert res.returncode == 0, res.stdout
-    assert "MASTER" not in res.stdout
+    assert "is the MASTER (control-plane)" not in res.stdout                 # no protection prompt / caps ...
+    assert "MASTER PROTECTION BYPASSED by the FORCE=1" in res.stdout         # ... but the bypass is announced
 
 
 def test_refuses_to_start_when_node_already_hot(tmp_path):

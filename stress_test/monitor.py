@@ -9,7 +9,7 @@ from typing import Callable, Optional
 from .kube import Kubectl, KubectlError
 from .manifests import PROBE_SCRIPT
 from .models import PROBE_POD, WARN_TEMP, ProbeData, Sample
-from .parsing import cpu_percent, format_duration, parse_probe_output
+from .parsing import cpu_percent, format_duration, parse_probe_output, power_watts
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +38,8 @@ class OverheatGuard:
 
 
 def format_reading(cpu_pct: Optional[float], probe: ProbeData,
-                   warn_temp: int = WARN_TEMP, now: Optional[str] = None) -> str:
+                   warn_temp: int = WARN_TEMP, now: Optional[str] = None,
+                   power_w: Optional[float] = None) -> str:
     """One line of output/log: time | CPU, RAM | temperatures | clock.
 
     CPU % is computed from the difference of the /proc/stat counters between two readings, RAM from
@@ -55,7 +56,10 @@ def format_reading(cpu_pct: Optional[float], probe: ProbeData,
     if probe.cpu_temp is not None and probe.cpu_temp >= warn_temp:
         temps += " ⚠️ OVERHEATING!"
     freq = f"{probe.freq_mhz} MHz" if probe.freq_mhz is not None else "? MHz"
-    return f"[{stamp}] CPU: {cpu}, RAM: {ram} | Temp: {temps} | Clock: {freq}"
+    power = f" | Power: {power_w:.1f} W" if power_w is not None else ""
+    ping = (" | Ping: lost" if probe.ping_lost else
+            f" | Ping: {probe.ping_ms:.2f} ms" if probe.ping_ms is not None else "")
+    return f"[{stamp}] CPU: {cpu}, RAM: {ram} | Temp: {temps} | Clock: {freq}{power}{ping}"
 
 
 def format_remaining(elapsed_s: float, total_s: int,
@@ -88,6 +92,7 @@ class Monitor(threading.Thread):
                  probe_pod: str = PROBE_POD,
                  emit_info: Optional[Callable[[str], None]] = None,
                  clock: Callable[[], float] = time.monotonic,
+                 ping_target: str = "",
                  initial: Optional[ProbeData] = None) -> None:
         super().__init__(daemon=True)
         self.kube = kube
@@ -102,9 +107,11 @@ class Monitor(threading.Thread):
         self.remaining_every = remaining_every   # 0 = do not print
         self.emit_info = emit_info or emit
         self._clock = clock
+        self._script = (f'PING_TARGET="{ping_target}"\n' if ping_target else "") + PROBE_SCRIPT
         self._t0 = clock()                       # start of measuring = start of the test
         self._ticks = 0
         self._prev_cpu = initial.cpu_stat if initial else None   # base for CPU %
+        self._prev_energy: Optional[tuple[int, float]] = None    # (RAPL µJ, time) base for power
         self.phase = "test"
         self.stage = 0                           # stage number of the stepped test (0 = none)
         self.guard_active = True
@@ -129,7 +136,7 @@ class Monitor(threading.Thread):
     def _tick(self) -> None:
         phase, stage = self.phase, self.stage     # state at the start of the reading (the probe takes a while)
         try:
-            probe = parse_probe_output(self.kube.exec(self.probe_pod, PROBE_SCRIPT))
+            probe = parse_probe_output(self.kube.exec(self.probe_pod, self._script))
         except KubectlError as exc:
             log.warning("reading the probe failed: %s", exc)
             probe = ProbeData()
@@ -137,13 +144,18 @@ class Monitor(threading.Thread):
         cpu_pct = cpu_percent(self._prev_cpu, current)
         if current is not None:
             self._prev_cpu = current
+        now = self._clock()
+        power_w = power_watts(self._prev_energy, probe.energy_uj, now, probe.energy_max_uj)
+        if probe.energy_uj is not None:
+            self._prev_energy = (probe.energy_uj, now)
         self._ticks += 1
         self.samples.append(Sample(
             t=self._clock() - self._t0, phase=phase, cpu_temp=probe.cpu_temp,
             freq_mhz=probe.freq_mhz, cpu_pct=cpu_pct,
             mem_used_mib=probe.mem_used_mib, mem_used_pct=probe.mem_used_pct,
-            stage=stage if phase == "test" else 0))
-        self.emit(format_reading(cpu_pct, probe, self.warn_temp))
+            stage=stage if phase == "test" else 0, power_w=power_w,
+            ping_ms=probe.ping_ms, ping_lost=probe.ping_lost))
+        self.emit(format_reading(cpu_pct, probe, self.warn_temp, power_w=power_w))
         if (phase == "test" and self.remaining_every > 0 and self.total_seconds > 0
                 and self._ticks % self.remaining_every == 0):
             self.emit_info(format_remaining(self._clock() - self._t0,

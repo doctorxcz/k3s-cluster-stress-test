@@ -111,7 +111,7 @@ def _ops(run: RunData) -> dict[str, float]:
 
 
 def _stats(run: RunData, warn_temp: int) -> RunStats:
-    targets = run.stage_targets if run.profile == "stepped" and run.stage_targets else None
+    targets = run.stage_targets if run.profile in ("stepped", "spike") and run.stage_targets else None
     return run_stats(run.samples, run.baseline_temp, warn_temp, stage_targets=targets)
 
 
@@ -120,9 +120,9 @@ def _concurrent_text(run: RunData) -> str:
 
 
 def _profile_text(run: RunData) -> str:
-    if run.profile == "stepped" and run.stage_targets:
-        return "stepped " + "/".join(str(t) for t in run.stage_targets) + " %"
-    return "stepped" if run.profile == "stepped" else "classic"
+    if run.profile in ("stepped", "spike") and run.stage_targets:
+        return run.profile + " " + "/".join(str(t) for t in run.stage_targets) + " %"
+    return run.profile
 
 
 # --- main function --------------------------------------------------------------------------
@@ -237,10 +237,10 @@ def _warnings(a: RunData, b: RunData, sa: RunStats, sb: RunStats) -> list[str]:
         notes.append(f"The tests ran with a different node parallelism ({a.concurrent} and {b.concurrent}): "
                      f"the load of the other machines changes the ambient temperature and power draw.")
     if a.profile != b.profile:
-        notes.append("The tests have a different profile (classic and stepped), performance and temperatures are not "
-                     "directly comparable.")
-    elif a.profile == "stepped" and a.stage_targets != b.stage_targets:
-        notes.append("The stepped tests have different stages, only the same ones are compared.")
+        notes.append(f"The tests have a different profile ({a.profile} and {b.profile}), performance and "
+                     "temperatures are not directly comparable.")
+    elif a.profile in ("stepped", "spike") and a.stage_targets != b.stage_targets:
+        notes.append(f"The {a.profile} tests have different stages, only the same ones are compared.")
     if a.node != b.node:
         notes.append(f"The tests are from different nodes ({a.node} and {b.node}), the comparison is only indicative.")
     if not sa.n_test or not sb.n_test:

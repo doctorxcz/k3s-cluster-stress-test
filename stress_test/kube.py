@@ -4,20 +4,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from typing import Optional
 
 from .models import TOOL_LABEL, NodeInfo, NodeWorkload, ToolPod
-from .parsing import node_from_json, tool_pods_from_json, workload_from_json
+from .parsing import clean_ip, node_from_json, tool_pods_from_json, workload_from_json
 
 
 log = logging.getLogger(__name__)
 _MAX_LOGGED = 2000
 
 
+# values of keys that look like credentials are hidden in the debug log (also inside JSON that is escaped in a JSON string)
+_SECRET_RE = re.compile(r'(\\?"\w*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY)\w*\\?"\s*:\s*\\?")[^"\\]*',
+                        re.IGNORECASE)
+
+
 def _cut(text: str) -> str:
-    text = text.strip()
+    text = _SECRET_RE.sub(r"\1***", text.strip())
     if len(text) <= _MAX_LOGGED:
         return text
     return text[:_MAX_LOGGED] + f"…(+{len(text) - _MAX_LOGGED} chars)"
@@ -41,7 +47,7 @@ class Kubectl:
         started = time.monotonic()
         try:
             proc = subprocess.run(cmd, input=input_text, capture_output=True,
-                                  text=True, timeout=timeout)
+                                  text=True, errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             log.error("kubectl timed out after %ss: %s", timeout, " ".join(cmd))
             raise KubectlError(f"Timed out: {' '.join(cmd)}") from exc
@@ -114,6 +120,23 @@ class Kubectl:
         return self.run("get", "pod", pod, "-o", "jsonpath={.status.phase}",
                         check=False).strip()
 
+    def pod_ip(self, pod: str) -> str:
+        return clean_ip(self.run("get", "pod", pod, "-o", "jsonpath={.status.podIP}", check=False))
+
+    def used_node_ports(self) -> set:
+        """NodePorts taken by Services of the whole cluster (an empty set if they cannot be listed)."""
+        try:
+            items = self.get_json("services", "-A").get("items", [])
+        except (KubectlError, ValueError):
+            return set()
+        return {p["nodePort"] for s in items for p in s.get("spec", {}).get("ports", []) if p.get("nodePort")}
+
+    def service_ip(self, name: str) -> str:
+        return clean_ip(self.run("get", "service", name, "-o", "jsonpath={.spec.clusterIP}", check=False))
+
+    def delete_service(self, name: str) -> None:
+        self.run("delete", "service", name, "--ignore-not-found", check=False, timeout=60)
+
     def logs(self, pod: str) -> str:
         return self.run("logs", pod, check=False)
 
@@ -121,7 +144,7 @@ class Kubectl:
         log.debug("kubectl logs -f %s (stream)", pod)
         return subprocess.Popen([self.binary, "logs", "-f", pod],
                                 stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True, errors="replace")
 
-    def exec(self, pod: str, script: str) -> str:
-        return self.run("exec", pod, "--", "sh", "-c", script, timeout=30)
+    def exec(self, pod: str, script: str, timeout: int = 30) -> str:
+        return self.run("exec", pod, "--", "sh", "-c", script, timeout=timeout)

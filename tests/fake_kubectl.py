@@ -80,6 +80,8 @@ def node_object(spec):
             "conditions": [{"type": "Ready", "status": "True" if spec.get("ready", True) else "False"}],
             "allocatable": {"memory": "8000000Ki"},
             "capacity": {"cpu": "8"},
+            "addresses": [{"type": "InternalIP", "address": spec.get("ip", "10.0.0.1")},
+                          {"type": "Hostname", "address": spec["name"]}],
             "nodeInfo": {"osImage": "FakeOS", "kernelVersion": "1.0",
                          "architecture": "amd64", "containerRuntimeVersion": "fake://1"},
         },
@@ -123,12 +125,17 @@ if cmd == "get":
                           "spec": {"nodeName": p["node"]},
                           "status": {"phase": p["phase"]}})
         print(json.dumps({"items": items}))
+    elif args[1] == "services":                   # all Services (NodePorts in use)
+        ports = json.loads(os.environ.get("FAKE_NODEPORTS", "[]"))
+        print(json.dumps({"items": [{"spec": {"ports": [{"nodePort": p} for p in ports]}}]}))
+    elif args[1] == "service":                    # Service address (jsonpath)
+        print("" if os.environ.get("FAKE_NO_SERVICE_IP") == "1" else "10.43.0.7")
     elif args[1] == "pod":                        # pod phase (jsonpath)
         pod = args[2]
         if pod.startswith("stress-test") and deleted(pod):
             print("Error from server (NotFound): pods not found", file=sys.stderr)
             sys.exit(1)
-        print("Succeeded")
+        print("10.42.0.9" if "jsonpath={.status.podIP}" in args else "Succeeded")
 elif cmd == "top":
     print("fake-node 1000m 12% 2000Mi 25%")
 elif cmd == "apply":
@@ -155,6 +162,10 @@ elif cmd == "wait":
 elif cmd == "logs":
     pod = args[-1]
     rid = rid_of(pod)
+    if os.environ.get("FAKE_BAD_UTF8") == "1":                 # a pod that prints bytes which are not valid UTF-8
+        sys.stdout.flush()
+        sys.stdout.buffer.write(b"caf\xe9 \xff\xfe not utf-8\n")
+        sys.stdout.buffer.flush()
     if "-f" in args:
         run_total = float(os.environ.get("FAKE_RUN", "4"))
         kill = os.environ.get("FAKE_KILL_AFTER")
@@ -194,7 +205,78 @@ elif cmd == "logs":
             print(f"stress-ng: metrc: [1] cpu               {percent * 800}    180.01    112.28      0.21       {percent * 6.5:.2f}         702.96", flush=True)
             print("stress-ng: info:  [1] successful run completed in 3 mins, 0.01 secs", flush=True)
 
-        if stages:
+        net_jobs = re.findall(r'NET-JOB \$i/\d+ (\S+)"', script)
+        if net_jobs:                                                # network test: one result per job
+            print("STRESS-NG STARTED", flush=True)
+            mbps = float(os.environ.get("FAKE_NET_MBPS", "940"))
+            errs = int(os.environ.get("FAKE_NET_ERR", "0"))
+            n_link = 0
+            for i, name in enumerate(net_jobs, 1):
+                print(f"NET-JOB {i}/{len(net_jobs)} {name}", flush=True)
+                if not run_for(run_total / len(net_jobs)):
+                    finished = False
+                    break
+                if name in ("link", "link-end"):
+                    n_link += 1
+                    e = errs if name == "link-end" else 0
+                    payload = (f"if=eth0 speed={os.environ.get('FAKE_NET_SPEED', '1000')} duplex=full "
+                               f"rx_errors={e} rx_dropped=0 tx_errors=0 tx_dropped=0")
+                elif name == "ping":
+                    loss = os.environ.get("FAKE_NET_LOSS", "0")
+                    payload = (f"50 packets transmitted, 50 received, {loss}% packet loss, time 9800ms "
+                               f"rtt min/avg/max/mdev = 0.210/0.350/0.900/0.080 ms ")
+                elif name == "mtu":
+                    payload = "mtu=1500"
+                elif name == "dns":
+                    payload = (f"cluster_ms={os.environ.get('FAKE_DNS_MS', '1.20')} external_ms=4.50 "
+                               f"fails={os.environ.get('FAKE_DNS_FAILS', '0')}")
+                elif name == "internet":
+                    payload = ""
+                elif name == "mtr":
+                    payload = ("Start: 2026-09-29T14:00:00+0200;HOST: x  Loss%   Snt   Last   Avg  Best  Wrst StDev;"
+                               "  1.|-- 10.0.0.2   0.0%     5    0.3   0.3   0.2   0.5   0.1;")
+                elif name == "udp":
+                    payload = json.dumps({"end": {"sum": {"bits_per_second": 100e6, "jitter_ms": 0.04,
+                                                          "lost_percent": 0.0}}})
+                else:
+                    rate_mbps = float(os.environ.get("FAKE_NET_SVC_MBPS", mbps)) if name == "tcp-svc" else mbps
+                    payload = json.dumps({"end": {"sum_sent": {"retransmits": 2},
+                                                  "sum_received": {"bits_per_second": rate_mbps * 1e6}}})
+                if os.environ.get("FAKE_NET_FAIL") == name:
+                    print(f"NET-FAILED {name}", flush=True)
+                    finished = False
+                    break
+                if name == "internet":
+                    print("NET-RESULT internet-ping 5 packets transmitted, 5 received, 0% packet loss, time 800ms "
+                          "rtt min/avg/max/mdev = 5.0/6.0/7.0/0.8 ms ", flush=True)
+                    print("NET-RESULT internet-down speed=25000000 ttfb=0.056 code=206", flush=True)
+                else:
+                    print(f"NET-RESULT {name} {payload}", flush=True)
+            else:
+                print("NET-DONE", flush=True)
+        disk_jobs = re.findall(r'"(\S+) (?:read|write|randread|randwrite) ', script) if "DISK-JOB" in script else []
+        if net_jobs:
+            pass
+        elif disk_jobs:                                             # disk benchmark (fio): one result per job
+            mbs = float(os.environ.get("FAKE_DISK_MBS", "400"))
+            print("STRESS-NG STARTED", flush=True)
+            for i, name in enumerate(disk_jobs, 1):
+                print(f"DISK-JOB {i}/{len(disk_jobs)} {name}", flush=True)
+                if not run_for(run_total / len(disk_jobs)):
+                    finished = False
+                    break
+                side = "write" if "write" in name else "read"
+                job = {"jobs": [{side: {"io_bytes": 1000, "bw_bytes": int(mbs * 1e6), "iops": mbs * 10,
+                                        "lat_ns": {"mean": 2_000_000.0},
+                                        "clat_ns": {"percentile": {"99.000000": 5_000_000}}}}]}
+                print(f"DISK-RESULT {name} " + json.dumps(job), flush=True)
+                if os.environ.get("FAKE_DISK_FAIL") == "1" and i == 2:
+                    print(f"DISK-FAILED {name}", flush=True)
+                    finished = False
+                    break
+            else:
+                print("DISK-DONE", flush=True)
+        elif stages:
             for i, percent in enumerate(stages, 1):
                 print(f"STRESS-STAGE {i}/{len(stages)} {percent}%", flush=True)
                 write_int(sflag("stage-pct", rid), percent)
@@ -212,10 +294,63 @@ elif cmd == "logs":
                 print("stress-ng: info:  [1] successful run completed in 1 min 5.95 secs", flush=True)
         open(sflag("stress-ended", rid), "w").close()             # the load ended
         event("end", node)
+    elif pod.startswith("net-mx"):                              # network matrix helper pod: installed, waiting
+        bad = os.environ.get("FAKE_MX_NOT_READY", "")
+        try:
+            node = json.load(open(flag(f"manifest-{pod}.json")))["spec"]["nodeName"]
+        except (OSError, KeyError, ValueError):
+            node = "?"
+        print("MX-FAILED" if bad and bad == node else "MX-READY")
     elif pod.startswith("hw-info"):
-        print("CPU: Fake CPU\nThreads: 8")
+        try:
+            with open(flag(f"manifest-{pod}.json")) as fh:
+                kind = json.load(fh)["spec"]["containers"][0]["name"]
+        except (OSError, ValueError, KeyError):
+            kind = "hw-info"
+        if kind == "net-server":                                # network test: the iperf3 server on the peer
+            print("apt noise\n-----------------------------------------------------------\n"
+                  "Server listening on 5201 (test #1)" if os.environ.get("FAKE_NET_SERVER_FAIL") != "1"
+                  else "NET-SERVER-FAILED")
+        elif kind == "smart":                                     # --smart: SMART data of one fake disk
+            if os.environ.get("FAKE_SMART_RAW") is not None:
+                print(os.environ["FAKE_SMART_RAW"])
+            else:
+                passed = "false" if os.environ.get("FAKE_SMART_FAIL") == "1" else "true"
+                realloc = os.environ.get("FAKE_SMART_REALLOC", "0")
+                print("SMART-BEGIN /dev/sda")
+                print(json.dumps({"model_name": "Fake SSD 256GB", "smart_status": {"passed": passed == "true"},
+                                  "temperature": {"current": 35}, "power_on_time": {"hours": 1234},
+                                  "ata_smart_attributes": {"table": [
+                                      {"id": 5, "raw": {"value": int(realloc)}},
+                                      {"id": 197, "raw": {"value": 0}}]}}))
+                print("SMART-END")
+        else:
+            print("CPU: Fake CPU\nThreads: 8")
     else:
         print("STRESS-NG STARTED")
+elif cmd == "exec" and args[1].startswith("net-mx"):           # network matrix helper pods
+    script = args[-1]
+    try:
+        me = json.load(open(flag(f"manifest-{args[1]}.json")))["spec"]["nodeName"]
+    except (OSError, KeyError, ValueError):
+        me = "?"
+    if "/proc/net/route" in script:
+        print(f"if=eth0 speed={json.loads(os.environ.get('FAKE_MX_SPEED', '{}')).get(me, 1000)} duplex=full")
+    elif "MX-PING" in script:                                   # ping from the client node to the server node
+        target = re.search(r"ping -c \d+ -i [\d.]+ -q (\S+)", script).group(1)
+        peer = next((s["name"] for s in NODE_SPECS if s.get("ip") == target), "?")
+        loss = json.loads(os.environ.get("FAKE_MX_LOSS", "{}")).get(f"{me}>{peer}", 0)
+        print(f"MX-PING 10 packets transmitted, 10 received, {loss}% packet loss, time 1800ms "
+              f"rtt min/avg/max/mdev = 0.200/0.400/0.800/0.100 ms ")
+    elif "MX-IPERF" in script:                                  # iperf3 -R run on the server node: data flows peer -> me
+        target = re.search(r"iperf3 -c (\S+) ", script).group(1)
+        sender = next((s["name"] for s in NODE_SPECS if s.get("ip") == target), "?")
+        mbps = json.loads(os.environ.get("FAKE_MX_MBPS", "{}")).get(f"{sender}>{me}", 940.0)
+        if os.environ.get("FAKE_MX_FAIL") == f"{sender}>{me}":
+            print("MX-IPERF iperf3: error - unable to connect")
+        else:
+            print("MX-IPERF " + json.dumps({"end": {"sum_sent": {"retransmits": 1},
+                                                    "sum_received": {"bits_per_second": mbps * 1e6}}}))
 elif cmd == "exec":
     rid = rid_of(args[1])
     started = os.path.exists(sflag("stress-started", rid))
@@ -252,4 +387,14 @@ elif cmd == "exec":
     if os.environ.get("FAKE_NO_MEM") != "1":
         lines.append("mem_total_kb 8000000")
         lines.append(f"mem_available_kb {os.environ.get('FAKE_MEM_AVAILABLE_KB', '6000000')}")
+    if "PING_TARGET=" in args[-1]:                          # --net-watch: the probe pings another node
+        if phase == "load" and os.environ.get("FAKE_PING_LOST_UNDER_LOAD") == "1":
+            lines.append("ping_ms lost")
+        else:
+            lines.append(f"ping_ms {os.environ.get('FAKE_PING_LOAD', '3.0') if phase == 'load' else os.environ.get('FAKE_PING_IDLE', '0.4')}")
+    watts = os.environ.get("FAKE_WATTS")
+    if watts:                                               # RAPL: the energy counter grows by watts * 0.5 s per call (interval of run_tool)
+        energy = read_int(sflag("rapl-uj", rid)) + int(float(watts) * 500_000)
+        write_int(sflag("rapl-uj", rid), energy)
+        lines.append(f"rapl_uj {energy} 262143000000 {os.environ.get('FAKE_PL1_UW', '25000000')} 51000000")
     print("\n".join(lines))

@@ -97,7 +97,7 @@ def plan_config(template: StressConfig, node: NodeInfo) -> tuple[StressConfig, l
 
 def estimate_seconds(cfg: StressConfig) -> int:
     """Rough estimate of the length of the test of one node (preparation + load + cooldown)."""
-    return PREP_SECONDS + cfg.duration + cfg.cooldown
+    return PREP_SECONDS + cfg.total_duration + cfg.cooldown
 
 
 def estimate_total(template: StressConfig, nodes: Sequence[NodeInfo], parallel: bool = False) -> int:
@@ -126,6 +126,10 @@ def plan_lines(template: StressConfig, nodes: Sequence[NodeInfo],
     if template.stepped:
         lines.append(f"Profile: stepped {describe_steps(template.steps)} % for "
                      f"{describe_duration(template.step_time)}")
+    elif template.spike:
+        lines.append(f"Profile: spike - {template.spike_cycles}x "
+                     f"({describe_duration(template.spike_low_time)} / "
+                     f"{describe_duration(template.spike_high_time)} at {template.spike_target} %)")
     else:
         lines.append(f"Profile: classic, CPU load {template.cpu_load} % for "
                      f"{describe_duration(template.duration)}")
@@ -265,6 +269,10 @@ class SeriesRunner:
         if t.stepped:
             self._log(f"Profile: stepped {describe_steps(t.steps)} % for "
                       f"{describe_duration(t.step_time)}")
+        elif t.spike:
+            self._log(f"Profile: spike - {t.spike_cycles}x "
+                      f"({describe_duration(t.spike_low_time)} / "
+                      f"{describe_duration(t.spike_high_time)} at {t.spike_target} %)")
         else:
             self._log(f"Profile: classic, CPU {t.cpu_load} % for {describe_duration(t.duration)}")
         self._log("Nodes: " + ", ".join(n.name + (" (master)" if n.is_control_plane else "")

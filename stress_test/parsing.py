@@ -1,6 +1,7 @@
 """Pure functions for processing kubectl and probe output (no side effects)."""
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Optional, Sequence
 
@@ -16,6 +17,34 @@ _SENSOR_LABELS = {
     "nvme": "NVMe",
     "drivetemp": "HDD",
 }
+
+MAX_DURATION_S = 7 * 24 * 3600          # no test longer than a week (activeDeadlineSeconds, runaway typos)
+_NODE_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+MAX_TEXT = 500
+
+
+def clean_ip(text: str) -> str:
+    """The text if it is exactly an IPv4/IPv6 address, otherwise "" (addresses go into shell scripts run in pods)."""
+    text = (text or "").strip()
+    try:
+        return str(ipaddress.ip_address(text)) if text else ""
+    except ValueError:
+        return ""
+
+
+def is_node_name(text: str) -> bool:
+    """A Kubernetes node name (DNS-1123 subdomain): it can never look like a kubectl option or carry a shell command."""
+    return isinstance(text, str) and 0 < len(text) <= 253 and _NODE_NAME_RE.fullmatch(text) is not None
+
+
+def clean_text(text: str, limit: int = MAX_TEXT) -> str:
+    """One harmless line: control characters (also newlines) become spaces, the length is limited.
+
+    Free text (--notes) goes into result logs that are read back line by line - a newline would forge log lines.
+    """
+    return _CTRL_RE.sub(" ", str(text)).strip()[:limit]
+
 
 _UNITS_TO_MIB = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024, "Ti": 1024 * 1024}
 
@@ -46,6 +75,8 @@ def parse_duration(text: str) -> int:
         seconds = hours * 3600 + minutes * 60 + secs
     if seconds < 1:
         raise ValueError("The test duration must be at least 1 second.")
+    if seconds > MAX_DURATION_S:
+        raise ValueError(f"The duration is too long (maximum {MAX_DURATION_S // 86400} days).")
     return seconds
 
 
@@ -113,11 +144,34 @@ def parse_probe_output(text: str) -> ProbeData:
                 data.mem_available_mib = int(parts[1]) // 1024
             elif len(parts) == 2 and parts[0] == "mem_total_kb":
                 data.mem_total_mib = int(parts[1]) // 1024
+            elif len(parts) == 2 and parts[0] == "ping_ms":
+                if parts[1] == "lost":
+                    data.ping_lost = True
+                else:
+                    data.ping_ms = float(parts[1])
+            elif len(parts) == 5 and parts[0] == "rapl_uj":
+                data.energy_uj = int(parts[1])
+                data.energy_max_uj = int(parts[2]) or None
+                data.pl1_w = int(parts[3]) / 1e6 or None
+                data.pl2_w = int(parts[4]) / 1e6 or None
             elif len(parts) == 3 and parts[0] == "cpu_stat":
                 data.cpu_total, data.cpu_idle = int(parts[1]), int(parts[2])
         except ValueError:
             continue
     return data
+
+
+def power_watts(prev: Optional[tuple[int, float]], energy_uj: Optional[int], now: float,
+                max_uj: Optional[int] = None) -> Optional[float]:
+    """Power in W from two RAPL energy readings (prev = (µJ, time in s)); handles the counter wrap-around."""
+    if prev is None or energy_uj is None or now <= prev[1]:
+        return None
+    delta = energy_uj - prev[0]
+    if delta < 0:
+        if not max_uj:
+            return None
+        delta += max_uj
+    return delta / 1e6 / (now - prev[1])
 
 
 def cpu_percent(prev: Optional[tuple[int, int]],
@@ -271,4 +325,6 @@ def node_from_json(data: dict) -> NodeInfo:
         kernel=info.get("kernelVersion", "?"),
         architecture=info.get("architecture", "?"),
         runtime=info.get("containerRuntimeVersion", "?"),
+        internal_ip=next((clean_ip(a.get("address", "")) for a in status.get("addresses", [])
+                          if a.get("type") == "InternalIP" and clean_ip(a.get("address", ""))), ""),
     )

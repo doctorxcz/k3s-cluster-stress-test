@@ -12,16 +12,24 @@ from typing import Callable, Optional
 import secrets
 from pathlib import Path
 
-from . import background, compare, debuglog, parallel, series
+from . import background, baseline, compare, debuglog, parallel, series
 from .kube import Kubectl, KubectlError
+from .disk import (DISK_JOB_TIME_DEFAULT, DISK_SIZE_DEFAULT, MAX_DISK_JOB_TIME, MAX_DISK_SIZE,
+                   MIN_DISK_JOB_TIME, MIN_DISK_SIZE, jobs as disk_jobs)
+from . import menu, netmatrix
+from .net import (MAX_NET_TIME, MIN_NET_TIME, NET_MODES, NET_TIME_DEFAULT, net_duration,
+                  normalize_extras)
+from .export import EXPORT_CHOICES, write_exports
+from .logparse import read_log
 from .models import (COOLDOWN_DEFAULT, COOLDOWN_MAX, DEFAULT_MAX_TEMP, MASTER_CPU_CAP,
-                     MAX_MAX_TEMP, MAX_NODE_BUSY_PCT, MIN_MAX_TEMP, MIN_STEP_TIME,
-                     PROFILE_CLASSIC, PROFILE_STEPPED, STEP_TIME_DEFAULT, STEPS_DEFAULT,
-                     StressConfig)
-from .parsing import (describe_duration, describe_steps, format_workload, parse_duration,
-                      parse_steps)
-from .paths import make_private_dir, user_log_dir
-from .runner import EXIT_ERROR, RunnerError, StressRunner
+                     MAX_MAX_TEMP, MAX_NODE_BUSY_PCT, MAX_SPIKE_PHASE_TIME, MIN_MAX_TEMP,
+                     MIN_SPIKE_PHASE_TIME, MIN_STEP_TIME, PROFILE_CLASSIC, PROFILE_DISK, PROFILE_NET, PROFILE_SPIKE,
+                     PROFILE_STEPPED, SPIKE_LOW_PCT, SPIKE_PHASE_TIME_DEFAULT, SPIKE_TARGETS,
+                     STEP_TIME_DEFAULT, STEPS_DEFAULT, StressConfig)
+from .parsing import (clean_text, describe_duration, describe_steps, format_workload, is_node_name,
+                      parse_duration, parse_steps)
+from .paths import make_private_dir, open_private, user_log_dir
+from .runner import EXIT_ERROR, EXIT_INTERRUPTED, RunnerError, StressRunner
 
 YES = {"y", "yes"}
 log = logging.getLogger(__name__)
@@ -32,6 +40,35 @@ def duration_arg(text: str) -> int:
         return parse_duration(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc))
+
+
+def node_arg(text: str) -> str:
+    """A node name as a Kubernetes node name (never something kubectl or a shell could take for more)."""
+    if not is_node_name(text):
+        raise argparse.ArgumentTypeError(f"'{text[:60]}' is not a valid node name (lowercase letters, digits, - and .)")
+    return text
+
+
+def node_list_arg(text: str) -> str:
+    """--nodes a,b,c : every name validated, the comma separated text is kept."""
+    for name in (n.strip(" ") for n in text.split(",")):
+        if name:
+            node_arg(name)
+    return text
+
+
+def notes_arg(text: str) -> str:
+    return clean_text(text)
+
+
+def interval_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{text}' is not a number")
+    if not 0.5 <= value <= 300:
+        raise argparse.ArgumentTypeError("the interval must be 0.5-300 seconds")
+    return value
 
 
 def steps_arg(text: str) -> tuple[int, ...]:
@@ -93,6 +130,8 @@ examples:
   ./stress.sh --stop hp-g2-celeron             stop a test running in the background
   ./stress.sh --compare dell-9020-sff-i7       compare the two latest tests of a node
   ./stress.sh --list-nodes                     list the cluster's nodes and exit
+  ./stress.sh --set-baseline dell-9020-sff-i7  newest test of the node becomes its baseline
+  ./stress.sh --export-log dell-9020-sff-i7    JSON+CSV export of the node's newest log
   ./stress.sh --node dell-9020-sff-i7 --time 10m --dry-run
                                                show the test settings, start nothing
   ./stress.sh --node dell-9020-sff-i7 --time 20m --schedule 22:30 -b
@@ -138,13 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
                         f"and CPU temperature (--max-temp) - see the 'safety' group")
 
     g = p.add_argument_group("what to test (asks if not given)")
-    g.add_argument("--node", metavar="NODE", help="one node")
+    g.add_argument("--node", metavar="NODE", type=node_arg, help="one node")
     g.add_argument("--workers", action="store_true",
                    help="all workers one after another (without the master)")
     g.add_argument("--cluster", action="store_true",
                    help="the whole cluster one after another, master always last (CPU cap "
                         f"{MASTER_CPU_CAP} %%); always logged")
-    g.add_argument("--nodes", metavar="A,B,C",
+    g.add_argument("--nodes", metavar="A,B,C", type=node_list_arg,
                    help="selected nodes one after another (a master name in the list includes it)")
     g.add_argument("--include-master", action="store_true",
                    help="also include the master with --workers; in the stepped test without a question")
@@ -155,9 +194,44 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("what kind of test")
     g.add_argument("--time", type=duration_arg, dest="duration", metavar="DURATION",
                    help="test duration: seconds or 30s, 5m, 1h, 1h30m")
-    g.add_argument("--profile", choices=[PROFILE_CLASSIC, PROFILE_STEPPED], default=None,
+    g.add_argument("--profile", choices=[PROFILE_CLASSIC, PROFILE_STEPPED, PROFILE_SPIKE, PROFILE_DISK, PROFILE_NET],
+                   default=None,
                    help="test type: classic = one load for the whole time (default), "
-                        "stepped = gradually 25/50/75/100 %% (always logged)")
+                        "stepped = gradually 25/50/75/100 %% (always logged), "
+                        "spike = repeating on/off jump between a low and a target %% "
+                        "(always logged), disk = fio disk benchmark: MB/s, IOPS and latency "
+                        "(always logged, installs fio in the pod), net = network test: iperf3 "
+                        "throughput, ping latency, MTU, link speed (always logged, installs iperf3)")
+    g.add_argument("--net-matrix", action="store_true",
+                   help="network matrix: ping + iperf3 between EVERY pair of nodes (all Ready nodes, "
+                        "or --nodes a,b,c), shown as tables; finds the weak node or cable. "
+                        "--net-time sets the length of one iperf3 test; the master is capped at 300 Mbit/s")
+    g.add_argument("--net-watch", nargs="?", const="auto", default=None, metavar="NODE", type=node_arg,
+                   help="during ANY test also ping another node (default: the master, or a worker when "
+                        "the master is tested) once per reading: shows whether the load disturbs the "
+                        "network (latency and lost pings in the log and summary)")
+    g.add_argument("--net-peer", default=None, metavar="NODE", type=node_arg,
+                   help="network test: the node on the other end (default: another Ready worker, "
+                        "the master only when nothing else exists)")
+    g.add_argument("--net-time", type=duration_arg, default=None, metavar="DURATION",
+                   help=f"network test: length of one iperf3 test ({MIN_NET_TIME}-{MAX_NET_TIME} s, "
+                        f"default {NET_TIME_DEFAULT} s); 4 tests: TCP up, TCP down, 4 streams, UDP")
+    g.add_argument("--net-extra", default=None, metavar="LIST",
+                   help="network test: extra jobs, comma separated: dns (CoreDNS + external lookups), "
+                        "internet (ping + download speed), mtr (path to the peer), service "
+                        "(TCP through a Kubernetes Service, needs --net-mode pod), or all")
+    g.add_argument("--net-mode", choices=NET_MODES, default=None,
+                   help="network test: host = the nodes' real network (default), "
+                        "pod = the pod network (what workloads really use, flannel/CNI)")
+    g.add_argument("--net-rate", type=int, default=None, metavar="MBIT",
+                   help="network test: cap the TCP tests at this many Mbit/s (default unlimited; "
+                        "300 when the master takes part)")
+    g.add_argument("--disk-size", type=int, default=None, metavar="MiB",
+                   help=f"disk test: size of the test file ({MIN_DISK_SIZE}-{MAX_DISK_SIZE} MiB, "
+                        f"default {DISK_SIZE_DEFAULT}); it lives in an emptyDir on the node's disk")
+    g.add_argument("--disk-job-time", type=duration_arg, default=None, metavar="DURATION",
+                   help=f"disk test: length of one fio job ({MIN_DISK_JOB_TIME}-{MAX_DISK_JOB_TIME} s, "
+                        f"default {DISK_JOB_TIME_DEFAULT} s); 4 jobs: seq read/write, random read/write")
     g.add_argument("--steps", type=steps_arg, default=None, metavar="LIST",
                    help=f"stages of the stepped test in %%, e.g. 25,50,75,100 "
                         f"(default {describe_steps(STEPS_DEFAULT)})")
@@ -165,6 +239,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"length of one stage of the stepped test (default "
                         f"{describe_duration(STEP_TIME_DEFAULT)}, min {MIN_STEP_TIME} s); "
                         f"total time = stages x stage time")
+    g.add_argument("--spike-target", type=int, choices=SPIKE_TARGETS, default=None, metavar="%",
+                   help=f"spike test: high-phase target CPU load - 1/4, 2/4, 3/4 or 4/4 "
+                        f"({'/'.join(str(s) for s in SPIKE_TARGETS)} %%; default "
+                        f"{SPIKE_TARGETS[-1]}); the low phase is always {SPIKE_LOW_PCT} %%")
+    g.add_argument("--spike-low-time", type=duration_arg, default=None, metavar="DURATION",
+                   help=f"spike test: duration of the low phase ({SPIKE_LOW_PCT} %%) in each "
+                        f"cycle (default {describe_duration(SPIKE_PHASE_TIME_DEFAULT)}, "
+                        f"{MIN_SPIKE_PHASE_TIME}-{MAX_SPIKE_PHASE_TIME} s)")
+    g.add_argument("--spike-high-time", type=duration_arg, default=None, metavar="DURATION",
+                   help=f"spike test: duration of the high phase (--spike-target) in each "
+                        f"cycle (default {describe_duration(SPIKE_PHASE_TIME_DEFAULT)}, "
+                        f"{MIN_SPIKE_PHASE_TIME}-{MAX_SPIKE_PHASE_TIME} s); --time sets the "
+                        f"total test time, rounded down to a whole number of cycles")
     g.add_argument("--cpu-load", type=int, metavar="%", help="CPU load in %% (default 100)")
     g.add_argument("--ram-pct", type=int, metavar="%",
                    help="enables the RAM test: how many %% of FREE memory to allocate")
@@ -214,11 +301,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="compare two tests from logs: either two logs (older and newer; path or "
                         "name in the logs folder), or just a node name (compares its two "
                         "newest tests)")
+    g.add_argument("--export", choices=EXPORT_CHOICES, default=None, metavar="FORMAT",
+                   help="machine-readable export next to the log: json (default), csv "
+                        "(measurements only), both or none")
+    g.add_argument("--export-log", nargs="+", metavar="LOG|NODE",
+                   help="create the JSON/CSV export of already finished tests from their logs "
+                        "(a log, or a node name = its newest log) and exit; format from --export")
+    g.add_argument("--set-baseline", metavar="LOG|NODE",
+                   help="save a finished test as the baseline of its node (a log, or a node name "
+                        "= its newest log); later tests of that node are compared with it")
+    g.add_argument("--no-baseline-check", action="store_true",
+                   help="do not compare the finished test with the node's baseline")
     g.add_argument("--log-dir", default="logs", metavar="DIR",
                    help="folder with test results (default 'logs' in the project directory "
                         "python-stress-test, wherever you run it from; a relative path "
                         "is taken from the project, an absolute one unchanged)")
-    g.add_argument("--notes", metavar="TEXT", help="a note about the test (goes into the log)")
+    g.add_argument("--notes", metavar="TEXT", type=notes_arg, help="a note about the test (goes into the log)")
 
     g = p.add_argument_group("scheduling and information")
     g.add_argument("--schedule", type=schedule_arg, metavar="TIME",
@@ -242,8 +340,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--hw-privileged", action="store_true",
                    help="the hw-info pod runs privileged (needed to list RAM modules "
                         "via dmidecode; default is without privileged)")
-    g.add_argument("--interval", type=float, default=5.0, metavar="SEC",
-                   help="measurement interval in seconds (default 5)")
+    g.add_argument("--smart", action="store_true",
+                   help="preflight: read the disk health (SMART) of the node with a PRIVILEGED pod; "
+                        "a disk with a failed health check refuses the test")
+    g.add_argument("--allow-bad-disk", action="store_true",
+                   help="with --smart: test even if a disk reports a failed SMART health check")
+    g.add_argument("--interval", type=interval_arg, default=5.0, metavar="SEC",
+                   help="measurement interval in seconds, 0.5-300 (default 5)")
     g.add_argument("--remaining-every", type=int, default=3, metavar="N",
                    help="every Nth measurement print how much is left "
                         "(default 3, 0 = do not print)")
@@ -303,18 +406,69 @@ def ask_scope() -> str:
 
 
 def ask_profile() -> str:
-    """Test type: classic or stepped."""
+    """Test type: classic, stepped, spike or disk."""
     print("Test type:")
     print("  [1] classic (one load for the given time)")
     print(f"  [2] stepped ({describe_steps(STEPS_DEFAULT)} % in stages, always logged)")
+    print(f"  [3] spike (repeating on/off jump: {SPIKE_LOW_PCT} % <-> target %, "
+          f"always logged)")
+    print("  [4] disk (fio benchmark: MB/s, IOPS, latency; always logged)")
+    print("  [5] network (iperf3 + ping to another node: MB/s, latency, MTU; always logged)")
     while True:
         raw = ask("Choose", "1")
-        if raw in ("1", "2"):
-            return PROFILE_CLASSIC if raw == "1" else PROFILE_STEPPED
+        if raw in ("1", "2", "3", "4", "5"):
+            return {"1": PROFILE_CLASSIC, "2": PROFILE_STEPPED, "3": PROFILE_SPIKE,
+                    "4": PROFILE_DISK, "5": PROFILE_NET}[raw]
+        print("  Invalid choice.")
+
+
+SPIKE_TARGET_CHOICES = {"1": 25, "2": 50, "3": 75, "4": 100}
+
+
+def ask_spike_target() -> int:
+    """Spike test: target CPU load after the jump (1/4, 2/4, 3/4, 4/4)."""
+    print("Spike test - target load after the jump:")
+    for key, pct in SPIKE_TARGET_CHOICES.items():
+        note = " (default)" if pct == SPIKE_TARGETS[-1] else ""
+        print(f"  [{key}] {key}/4  ({pct} %){note}")
+    while True:
+        raw = ask("Choose", "4")
+        if raw in SPIKE_TARGET_CHOICES:
+            return SPIKE_TARGET_CHOICES[raw]
         print("  Invalid choice.")
 
 
 COOLDOWN_CHOICES = {"1": 60, "2": 180, "3": 300, "4": COOLDOWN_MAX}
+
+
+def ask_net_mode() -> str:
+    """Network test: the nodes' real network, or the pod network."""
+    print("Network to test:")
+    print("  [1] nodes' network (the real NICs and cables)  (default)")
+    print("  [2] pod network (what workloads really use: flannel / CNI)")
+    while True:
+        raw = ask("Choose", "1")
+        if raw in ("1", "2"):
+            return "host" if raw == "1" else "pod"
+        print("  Invalid choice.")
+
+
+def ask_net_extra() -> str:
+    """Network test: optional extra jobs."""
+    print("Extra network jobs (comma separated, Enter = none):")
+    print("  dns       CoreDNS + external name lookups")
+    print("  internet  ping 1.1.1.1 + a bounded download")
+    print("  mtr       path, loss and latency to the peer")
+    print("  service   TCP through a Kubernetes Service (pod network only)")
+    print("  all       everything above")
+    while True:
+        raw = ask("Extras", "").replace(" ", "")
+        try:
+            normalize_extras(x for x in raw.split(",") if x)
+        except ValueError as exc:
+            print(f"  {exc}")
+            continue
+        return raw
 
 
 def ask_cooldown() -> int:
@@ -373,8 +527,19 @@ def build_config(args: argparse.Namespace, node_name: str,
     if profile is None:
         profile = ask_profile() if interactive else PROFILE_CLASSIC
     stepped = profile == PROFILE_STEPPED
+    spike = profile == PROFILE_SPIKE
+    disk = profile == PROFILE_DISK
+    net = profile == PROFILE_NET
+    net_time = NET_TIME_DEFAULT
+    net_extra: tuple = ()
+    disk_size = DISK_SIZE_DEFAULT
+    disk_job_time = DISK_JOB_TIME_DEFAULT
     steps = args.steps or STEPS_DEFAULT
     step_time = STEP_TIME_DEFAULT
+    spike_target = None
+    spike_low_time = SPIKE_PHASE_TIME_DEFAULT
+    spike_high_time = SPIKE_PHASE_TIME_DEFAULT
+    spike_cycles = 1
     if stepped:
         step_time = pick(args.step_time,
                          lambda: ask_duration("Duration of one stage (e.g. 90, 3m)", "3m"),
@@ -382,6 +547,51 @@ def build_config(args: argparse.Namespace, node_name: str,
         duration = len(steps) * step_time
         if args.duration is not None:
             print("ℹ️  For the stepped test the time is set with --step-time, --time is ignored.")
+    elif net:
+        net_mode = pick(args.net_mode, ask_net_mode, "host")
+        args.net_mode = net_mode
+        net_extra_text = pick(args.net_extra, ask_net_extra, "")
+        args.net_extra = net_extra_text
+        net_time = pick(args.net_time,
+                        lambda: ask_duration(f"Length of one iperf3 test ({MIN_NET_TIME}-{MAX_NET_TIME} s, "
+                                             f"e.g. 10, 30s)", str(NET_TIME_DEFAULT)), NET_TIME_DEFAULT)
+        net_extra = normalize_extras(x for x in (args.net_extra or "").replace(" ", "").split(",") if x)
+        duration = net_duration(net_time, net_extra, args.net_mode or "host")
+        if args.duration is not None:
+            print("ℹ️  For the network test the time is set with --net-time, --time is ignored.")
+    elif disk:
+        disk_size = pick(args.disk_size,
+                         lambda: ask_int(f"Test file size in MiB ({MIN_DISK_SIZE}-{MAX_DISK_SIZE})",
+                                         DISK_SIZE_DEFAULT), DISK_SIZE_DEFAULT)
+        disk_job_time = pick(args.disk_job_time,
+                             lambda: ask_duration(f"Length of one fio job ({MIN_DISK_JOB_TIME}-"
+                                                  f"{MAX_DISK_JOB_TIME} s, e.g. 15, 30s)",
+                                                  str(DISK_JOB_TIME_DEFAULT)), DISK_JOB_TIME_DEFAULT)
+        duration = len(disk_jobs()) * disk_job_time
+        if args.duration is not None:
+            print("ℹ️  For the disk test the time is set with --disk-job-time, --time is ignored.")
+    elif spike:
+        spike_target = pick(args.spike_target, ask_spike_target, SPIKE_TARGETS[-1])
+        spike_low_time = pick(
+            args.spike_low_time,
+            lambda: ask_duration(f"Low-phase duration ({SPIKE_LOW_PCT} %) each cycle "
+                                 f"(e.g. 5, 10s)", str(SPIKE_PHASE_TIME_DEFAULT)),
+            SPIKE_PHASE_TIME_DEFAULT)
+        spike_high_time = pick(
+            args.spike_high_time,
+            lambda: ask_duration("High-phase duration (target %) each cycle (e.g. 5, 10s)",
+                                 str(SPIKE_PHASE_TIME_DEFAULT)),
+            SPIKE_PHASE_TIME_DEFAULT)
+        wanted = pick(args.duration,
+                     lambda: ask_duration(
+                         "Total test duration (e.g. 5m, 10m, 1h)", "10m"), 600)
+        phase = spike_low_time + spike_high_time
+        spike_cycles = max(1, round(wanted / phase))
+        duration = spike_cycles * phase
+        if duration != wanted:
+            print(f"ℹ️  Rounded to a whole number of cycles: {describe_duration(duration)} "
+                 f"({spike_cycles}x {describe_duration(phase)}) instead of "
+                 f"{describe_duration(wanted)}.")
     else:
         duration = pick(args.duration,
                         lambda: ask_duration(
@@ -392,14 +602,16 @@ def build_config(args: argparse.Namespace, node_name: str,
                         f"({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C)", DEFAULT_MAX_TEMP),
                     DEFAULT_MAX_TEMP)
     cooldown = pick(args.cooldown, ask_cooldown, COOLDOWN_DEFAULT)
-    cpu_load = 100 if stepped else pick(args.cpu_load,
-                                         lambda: ask_int("CPU load in %", 100), 100)
+    cpu_load = 100 if (stepped or spike or disk or net) else pick(args.cpu_load,
+                                                     lambda: ask_int("CPU load in %", 100), 100)
 
     ram_pct = args.ram_pct
     hdd = args.hdd
-    if stepped:           # the stepped test loads only the CPU
+    if stepped or spike or disk or net:   # these tests load only the CPU (or only the disk / network)
         if ram_pct is not None or hdd:
-            print("ℹ️  The stepped test loads only the CPU, RAM and disk are ignored.")
+            kind = "stepped" if stepped else "spike" if spike else "disk" if disk else "network"
+            only = "CPU" if (stepped or spike) else kind
+            print(f"ℹ️  The {kind} test loads only the {only}, RAM and disk are ignored.")
         ram_pct, hdd = None, False
     elif not master_mode:   # on the master RAM and disk are not used anyway
         if ram_pct is None and interactive:
@@ -414,7 +626,7 @@ def build_config(args: argparse.Namespace, node_name: str,
                              "logging turns on by itself)") if interactive else False)
 
     why = [w for w, on in (("background test", run_bg), ("stepped test", stepped),
-                           ("multi-node test", series)) if on]
+                           ("spike test", spike), ("disk test", disk), ("network test", net), ("multi-node test", series)) if on]
     if why:
         reason = ", ".join(why)
         if args.log is False:
@@ -426,13 +638,21 @@ def build_config(args: argparse.Namespace, node_name: str,
         log = pick(args.log, lambda: ask_yes_no("Save metrics to a file?"), False)
     notes = args.notes
     if notes is None:
-        notes = ask("Note about the test", "") if (interactive and log) else ""
+        notes = clean_text(ask("Note about the test", "")) if (interactive and log) else ""
 
     return StressConfig(node=node_name, duration=duration, max_temp=max_temp,
                         cpu_load=cpu_load, ram_pct=ram_pct, hdd=bool(hdd),
                         log=bool(log), notes=notes, background=bool(run_bg),
-                        cooldown=cooldown, profile=profile, steps=tuple(steps),
-                        step_time=step_time)
+                        cooldown=cooldown, export=args.export or "json",
+                        baseline_check=not args.no_baseline_check,
+                        smart=args.smart, allow_bad_disk=args.allow_bad_disk,
+                        profile=profile, steps=tuple(steps),
+                        step_time=step_time, spike_target=spike_target,
+                        spike_low_time=spike_low_time, spike_high_time=spike_high_time,
+                        spike_cycles=spike_cycles, disk_size=disk_size,
+                        disk_job_time=disk_job_time, net_time=net_time, net_extra=net_extra,
+                        net_watch=args.net_watch or "", net_peer=args.net_peer or "", net_mode=args.net_mode or "host",
+                        net_rate=args.net_rate or 0)
 
 
 def confirm_workload(kube: Kubectl, node, args: argparse.Namespace,
@@ -537,6 +757,90 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_log(args: argparse.Namespace) -> int:
+    log_dir = user_log_dir(args.log_dir)
+    formats = args.export or "both"
+    if formats == "none":
+        print("❌ --export none does not export anything.")
+        return EXIT_ERROR
+    code = 0
+    for value in args.export_log:
+        try:
+            path = baseline.resolve_log(value, log_dir)
+            written = write_exports(read_log(path), str(path), formats)
+        except (compare.CompareError, OSError, ValueError) as exc:
+            print(f"❌ {value}: {exc}")
+            code = EXIT_ERROR
+            continue
+        for item in written:
+            print(f"📄 {item}")
+    return code
+
+
+def cmd_set_baseline(args: argparse.Namespace) -> int:
+    log_dir = user_log_dir(args.log_dir)
+    try:
+        path = baseline.resolve_log(args.set_baseline, log_dir)
+        run = read_log(path)
+        saved = baseline.save_baseline(run, log_dir)
+    except (compare.CompareError, OSError, ValueError) as exc:
+        print(f"❌ {exc}")
+        log.error("Setting the baseline failed: %s", exc)
+        return EXIT_ERROR
+    print(f"✅ Baseline of {run.node} set from {path.name}\n   saved to {saved}")
+    log.info("Baseline of %s set from %s", run.node, path)
+    return 0
+
+
+def cmd_net_matrix(args: argparse.Namespace) -> int:
+    """--net-matrix: every ordered pair of nodes; asks first (it loads the network of the cluster)."""
+    kube = Kubectl()
+    try:
+        wanted = ([n.strip() for n in args.nodes.split(",") if n.strip()] if args.nodes
+                  else kube.list_node_names())
+        nodes = [kube.get_node(n) for n in wanted]
+        busy = [p for p in kube.list_tool_pods() if p.phase not in ("Succeeded", "Failed")]
+    except KubectlError as exc:
+        print(f"❌ {exc}")
+        return EXIT_ERROR
+    nodes = [n for n in nodes if n.ready and n.internal_ip]
+    if len(nodes) < 2:
+        print("❌ The network matrix needs at least two Ready nodes with an InternalIP.")
+        return EXIT_ERROR
+    if busy:
+        print(f"❌ A test of this tool is running right now ({', '.join(p.name for p in busy)}); "
+              f"wait for it, the results would be skewed.")
+        return EXIT_ERROR
+    net_time = args.net_time or 5
+    if not MIN_NET_TIME <= net_time <= MAX_NET_TIME:
+        print(f"❌ --net-time must be {MIN_NET_TIME}-{MAX_NET_TIME} s.")
+        return EXIT_ERROR
+    pairs = len(nodes) * (len(nodes) - 1)
+    estimate = pairs * (net_time + 8) + 90
+    print(f"Network matrix: {len(nodes)} nodes, {pairs} pairs x ({net_time} s iperf3 + ping), "
+          f"about {describe_duration(estimate)} + installing iperf3.")
+    print("  " + ", ".join(n.name + (" (master, capped at 300 Mbit/s)" if n.is_control_plane else "") for n in nodes))
+    if not args.yes:
+        if args.non_interactive or not ask_yes_no("Load the network of these nodes now?"):
+            print("Cancelled (--yes confirms without asking).")
+            return EXIT_ERROR
+    try:
+        result = netmatrix.run_matrix(kube, nodes, net_time, out=print,
+                                      rate_mbit=args.net_rate or 0)
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted, the helper pods were deleted.")
+        return EXIT_INTERRUPTED
+    except KubectlError as exc:
+        print(f"❌ {exc}")
+        return EXIT_ERROR
+    print()
+    for line in netmatrix.format_matrix(result):
+        print(line)
+    log_path, json_path = netmatrix.write_matrix(result, user_log_dir(args.log_dir), open_private)
+    print(f"\n📁 Saved: {log_path}\n📄 {json_path}")
+    return 0
+
+
 def cmd_stop(target: str) -> int:
     ok, message = background.stop(target)
     print(("✅ " if ok else "❌ ") + message)
@@ -583,18 +887,23 @@ def _choose_scope(args: argparse.Namespace) -> str:
 
 
 def _keep_master(args: argparse.Namespace, template: StressConfig) -> bool:
-    """In the stepped test we ask whether to keep the master (CPU cap 70 %)."""
-    if args.include_master or not template.stepped:
+    """In the stepped/spike test we ask whether to keep the master (CPU cap 70 %)."""
+    if args.include_master or not template.multi_stage:
         return True                       # explicitly, or confirmed by the overview before the start
-    capped = tuple(sorted({min(s, MASTER_CPU_CAP) for s in template.steps}))
     if args.yes:
         return True
     if args.non_interactive:
-        print("ℹ️  Master left out of the stepped test (no confirmation; add --include-master "
+        kind = "stepped" if template.stepped else "spike"
+        print(f"ℹ️  Master left out of the {kind} test (no confirmation; add --include-master "
               "or --yes).")
         return False
-    return ask_yes_no(f"Keep the master in the stepped test (stages capped at max "
-                      f"{MASTER_CPU_CAP} %: {describe_steps(capped)})?")
+    if template.stepped:
+        capped = tuple(sorted({min(s, MASTER_CPU_CAP) for s in template.steps}))
+        return ask_yes_no(f"Keep the master in the stepped test (stages capped at max "
+                          f"{MASTER_CPU_CAP} %: {describe_steps(capped)})?")
+    capped_target = min(template.spike_target, MASTER_CPU_CAP)
+    return ask_yes_no(f"Keep the master in the spike test (target capped at max "
+                      f"{MASTER_CPU_CAP} %: {capped_target} %)?")
 
 
 def _choose_parallel(args: argparse.Namespace, nodes) -> bool:
@@ -718,9 +1027,17 @@ def apply_quick(args: argparse.Namespace) -> None:
 
 
 def quick_summary(cfg: StressConfig) -> str:
-    parts = [cfg.node, describe_duration(cfg.duration)]
-    parts.append("stepped " + describe_steps(cfg.steps) + " %" if cfg.stepped
-                 else f"CPU {cfg.cpu_load} %")
+    parts = [cfg.node, describe_duration(cfg.total_duration)]
+    if cfg.stepped:
+        parts.append("stepped " + describe_steps(cfg.steps) + " %")
+    elif cfg.spike:
+        parts.append(f"spike {SPIKE_LOW_PCT}<->{cfg.spike_target} % ({cfg.spike_cycles}x)")
+    elif cfg.disk:
+        parts.append(f"disk fio {cfg.disk_size} MiB")
+    elif cfg.net:
+        parts.append(f"network {cfg.net_mode}")
+    else:
+        parts.append(f"CPU {cfg.cpu_load} %")
     if cfg.ram_pct:
         parts.append(f"RAM {cfg.ram_pct} %")
     if cfg.hdd:
@@ -742,8 +1059,17 @@ def _main(args: argparse.Namespace) -> int:
         return cmd_stop(args.stop)
     if args.compare:
         return cmd_compare(args)
+    if args.export_log:
+        return cmd_export_log(args)
+    if args.set_baseline:
+        return cmd_set_baseline(args)
     if args.list_nodes:
         return cmd_list_nodes()
+    if args.net_matrix:
+        if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
+            print("❌ Error: 'kubectl' was not found.")
+            return EXIT_ERROR
+        return cmd_net_matrix(args)
     if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
         print("❌ Error: 'kubectl' was not found.")
         log.error("kubectl was not found in PATH")
@@ -775,6 +1101,10 @@ def _main(args: argparse.Namespace) -> int:
         master_mode = node.is_control_plane and not force
         log.info("control-plane=%s force=%s -> master_mode=%s",
                  node.is_control_plane, force, master_mode)
+        if node.is_control_plane and force:
+            why = "--force" if args.force else "the FORCE=1 environment variable"
+            print(f"⚠️  MASTER PROTECTION BYPASSED by {why}: no CPU cap, no lower temperature limit, "
+                  f"no confirmation. The API of the cluster may slow down.")
         if master_mode:
             print(f"⚠️  '{node.name}' is the MASTER (control-plane). The load may slow down "
                   f"the API and services.\n    CPU will be limited to at most {MASTER_CPU_CAP} %, "
@@ -814,6 +1144,8 @@ def _main(args: argparse.Namespace) -> int:
             directory = make_private_dir(user_log_dir(args.log_dir))
             stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
             log_path = str(directory / f"{node.name}-{cfg.duration}s-{stamp}.log")
+        if log_path:                              # fail now, not after the pods are up and hardware is detected
+            open_private(log_path, "a").close()
 
         if cfg.background and not background.supported():
             print("❌ Running in the background is not supported on this system (no fork).")
@@ -842,14 +1174,14 @@ def _main(args: argparse.Namespace) -> int:
             log.info("Test moved to the background: run_id=%s, child PID=%s, output=%s",
                      runner.names.run_id, pid, console_path)
             _print_background_info(
-                node.name, f"{describe_duration(cfg.duration)}  (+ 1–3 min preparation)",
+                node.name, f"{describe_duration(cfg.total_duration)}  (+ 1–3 min preparation)",
                 runner.names.run_id, pid, log_path, console_path)
             sys.stdout.flush()
             os._exit(0)                           # without cleanup: the child does that
         # CHILD: detached, stdout goes to console_path
         log.info("Child detached from the terminal (PID %s)", os.getpid())
         _wait_until(args.schedule)
-        background.register(runner.names.run_id, node.name, cfg.duration,
+        background.register(runner.names.run_id, node.name, cfg.total_duration,
                             log_path, console_path)
         try:
             return runner.run()
@@ -878,6 +1210,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     debug_path = debuglog.setup(argv_list)      # hidden debug log of every run
     code = EXIT_ERROR
     try:
+        if menu.enabled(argv_list):              # bare ./stress.sh in a terminal: the main menu
+            code = menu.run_menu()
+            return code
         code = _main(build_parser().parse_args(argv_list))
         return code
     except SystemExit as exc:                   # --help, argparse error, EOF on input

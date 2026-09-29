@@ -19,7 +19,7 @@ check the "Common issues" section at the bottom before opening an issue.
 
 **Option B — clone with git:**
 ```bash
-git clone https://github.com/<owner>/k3s-cluster-stress-test.git
+git clone https://github.com/doctorxcz/k3s-cluster-stress-test.git
 cd k3s-cluster-stress-test
 ```
 
@@ -70,6 +70,12 @@ kubectl get nodes
 Use the exact names shown here as the value for `--node NAME`. You don't have to remember them —
 running the tool with no `--node` flag shows you an interactive list to pick from.
 
+### 6b. Quick look without starting anything
+```bash
+./stress.sh --list-nodes                                   # nodes, roles, state
+./stress.sh --node <your-worker-node> --time 10m --dry-run # shows what WOULD run, starts nothing
+```
+
 ## 7. Run a small, safe first test
 
 Don't jump straight to a long test on your master. Start small on a worker node:
@@ -83,7 +89,65 @@ python3 -m stress_test --node <your-worker-node> --time 60 --cpu-load 50
 This runs a 60-second test at 50% CPU load — enough to confirm everything works without stressing
 the machine.
 
-## 8. Full usage
+## 8. Network tests need open ports (read this if you use `--profile net` or `--net-matrix`)
+
+> ## ⚠️ FIREWALL: allow TCP + UDP ports 30000–32767 between your nodes
+> The network tests (`--profile net`, `--net-matrix`) start an `iperf3` server on one node and connect to it
+> from another. The tool uses a port from the top of the Kubernetes **NodePort range: 32000–32699**
+> (`--net-matrix`: 32100 and up). **If a node's firewall (ufw, firewalld, iptables, a cloud security group)
+> only lets in specific ports, these tests fail** — the connection hangs or is refused — while ping still works.
+>
+> **What to allow (incoming, from the other cluster nodes):**
+> | Protocol | Ports | Used for |
+> |---|---|---|
+> | TCP | 30000–32767 | iperf3 TCP tests (upload, download, 4 streams) |
+> | UDP | 30000–32767 | iperf3 UDP test (jitter, loss) |
+> | ICMP | echo request/reply | ping, MTU probe, `--net-watch`, `mtr` |
+>
+> Example with `ufw` (run on each node that has a firewall, replace the subnet with yours):
+> ```bash
+> sudo ufw allow from 192.168.1.0/24 to any port 30000:32767 proto tcp
+> sudo ufw allow from 192.168.1.0/24 to any port 30000:32767 proto udp
+> sudo ufw status
+> ```
+> That range is normally already open on a k3s/Kubernetes node (NodePort Services need it), so on many
+> clusters nothing has to be changed. Nodes without any firewall need nothing at all.
+
+How to tell that a port is blocked: the network matrix shows `x` for a pair and the summary says
+`iperf3 failed (peer unreachable / port blocked?)`, or the test stops with `The iperf3 server did not start
+listening`. Check from another node:
+```bash
+timeout 3 bash -c '</dev/tcp/<node-ip>/32000' && echo open || echo blocked   # blocked is expected if no server runs
+```
+(Only a *running* server answers, so test with the tool itself: `./stress.sh --net-matrix --net-time 5`.)
+
+The network tests also need the nodes to reach the **internet** once (the pods install `iperf3`,
+`iputils-ping`, and optionally `curl`/`mtr-tiny` with `apt`), and `--net-extra internet` needs outgoing
+access to `1.1.1.1` and `archive.ubuntu.com`.
+
+`--smart` and `--profile disk` need no extra ports; `--smart` runs a *privileged* pod on the node
+(read-only access to the disks) — your cluster must allow privileged pods (no restrictive Pod Security policy).
+
+### Optional extras (nothing to install by hand)
+The nodes need **no software installed by you**. The pods install what they need with `apt` at run time and it
+disappears with the pod — this only requires that the node can reach the internet:
+`stress-ng` (CPU/RAM), `fio` (`--profile disk`), `smartctl` (`--smart`), `iperf3`/`ping`/`mtr` (network tests).
+Only `--smart` and `--hw-privileged` need a cluster that allows **privileged pods**.
+
+## 9. Full usage
+
+Running `./stress.sh` with no options opens the **main menu** (CPU load · Disk · Network · Quick test · Results ·
+Management) and asks for everything. Skip it with any option, or with `STRESS_NO_MENU=1`. Handy examples:
+```bash
+./stress.sh                                            # menu
+./stress.sh --node <worker> --time 10m --profile stepped
+./stress.sh --node <worker> --profile disk --smart
+./stress.sh --net-matrix --net-time 5                  # needs the open ports from step 8
+./stress.sh --node <worker> --time 20m --schedule 22:30 -b   # start later, in the background
+./stress.sh --status                                   # what runs now;  --stop <id|node|pid> stops it
+```
+Results (`logs/`) can be compared with `--compare`, exported with `--export`, and checked against a per-node
+baseline (`--set-baseline`) — see `README.md`.
 
 Once step 7 works, see `README.md` for the full option list (`--time`, `--max-temp`, `--ram-pct`,
 `--hdd`, `--workers`/`--cluster`, `--profile stepped`, `--background`, `--compare`, etc.) and how
@@ -116,6 +180,18 @@ hardcoded) and applies extra protection: lower CPU cap, lower temperature limit,
 prompt. Use `-y`/`--yes` to confirm automatically, `--force` (or `FORCE=1`) to bypass entirely, or
 just answer `y` when asked.
 
+**Network test: `iperf3 failed (peer unreachable / port blocked?)`, `The iperf3 server did not start listening`, or the matrix shows `x`**
+Almost always a node firewall. Allow TCP/UDP **30000–32767** from the other nodes (see step 8). Ping working
+does not prove that TCP ports are open. Also check that the peer node can reach the internet (`apt` installs `iperf3`).
+
+**Network test: many `x` in the matrix, but only for one node as the *server***
+That node's firewall drops incoming connections on the tool's port. The matrix runs the `iperf3` server on the
+sending node, so a node that cannot *receive* connections on 30000–32767 breaks every pair where it sends.
+
+**`--net-matrix` refuses to start: "A test of this tool is running right now"**
+Another run of this tool still has pods (`kubectl get pods -A | grep -E "stress-test|temp-probe|hw-info|net-mx"`).
+Wait for it, or stop it with `--stop`. Leftover pods of a killed run can be removed with `kubectl delete pod <name>`.
+
 **Pod stays `Pending` / test never starts**
 Usually means the node doesn't have internet access to pull the container image, or the cluster
 doesn't have enough free resources on that node. Check with `kubectl get pods -A` and
@@ -140,6 +216,17 @@ long time, check `kubectl get pods -A` for leftover pods from this tool and remo
 Background mode needs a system with `fork()` — Linux and macOS are fine; this won't behave the same
 on Windows outside WSL. Also note: it does **not** survive a full machine restart, only closing the
 terminal/losing the SSH connection.
+
+**Help text mentions `--cz` / `--eng` or `STRESS_LANG`**
+Those belong to a launcher of the original author's private setup (a Czech and an English build side by
+side). This repository is the English build only; ignore them.
+
+**Want to run the tests of the tool itself (no cluster needed)?**
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest -q
+```
 
 **Still stuck?**
 Check `logs/` (test results) and `.logs/debug/` (technical debug log per run) in the project folder —

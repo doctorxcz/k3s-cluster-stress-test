@@ -75,9 +75,9 @@ def test_smart_ok_is_printed_and_logged(tmp_path):
     res = run_tool(tmp_path, "--time", "5", "--smart", "--log", env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Disk health OK (SMART)" in res.stdout and "Fake SSD 256GB" in res.stdout
-    log = next((tmp_path / "logs").glob("fake-node-5s-*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("fake-node-5s-*.log")).read_text(encoding="utf-8")
     assert "=== DISK HEALTH (SMART) ===" in log and "/dev/sda: Fake SSD 256GB | PASSED" in log
-    data = json.loads(next((tmp_path / "logs").glob("*.json")).read_text())
+    data = json.loads(next((tmp_path / "logs").rglob("*.json")).read_text())
     assert any("Fake SSD" in line for line in data["disk_health"])
 
 

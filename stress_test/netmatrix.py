@@ -115,7 +115,7 @@ def _wait_ready(kube: Kubectl, pod: str, timeout_s: int = 240) -> bool:
 
 def run_matrix(kube: Kubectl, nodes: list, net_time: int, out: Callable[[str], None] = print,
                rate_mbit: int = 0, run_id: Optional[str] = None,
-               deadline_extra: int = 0) -> MatrixResult:
+               deadline_extra: int = 0, screen=None) -> MatrixResult:
     """Runs the matrix on the given NodeInfo list (each needs internal_ip). Always deletes its pods."""
     names = PodNames.new(run_id)
     pods = {n.name: f"{POD_PREFIX}-{i}-{names.run_id}" for i, n in enumerate(nodes)}
@@ -128,12 +128,16 @@ def run_matrix(kube: Kubectl, nodes: list, net_time: int, out: Callable[[str], N
             kube.apply(matrix_pod(n.name, pods[n.name], deadline, names.run_id))
         ready = []
         for n in nodes:
+            if screen:
+                screen.prep(len(ready), len(nodes), f"waiting for the helper pod on {n.name} (iperf3 is installed via apt)")
             if _wait_ready(kube, pods[n.name]):
                 ready.append(n)
             else:
                 result.skipped[n.name] = "helper pod did not start (no internet for apt?)"
                 out(f"⚠️  {n.name}: {result.skipped[n.name]}, left out.")
         for n in ready:
+            if screen:
+                screen.prep(len(nodes), len(nodes), f"reading the network card of {n.name}")
             try:
                 result.links[n.name] = parse_kv("link", kube.exec(pods[n.name], MX_LINK_SCRIPT)).values
             except KubectlError:
@@ -151,8 +155,11 @@ def run_matrix(kube: Kubectl, nodes: list, net_time: int, out: Callable[[str], N
                 port, next_port = next_port, next_port + 1
                 capped = NET_RATE_CAP_MASTER if (server.is_control_plane or client.is_control_plane) and not rate_mbit \
                     else rate_mbit
-                out(f"▶ [{index}/{len(ready) * (len(ready) - 1)}] {client.name} -> {server.name}"
-                    + (f" (capped at {capped} Mbit/s)" if capped else ""))
+                if screen:
+                    screen.begin_pair(index, len(ready) * (len(ready) - 1), client.name, server.name, capped)
+                else:
+                    out(f"▶ [{index}/{len(ready) * (len(ready) - 1)}] {client.name} -> {server.name}"
+                        + (f" (capped at {capped} Mbit/s)" if capped else ""))
                 try:
                     # ping client -> server; the data flows client -> server: the iperf3 server runs on the CLIENT node
                     # and the iperf3 client (with -R) on the server node (see iperf_script)
@@ -165,7 +172,11 @@ def run_matrix(kube: Kubectl, nodes: list, net_time: int, out: Callable[[str], N
                 except KubectlError as exc:
                     pair = Pair(client.name, server.name, error=f"exec failed: {exc}", capped=capped)
                 result.pairs.append(pair)
-                out("   " + describe_pair(pair))
+                if screen:
+                    screen.end_pair(pair)
+                    out(f"{client.name} → {server.name}: {describe_pair(pair)}")
+                else:
+                    out("   " + describe_pair(pair))
     finally:
         kube.delete_pods(*pods.values())
     return result
@@ -232,8 +243,9 @@ def findings(result: MatrixResult) -> list[str]:
     return notes
 
 
-def format_matrix(result: MatrixResult) -> list[str]:
-    """Two tables (Mbit/s and ping ms): rows = client, columns = server; nodes are numbered to keep it narrow."""
+def format_matrix(result: MatrixResult, width: Optional[int] = None) -> list[str]:
+    """Two tables (Mbit/s and ping ms): rows = client, columns = server; nodes are numbered to keep it narrow.
+    `width` (terminal): narrower cells, and when the columns still do not fit they are split into blocks of columns."""
     nodes = [n for n in result.nodes if n not in result.skipped]
     lines = ["NETWORK MATRIX (iperf3 TCP, ping) - row = client, column = server", ""]
     for i, name in enumerate(nodes, 1):
@@ -242,15 +254,24 @@ def format_matrix(result: MatrixResult) -> list[str]:
         lines.append(f"  [{i}] {name}  ({link.get('if', '?')}, {speed})")
     for title, getter, fmt in (("Throughput, Mbit/s", lambda p: p.mbps, "{:.0f}"),
                                ("Ping, ms (average)", lambda p: p.ping_avg_ms, "{:.2f}")):
-        lines += ["", title, "      " + "".join(f"{f'[{j}]':>9}" for j in range(1, len(nodes) + 1))]
-        for i, client in enumerate(nodes, 1):
-            cells = []
-            for server in nodes:
-                p = result.pair(client, server)
-                value = getter(p) if p else None
-                mark = "*" if (p and p.capped and title.startswith("Throughput")) else ""
-                cells.append(f"{'-':>9}" if client == server else f"{(fmt.format(value) + mark) if value is not None else 'x':>9}")
-            lines.append(f"  [{i}] " + "".join(cells))
+        cw = 9
+        if width is not None and 6 + cw * len(nodes) > width:
+            cw = 7
+        per_block = len(nodes) if width is None else max(1, (width - 6) // cw)
+        for start in range(0, len(nodes), per_block):
+            block = range(start, min(start + per_block, len(nodes)))
+            lines += ["", title + (f" (columns [{block[0] + 1}]-[{block[-1] + 1}])" if per_block < len(nodes) else ""),
+                      "      " + "".join(f"{f'[{j + 1}]':>{cw}}" for j in block)] if start else \
+                     ["", title, "      " + "".join(f"{f'[{j + 1}]':>{cw}}" for j in block)]
+            for i, client in enumerate(nodes, 1):
+                cells = []
+                for server in (nodes[j] for j in block):
+                    p = result.pair(client, server)
+                    value = getter(p) if p else None
+                    mark = "*" if (p and p.capped and title.startswith("Throughput")) else ""
+                    cells.append(f"{'-':>{cw}}" if client == server else
+                                 f"{(fmt.format(value) + mark) if value is not None else 'x':>{cw}}")
+                lines.append(f"  [{i}] " + "".join(cells))
     if any(p.capped for p in result.pairs):
         lines += ["", "* capped on purpose (the master keeps its network for the API): shows the limit, not the link."]
     notes = findings(result)

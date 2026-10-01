@@ -5,9 +5,11 @@ import re
 from pathlib import Path
 from typing import Optional, Sequence
 
+from . import ui
 from .logparse import RunData, read_log
 from .models import WARN_TEMP
 from .parsing import format_duration
+from .paths import result_dirs
 from .summary import RECOVERY_MARGIN, RunStats, run_stats
 
 TEMP_DELTA = 2          # °C: a smaller change is not rated as better/worse
@@ -27,21 +29,26 @@ class CompareError(ValueError):
 # --- finding logs --------------------------------------------------------------------
 
 def _find_log(value: str, log_dir: Path) -> Path:
-    for candidate in (Path(value).expanduser(), log_dir / value, log_dir / f"{value}.log"):
-        if candidate.is_file():
-            return candidate
-    raise CompareError(f"Log '{value}' not found (nor in the folder {log_dir}).")
+    """A path, or a file name in the logs folder - also in any of its day folders (newest day first)."""
+    if Path(value).expanduser().is_file():
+        return Path(value).expanduser()
+    for folder in result_dirs(log_dir):
+        for candidate in (folder / value, folder / f"{value}.log"):
+            if candidate.is_file():
+                return candidate
+    raise CompareError(f"Log '{value}' not found (nor in the folder {log_dir} and its day folders).")
 
 
 def latest_logs_for_node(node: str, log_dir: Path, count: int = 2) -> list[Path]:
     """The newest logs of a node (older first), by the timestamp in the name."""
     pattern = re.compile(rf"^{re.escape(node)}-\d+s-(\d{{4}}-\d\d-\d\d_\d\d-\d\d-\d\d)\.log$")
     found = []
-    if log_dir.is_dir():
-        for file in log_dir.iterdir():
-            match = pattern.match(file.name)
-            if match:
-                found.append((match.group(1), file))
+    for folder in result_dirs(log_dir):
+        if folder.is_dir():
+            for file in folder.iterdir():
+                match = pattern.match(file.name)
+                if match:
+                    found.append((match.group(1), file))
     found.sort()
     return [file for _, file in found[-count:]]
 
@@ -78,6 +85,31 @@ def _line(label: str, a: str, b: str, change: str = "") -> str:
     text = label + ":" if label else ""
     left = text + " " * max(_COL_LABEL - len(text), 1)
     return (left + a.ljust(_COL_A) + b.ljust(_COL_B) + change).rstrip()
+
+
+def _screen_rows(rows: list, width: int, md: str) -> list:
+    """Table rows (label, A, B, change) for the terminal. Wide/normal: columns shrunk to the width (long values wrapped
+    under their column); compact: every metric is a small block 'label:' + 'A .. / B .. / change ..'."""
+    out = []
+    if md == "compact":
+        for label, a, b, change in rows:
+            if not label and a == "A (older)":
+                continue
+            out.append(f"{label}:" if label else "")
+            for tag, value in (("A", a), ("B", b), ("Δ", change)):
+                if value:
+                    out += ui.wrap(value, width, f"  {tag} ", "    ")
+        return out
+    label_w = min(28, max(14, width // 4))
+    rest = width - label_w
+    a_w = b_w = max(10, int(rest * (0.34 if md == "normal" else 0.30)))
+    ch_w = max(10, rest - a_w - b_w)
+    for label, a, b, change in rows:
+        cells = [ui.wrap(t, w - 1) for t, w in ((label + ":" if label else "", label_w), (a, a_w), (b, b_w), (change, ch_w))]
+        for i in range(max(len(c) for c in cells)):
+            parts = [(c[i] if i < len(c) else "").ljust(w) for c, w in zip(cells, (label_w, a_w, b_w, ch_w))]
+            out.append("".join(parts).rstrip())
+    return out
 
 
 def _verdict(diff: Optional[float], threshold: float, lower_is_better: bool) -> str:
@@ -127,18 +159,18 @@ def _profile_text(run: RunData) -> str:
 
 # --- main function --------------------------------------------------------------------------
 
-def compare_runs(a: RunData, b: RunData, warn_temp: int = WARN_TEMP) -> list[str]:
-    """Comparison lines of two tests (A = older, B = newer)."""
+def compare_runs(a: RunData, b: RunData, warn_temp: int = WARN_TEMP, width: Optional[int] = None) -> list[str]:
+    """Comparison lines of two tests (A = older, B = newer). `width` = lay the table out for that many columns (terminal)."""
     sa, sb = _stats(a, warn_temp), _stats(b, warn_temp)
     better = worse = 0
     out = ["=" * WIDTH, "TEST COMPARISON", "=" * WIDTH,
            f"A: {a.path or '?'}", f"B: {b.path or '?'}", "",
-           _line("", "A (older)", "B (newer)", "change B vs A"),
+           ("", "A (older)", "B (newer)", "change B vs A"),
            "-" * WIDTH]
 
     def add(label, ta, tb, change="", verdict=""):
         nonlocal better, worse
-        out.append(_line(label, ta, tb, change + verdict))
+        out.append((label, ta, tb, change + verdict))
         better += verdict == " (better)"
         worse += verdict == " (worse)"
 
@@ -228,6 +260,27 @@ def compare_runs(a: RunData, b: RunData, warn_temp: int = WARN_TEMP) -> list[str
     out.append("'Slow cooldown' is the rest of the whole heatsink cooling down. Changes smaller than "
                f"{TEMP_DELTA} °C, {OPS_DELTA_PCT:.0f} % of performance or {ABOVE_DELTA} s are not rated.")
     out.append("=" * WIDTH)
+    return _layout(out, width)
+
+
+def _layout(items: list, width: Optional[int]) -> list[str]:
+    """The table rows (tuples) of the comparison become text: the classic 98-column lines, or rows for the terminal."""
+    out, rows = [], []
+    md = ui.mode(width + 1) if width else ""
+
+    def flush() -> None:
+        nonlocal rows
+        if rows:
+            out.extend(_screen_rows(rows, width, md) if width else [_line(*r) for r in rows])
+            rows = []
+
+    for item in items:
+        if isinstance(item, tuple):
+            rows.append(item)
+            continue
+        flush()
+        out.append(item)
+    flush()
     return out
 
 
@@ -260,7 +313,7 @@ def _warnings(a: RunData, b: RunData, sa: RunStats, sb: RunStats) -> list[str]:
     return notes
 
 
-def compare_files(a_path, b_path, warn_temp: int = WARN_TEMP) -> list[str]:
+def compare_files(a_path, b_path, warn_temp: int = WARN_TEMP, width: Optional[int] = None) -> list[str]:
     """Loads two logs and returns the comparison lines (CompareError on problems)."""
     runs = []
     for path in (a_path, b_path):
@@ -268,4 +321,4 @@ def compare_files(a_path, b_path, warn_temp: int = WARN_TEMP) -> list[str]:
             runs.append(read_log(path))
         except (OSError, ValueError) as exc:
             raise CompareError(f"{path}: {exc}") from exc
-    return compare_runs(runs[0], runs[1], warn_temp)
+    return compare_runs(runs[0], runs[1], warn_temp, width)

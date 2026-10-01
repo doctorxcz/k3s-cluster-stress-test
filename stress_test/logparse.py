@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .gpu import parse_gpu_field
 from .models import Sample
 from .disk import parse_result_line
 from .net import parse_result_line as parse_net_line
@@ -24,7 +25,8 @@ MAX_LINE = 4000
 _LINE_RE = re.compile(r"^(?P<cool>\[cooldown\]\s+)?\[(?P<h>\d\d):(?P<m>\d\d):(?P<s>\d\d)\]\s+"
                       r"CPU:\s*(?P<load>.*?)\|\s*Temp:\s*(?P<temps>.*?)\|\s*Clock:\s*(?P<freq>\S+)\s*MHz"
                       r"(?:\s*\|\s*Power:\s*(?P<power>[\d.]+)\s*W)?"
-                      r"(?:\s*\|\s*Ping:\s*(?P<ping>[\d.]+\s*ms|lost))?")
+                      r"(?:\s*\|\s*Ping:\s*(?P<ping>[\d.]+\s*ms|lost))?"
+                      r"(?:\s*\|\s*GPU:\s*(?P<gpu>[^|⚠]+))?")
 _POWER_LIMITS_RE = re.compile(r"^Power limits:\s*PL1\s+([\d.]+)\s*W(?:,\s*PL2\s+([\d.]+)\s*W)?")
 _CPU_PCT_RE = re.compile(r"(?:^|\s)(\d+)%|\((\d+)%\)")
 _RAM_RE = re.compile(r"RAM:\s*(\d+)\s*Mi(?:B)?\s*\((\d+)%\)")
@@ -78,6 +80,7 @@ def _parse_sample_line(line: str) -> Optional[tuple[int, Sample]]:
     ram = _RAM_RE.search("RAM:" + load.split("RAM:", 1)[1]) if "RAM:" in load else None
     temp = _CPU_TEMP_RE.search(match["temps"])
     freq = int(match["freq"]) if match["freq"].isdigit() else None
+    gpu = parse_gpu_field(match["gpu"]) if match["gpu"] else None
     return clock, Sample(
         t=0.0, phase="cooldown" if match["cool"] else "test",
         cpu_temp=int(temp.group(1)) if temp else None, freq_mhz=freq, cpu_pct=cpu_pct,
@@ -85,7 +88,11 @@ def _parse_sample_line(line: str) -> Optional[tuple[int, Sample]]:
         mem_used_pct=float(ram.group(2)) if ram else None,
         power_w=float(match["power"]) if match["power"] else None,
         ping_ms=float(match["ping"].split()[0]) if match["ping"] and match["ping"] != "lost" else None,
-        ping_lost=match["ping"] == "lost")
+        ping_lost=match["ping"] == "lost",
+        gpu_fan_pct=gpu.fan_pct if gpu else None,
+        gpu_temp=gpu.temp if gpu else None, gpu_power_w=gpu.power_w if gpu else None,
+        gpu_sm_mhz=gpu.sm_mhz if gpu else None, gpu_util_pct=gpu.util_pct if gpu else None,
+        gpu_mem_mib=gpu.mem_used_mib if gpu else None, gpu_throttle=gpu.throttle if gpu else None)
 
 
 def _parse_metrics(text: str) -> list[StressMetric]:
@@ -151,7 +158,7 @@ def parse_log(text: str, path: str = "") -> RunData:
             low = stripped.lower()
             word = low.split(":", 1)[1].split()[0] if low.split(":", 1)[1].split() else ""
             run.profile = {"stepped": "stepped", "spike": "spike", "disk": "disk",
-                           "network": "net"}.get(word, "classic")
+                           "network": "net", "gpu": "gpu"}.get(word, "classic")
         stage = _STAGE_RE.search(stripped)
         if stage:
             current_stage = int(stage.group(1))
@@ -182,7 +189,10 @@ def parse_log(text: str, path: str = "") -> RunData:
                 freq_mhz=sample.freq_mhz, cpu_pct=sample.cpu_pct,
                 mem_used_mib=sample.mem_used_mib, mem_used_pct=sample.mem_used_pct,
                 stage=stage_no, power_w=sample.power_w,
-                ping_ms=sample.ping_ms, ping_lost=sample.ping_lost))
+                ping_ms=sample.ping_ms, ping_lost=sample.ping_lost,
+                gpu_fan_pct=sample.gpu_fan_pct,
+                gpu_temp=sample.gpu_temp, gpu_power_w=sample.gpu_power_w, gpu_sm_mhz=sample.gpu_sm_mhz,
+                gpu_util_pct=sample.gpu_util_pct, gpu_mem_mib=sample.gpu_mem_mib, gpu_throttle=sample.gpu_throttle))
     return run
 
 

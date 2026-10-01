@@ -1,6 +1,6 @@
 """History of pytest runs into the hidden folder .logs/tests/.
 
-Every pytest run gets its own subdirectory (date_time_pid):
+Every pytest run gets its own subdirectory inside the folder of the day (.logs/tests/YYYY-MM-DD/date_time_pid):
   pytest.log             results of individual tests, errors with a traceback, summary
   inprocess-debug.log    debug log of the library from tests that call the code directly
   tool-runs/             debug logs of the tool started from integration tests
@@ -23,7 +23,7 @@ _state = {}
 
 def pytest_configure(config):
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    session_dir = ROOT / ".logs" / "tests" / f"{stamp}_{os.getpid()}"
+    session_dir = ROOT / ".logs" / "tests" / time.strftime("%Y-%m-%d") / f"{stamp}_{os.getpid()}"
     (session_dir / "tool-runs").mkdir(parents=True, exist_ok=True)
 
     # debug logs of the tool started from the tests go here, not to .logs/debug

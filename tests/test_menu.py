@@ -78,18 +78,18 @@ def test_cluster_line_survives_a_broken_cluster():
     (("1", "1", ""), ["--profile", "classic"]),
     (("1", "2", "s"), ["--profile", "stepped", "--smart"]),
     (("1", "3", "sw"), ["--profile", "spike", "--smart", "--net-watch"]),
-    (("2", "1", ""), ["--profile", "disk"]),
-    (("2", "2", "w"), ["--profile", "disk", "--smart", "--net-watch"]),
-    (("3", "1"), ["--profile", "net"]),
-    (("3", "2"), ["--net-matrix"]),
-    (("4", "w"), ["--quick", "--net-watch"]),
-    (("5", "1", "n1 n2"), ["--compare", "n1", "n2"]),
-    (("5", "1", "dell-9020"), ["--compare", "dell-9020"]),
-    (("5", "2", "dell-9020"), ["--set-baseline", "dell-9020"]),
-    (("5", "3", "some.log"), ["--export-log", "some.log"]),
-    (("6", "1"), ["--status"]),
-    (("6", "2", "abc123"), ["--stop", "abc123"]),
-    (("6", "3"), ["--list-nodes"]),
+    (("3", "1", ""), ["--profile", "disk"]),
+    (("3", "2", "w"), ["--profile", "disk", "--smart", "--net-watch"]),
+    (("4", "1"), ["--profile", "net"]),
+    (("4", "2"), ["--net-matrix"]),
+    (("5", "w"), ["--quick", "--net-watch"]),
+    (("7", "1", "n1 n2"), ["--compare", "n1", "n2"]),
+    (("7", "1", "dell-9020"), ["--compare", "dell-9020"]),
+    (("7", "2", "dell-9020"), ["--set-baseline", "dell-9020"]),
+    (("7", "3", "some.log"), ["--export-log", "some.log"]),
+    (("8", "1"), ["--status"]),
+    (("8", "2", "abc123"), ["--stop", "abc123"]),
+    (("8", "3"), ["--list-nodes"]),
 ])
 def test_build_action(answers, expected):
     ask = scripted(*answers[1:])
@@ -97,8 +97,8 @@ def test_build_action(answers, expected):
 
 
 @pytest.mark.parametrize("choice, answers", [
-    ("1", ("0",)), ("2", ("",)), ("3", ("0",)), ("5", ("0",)), ("6", ("0",)),
-    ("5", ("1", "")), ("5", ("2", "")), ("6", ("2", "")), ("9", ()),
+    ("1", ("0",)), ("3", ("",)), ("4", ("0",)), ("7", ("0",)), ("8", ("0",)),
+    ("7", ("1", "")), ("7", ("2", "")), ("8", ("2", "")), ("9", ()),
 ])
 def test_build_action_backs_out(choice, answers):
     assert menu.build_action(choice, scripted(*answers)) is None
@@ -106,7 +106,7 @@ def test_build_action_backs_out(choice, answers):
 
 def test_submenu_rejects_bad_numbers_then_accepts():
     ask = scripted("7", "x", "2")
-    assert menu.build_action("3", ask) == ["--net-matrix"]
+    assert menu.build_action("4", ask) == ["--net-matrix"]
 
 
 def test_command_text():
@@ -117,12 +117,12 @@ def test_command_text():
 
 def test_loop_runs_actions_and_returns_to_the_menu(capsys):
     ran = []
-    ask = scripted("1", "1", "w", "", "6", "3", "", "0")      # CPU classic +watch, Enter, list nodes, Enter, quit
+    ask = scripted("1", "1", "w", "", "8", "3", "", "0")      # CPU classic +watch, Enter, list nodes, Enter, quit
     code = menu.run_menu(ask=ask, run=lambda o: ran.append(o) or 0, cluster=lambda: "cluster: test")
     assert code == 0
     assert ran == [["--profile", "classic", "--net-watch"], ["--list-nodes"]]
     out = capsys.readouterr().out
-    assert out.count("KUBERNETES STRESS TEST") == 3 and "cluster: test" in out       # the menu came back after each run
+    assert out.count("K3S·STRESS") == 3 and "cluster: test" in out       # the menu came back after each run
     assert "▶ ./stress.sh --profile classic --net-watch" in out
 
 
@@ -131,7 +131,7 @@ def test_loop_reports_exit_code_and_survives_errors(capsys):
         if options == ["--status"]:
             return 3
         raise SystemExit(2)
-    ask = scripted("6", "1", "", "6", "3", "", "0")
+    ask = scripted("8", "1", "", "8", "3", "", "0")
     assert menu.run_menu(ask=ask, run=run, cluster=lambda: "c") == 0
     assert "(exit code 3)" in capsys.readouterr().out
 
@@ -173,17 +173,18 @@ def test_build_config_net_asks_mode_extra_and_time(monkeypatch):
 
 def _env(tmp_path):
     return dict(os.environ, KUBECTL=str(FAKE), FAKE_STATE=str(tmp_path), PYTHONPATH=str(ROOT),
-                STRESS_TEST_RUNNING_DIR=str(tmp_path / "running"))
+                STRESS_TEST_RUNNING_DIR=str(tmp_path / "running"),
+                STRESS_TEST_MENU_STATE=str(tmp_path / "menu-state.json"))     # never touch the real .logs/menu-state.json
 
 
 def test_menu_end_to_end_lists_nodes_and_quits(tmp_path):
     code = "from stress_test import menu; raise SystemExit(menu.run_menu())"
     res = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=_env(tmp_path), text=True,
-                         input="6\n3\n\n0\n", capture_output=True, timeout=60)
+                         input="8\n3\n\n0\n", capture_output=True, timeout=60)
     assert res.returncode == 0, res.stdout + res.stderr
     assert "cluster: 1 nodes (1 workers + 0 master), all Ready" in res.stdout
     assert "▶ ./stress.sh --list-nodes" in res.stdout and "fake-node" in res.stdout
-    assert res.stdout.count("KUBERNETES STRESS TEST") == 2
+    assert res.stdout.count("K3S·STRESS") == 2
 
 
 def test_bare_run_without_a_terminal_keeps_the_old_behaviour(tmp_path):

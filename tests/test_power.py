@@ -82,7 +82,7 @@ def test_run_logs_power_and_exports_it(tmp_path):
     res = run_tool(tmp_path, "--time", "5", "--log", "--export", "both",
                    env_extra={"FAKE_RUN": "3", "FAKE_WATTS": "20"})
     assert res.returncode == 0, res.stdout + res.stderr
-    log = next((tmp_path / "logs").glob("fake-node-5s-*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("fake-node-5s-*.log")).read_text(encoding="utf-8")
     assert "Power limits: PL1 25 W, PL2 51 W" in log and " W\n" in log and "CPU power (test)" in log
-    csv_text = next((tmp_path / "logs").glob("*.csv")).read_text()
-    assert csv_text.splitlines()[0].endswith("power_w")
+    csv_text = next((tmp_path / "logs").rglob("*.csv")).read_text()
+    assert "power_w" in csv_text.splitlines()[0].split(",") and csv_text.splitlines()[0].endswith("gpu_fan_pct")

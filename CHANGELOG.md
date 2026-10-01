@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.16.0 - 2026-10-01
+- **GPU test (NVIDIA, 2026-10-01):** `--profile gpu` (main menu `2 GPU`) burns one NVIDIA GPU with gpu-burn in a pod with `runtimeClassName: nvidia`
+  and `nvidia.com/gpu: 1` (not privileged, no hostPath) and reads `nvidia-smi` every interval: temperature, utilization, SM clock, power
+  (`N/A` on cards that do not report it, e.g. Quadro P620), throttle reasons. GPU stop temperature selectable (`--gpu-max-temp`, asked in
+  the dialog, default 80 °C; a warning 5 °C below it); the CPU limit stays active too. The GPU pod stays idle after the load, so the
+  cooldown measures the GPU cooling. If `nvidia-smi` stops answering 3 times in a row the test stops (the GPU cannot be watched).
+  Missing driver / toolkit / device plugin is reported with a hint. `--gpu-mem-pct`, `--gpu-double`, `--gpu-image` (an image with a ready
+  `gpu_burn` skips the build). FULL self-test gets a GPU phase for nodes that offer `nvidia.com/gpu` (never together with the CPU load).
+  Menu `2 GPU` opens a settings dialog (length, stop temperature, GPU memory share, single/double precision, cooldown, image, extras) and a
+  summary before the start. The live frame shows CPU temperature, RAM, GPU temperature, GPU clock, VRAM used/total, GPU load, power and
+  throttling; GPU model, driver, memory, limits and PCIe are read once before the load (`GPU INFO`, also in the log). The self-test
+  accepts `--nodes A,B` (only these nodes; a single node skips the network matrix).
+  **GPU scan:** menu `2 GPU` (and `--list-gpus`) first scans every node (Kubernetes `nvidia.com/gpu` + `lspci` in a short unprivileged pod) and shows
+  a table: ✅ OK = usable dedicated NVIDIA GPU, ⚠️ ERROR = card found but not offered to Kubernetes (driver / toolkit / plugin), ❌ none = no dedicated
+  GPU, ❓ `? ERROR` = the scan failed (cannot tell). Only ✅ nodes can be chosen: one node is picked automatically, several = numbers / `a` (all);
+  several nodes are tested one after another (`--nodes a,b --profile gpu`).
+  **GPU fan:** the GPU fan speed is shown in % (`nvidia-smi fan.speed`, `GPU FAN` in the GPU frame, log field `fan=45%`, CSV `gpu_fan_pct`); the CPU fan
+  is not read (the nodes do not expose it through hwmon). CPU tests show the model and cores / threads under the title (`Intel Core i7-4790S · 4c/8t @ 3.2 GHz`);
+  the GPU test has its own live frame (card, bars, VRAM, throttling).
+  **Several GPU nodes:** one table of all nodes (✅ done · ▶ running with progress and live temperature · ⏳ waiting · ❌ failed) on top of the live frame, printed
+  between the nodes in plain output and as the final table (replaces the CPU cluster summary). `--gpu-prepull` (asked in the menu) pulls the CUDA image on all chosen
+  nodes first. The settings show both stop temperatures; `--gpu-*` without `--profile gpu` is reported as ignored. No CPU temperature question for the GPU, disk and
+  network tests. Docs: setup guide for a GPU node in HELPDESK.md, `deploy/*.yaml`. The menu was renumbered: 1 CPU, 2 GPU, 3 DISK, 4 NET, 5 QUICK, 6 FULL, 7 DATA, 8 ADMIN.
+  The log has ` | GPU: ...` fields, CSV/JSON have `gpu_*` columns; `--compare` and the baseline do not show GPU data yet.
+- **Every screen adapts to the terminal width (2026-09-30 23:40):** three modes - compact (< 60 columns), normal (60-99), wide (100-200).
+  Submenus and questions (panels), long prompts, the help, settings, TEST SETTINGS, test / cluster / network / disk summaries, `--status`,
+  `--list-nodes`, `--compare`, the network matrix, the background box, the FULL self-test screens and `--help` are laid out for the
+  window: long sentences wrapped with a hanging indent (URLs / paths cut with `…`, never split), key/value blocks in two columns (wide) or
+  label-above-value (compact), tables drop or shorten columns by priority. The menu goes up to 200 columns. Saved logs / JSON / exports keep
+  their fixed format. `STRESS_TEST_COLUMNS=NN` forces a width (also without a terminal).
+- **Live screens:** in a terminal a running test is one framed block redrawn in place (no scrolling): node, stage, progress bar
+  (preparation / load / cooldown with snowflakes), CPU, RAM, temperature, clock, power, ping and the last events. `--parallel`
+  shows one table with every node (its own bar per node). `--net-matrix` fills its grid live. Plain text is kept for pipes,
+  `NO_COLOR` and `STRESS_NO_LIVE=1`.
+- **Start mode (`--parallel`):** `--start-mode rolling` (default) - every node starts its load as soon as it is ready and runs the
+  full time from its own start (a slow node does not hold the others back). `--start-mode sync` - every node prepares, says READY and
+  the load starts on all nodes at the same moment (`--ready-timeout SEC`, default 900, leaves out a node that is late).
+- **Network test:** the UDP job no longer stops the test when a firewall blocks UDP (it is reported as skipped with the reason);
+  `--net-extra no-udp` leaves it out. Network and disk tests have no cooldown by default and a short own summary.
+- **FULL self-test** (main menu `6`, or `--self-test`): network matrix, disks + SMART, CPU (stepped) and RAM for the whole cluster
+  with cooling pauses between the phases and one report (log + JSON + a framed verdict). Two confirmations; the master is optional.
+  `--self-test-level quick|standard|thorough`, `--self-test-ack`.
+- **Day folders:** results, debug logs and pytest runs are written into a folder per day (`logs/2026-09-30/`, `.logs/debug/2026-09-30/`,
+  `.logs/tests/2026-09-30/`); a run uses today's folder if it exists and creates it when it does not. With `--log-dir DIR` the day folder
+  is created inside DIR. `--compare`, `--export-log` and `--set-baseline` search all day folders; baselines stay in `logs/baselines/`.
+  `--migrate-logs` moves old flat files into day folders by their date.
+- The repo address is shown in the top border of the menu and the frames.
+
 ## 1.15.0
 - **Main menu:** `./stress.sh` typed without any option in a terminal shows a menu (CPU load, Disk, Network, Quick test,
   Results, Management) with the cluster state in the header. Every entry only builds the usual options (printed as

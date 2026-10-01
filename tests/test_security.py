@@ -198,10 +198,10 @@ def test_notes_cannot_forge_log_lines(tmp_path):
     """[S11] a newline in --notes must not create lines that logparse reads as results."""
     res = run_tool(tmp_path, "--time", "5", "--log", "--notes", FORGED, env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
-    log = next((tmp_path / "logs").glob("fake-node-5s-*.log"))
+    log = next((tmp_path / "logs").rglob("fake-node-5s-*.log"))
     run = parse_log(log.read_text(encoding="utf-8"), str(log))
     assert run.disk_results == [] and run.net_results == [] and run.node == "fake-node" and run.profile == "classic"
-    data = json.loads(next((tmp_path / "logs").glob("*.json")).read_text())
+    data = json.loads(next((tmp_path / "logs").rglob("*.json")).read_text())
     assert data["node"] == "fake-node" and data["disk_results"] == []
 
 
@@ -226,7 +226,7 @@ def test_clean_text_unit():
 def test_control_characters_are_stripped_from_notes(tmp_path):
     res = run_tool(tmp_path, "--time", "5", "--log", "--notes", "a\x1b[31mred\x07\rc", env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
-    text = next((tmp_path / "logs").glob("fake-node-5s-*.log")).read_text(encoding="utf-8")
+    text = next((tmp_path / "logs").rglob("fake-node-5s-*.log")).read_text(encoding="utf-8")
     assert "\x00" not in text and "\x1b" not in text and "\x07" not in text and "\r" not in text
 
 
@@ -283,7 +283,7 @@ def test_open_private_refuses_symlinks(tmp_path):
 def test_results_are_private(tmp_path):
     res = run_tool(tmp_path, "--time", "5", "--log", "--export", "both", env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
-    for path in (tmp_path / "logs").glob("fake-node-5s-*"):
+    for path in (tmp_path / "logs").rglob("fake-node-5s-*"):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, path
     assert stat.S_IMODE((tmp_path / "logs").stat().st_mode) == 0o700
 
@@ -302,7 +302,7 @@ def test_network_matrix_results_are_private(tmp_path):
     nodes = json.dumps([{"name": "n1", "ip": "10.0.0.1"}, {"name": "n2", "ip": "10.0.0.2"}])
     res = run_tool(tmp_path, "--net-matrix", "--net-time", "5", "--yes", env_extra={"FAKE_NODES": nodes})
     assert res.returncode == 0, res.stdout + res.stderr
-    files = list((tmp_path / "logs").glob("net-matrix-*"))
+    files = list((tmp_path / "logs").rglob("net-matrix-*"))
     assert files and all(stat.S_IMODE(f.stat().st_mode) == 0o600 for f in files)
 
 
@@ -509,3 +509,56 @@ def test_credentials_are_hidden_in_the_debug_log():
     escaped = _cut('"k3s.io/node-env": "{\\"K3S_TOKEN\\":\\"abc123\\",\\"K3S_URL\\":\\"https://x:6443\\"}"')
     assert "abc123" not in escaped and "K3S_URL" in escaped and "https://x:6443" in escaped
     assert _cut("nothing secret here") == "nothing secret here"
+
+
+# ---------------- GPU test and the node scan (2026-10-01) -------------------------------------------------------
+
+def test_gpu_burn_is_built_from_a_pinned_commit_never_from_the_branch_head():
+    from stress_test.gpu import GPU_BURN_COMMIT, build_gpu_setup
+    setup = build_gpu_setup()
+    assert GPU_BURN_COMMIT in setup and len(GPU_BURN_COMMIT) == 40 and "git clone" not in setup
+    assert "git checkout -q FETCH_HEAD" in setup
+
+
+@pytest.mark.parametrize("bad", ["img; rm -rf /", "a b", "x$(id)", "`id`", "img\nname", "-flag", "", "a" * 300])
+def test_gpu_image_with_shell_or_odd_characters_is_refused(bad):
+    from stress_test.gpu import valid_image
+    from stress_test.models import StressConfig
+    assert not valid_image(bad)
+    if bad:
+        with pytest.raises(ValueError):
+            StressConfig(node="n", profile="gpu", duration=60, gpu_image=bad).validate()
+
+
+def test_prepull_refuses_a_bad_image_without_touching_the_cluster():
+    from stress_test import gpuscan
+
+    class NoKube:
+        def apply(self, *a, **k):
+            raise AssertionError("kubectl must not be called")
+    said = []
+    assert gpuscan.prepull(NoKube(), ["n1"], "bad image;id", said.append) == {"n1": False} and "not a valid image" in said[0].lower()
+
+
+def test_pod_text_cannot_forge_log_lines_or_send_escape_codes():
+    from stress_test.gpuscan import parse_cards
+    from stress_test.gpu import parse_gpu_info
+    from stress_test.parsing import clean_block
+    cards, _ = parse_cards("GPU-CARD NVIDIA Quadro \x1b[31mRED\x1b[0m [10de:1cb6]\nSCAN-DONE")
+    assert "\x1b" not in cards[0][1]
+    info = parse_gpu_info("Evil\\x1b[2J, 580.1, 2048, [N/A], 1480, 3504, 3, 16, 6.1, vbios")
+    assert all("\x1b" not in line for line in info)
+    assert clean_block("CPU: x\nRAM \x1b]0;title\x07 bad\r\nDisk: ok") == "CPU: x\nRAM  ]0;title  bad\nDisk: ok"
+
+
+def test_gpu_scan_and_prepull_pods_are_unprivileged_without_host_access():
+    import json
+    from stress_test.manifests import gpu_scan_pod, image_pull_pod, stress_pod
+    from stress_test.models import PodNames
+    names = PodNames.new()
+    for pod in (gpu_scan_pod("n", names), image_pull_pod("n", names, "nvidia/cuda:x"),
+                stress_pod("n", names, 600, "true", gpu=True, image="nvidia/cuda:x")):
+        text = json.dumps(pod)
+        assert '"privileged"' not in text and "hostPath" not in text and "hostNetwork" not in text and "hostPID" not in text
+        assert pod["spec"]["automountServiceAccountToken"] is False
+        assert pod["spec"]["activeDeadlineSeconds"] > 0

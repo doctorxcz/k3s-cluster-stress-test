@@ -15,7 +15,8 @@ from .summary import run_stats
 SCHEMA_VERSION = 1
 EXPORT_CHOICES = ("json", "csv", "both", "none")
 EXPORT_DEFAULT = "json"
-CSV_FIELDS = ("t", "phase", "stage", "cpu_temp", "freq_mhz", "cpu_pct", "mem_used_mib", "mem_used_pct", "power_w")
+CSV_FIELDS = ("t", "phase", "stage", "cpu_temp", "freq_mhz", "cpu_pct", "mem_used_mib", "mem_used_pct", "power_w",
+              "gpu_temp", "gpu_power_w", "gpu_sm_mhz", "gpu_util_pct", "gpu_mem_mib", "gpu_throttle", "gpu_fan_pct")
 
 
 def run_to_dict(run: RunData, warn_temp: int = WARN_TEMP) -> dict:
@@ -70,6 +71,8 @@ def write_exports(run: RunData, log_path: str, formats: str = EXPORT_DEFAULT,
                 writer.writerow(CSV_FIELDS)
                 for s in run.samples:
                     writer.writerow([s.t, s.phase, s.stage, s.cpu_temp, s.freq_mhz,
-                                     s.cpu_pct, s.mem_used_mib, s.mem_used_pct, s.power_w])
+                                     s.cpu_pct, s.mem_used_mib, s.mem_used_pct, s.power_w,
+                                     s.gpu_temp, s.gpu_power_w, s.gpu_sm_mhz, s.gpu_util_pct, s.gpu_mem_mib,
+                                     s.gpu_throttle, s.gpu_fan_pct])
         written.append(path)
     return written

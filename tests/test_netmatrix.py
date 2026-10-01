@@ -83,16 +83,16 @@ def _run(tmp_path, *extra, env=None):
 
 def test_matrix_refuses_without_confirmation(tmp_path):
     res = _run(tmp_path)
-    assert res.returncode != 0 and "Cancelled" in res.stdout and not list((tmp_path / "logs").glob("net-matrix-*"))
+    assert res.returncode != 0 and "Cancelled" in res.stdout and not list((tmp_path / "logs").rglob("net-matrix-*"))
 
 
 def test_matrix_runs_and_saves(tmp_path):
     res = _run(tmp_path, "--yes")
     assert res.returncode == 0, res.stdout + res.stderr
     assert "NETWORK MATRIX" in res.stdout and "Nothing suspicious" in res.stdout and "[6/6]" in res.stdout
-    files = {p.suffix for p in (tmp_path / "logs").glob("net-matrix-*")}
+    files = {p.suffix for p in (tmp_path / "logs").rglob("net-matrix-*")}
     assert files == {".log", ".json"}
-    data = json.loads(next((tmp_path / "logs").glob("net-matrix-*.json")).read_text())
+    data = json.loads(next((tmp_path / "logs").rglob("net-matrix-*.json")).read_text())
     assert len(data["pairs"]) == 6 and all(p["mbps"] == 940.0 or p["client"] == "m1" or p["server"] == "m1" for p in data["pairs"])
 
 

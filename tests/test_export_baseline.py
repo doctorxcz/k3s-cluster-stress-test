@@ -108,7 +108,7 @@ def test_child_args_pass_export_and_baseline_flag():
 def test_run_writes_json_next_to_log(tmp_path):
     res = run_tool(tmp_path, "--node", "fake-node", "--time", "5", "--log", env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
-    jsons = list((tmp_path / "logs").glob("fake-node-5s-*.json"))
+    jsons = list((tmp_path / "logs").rglob("fake-node-5s-*.json"))
     assert len(jsons) == 1 and json.loads(jsons[0].read_text())["node"] == "fake-node"
     assert "Export saved to" in res.stdout
 
@@ -117,7 +117,7 @@ def test_export_none_writes_nothing(tmp_path):
     res = run_tool(tmp_path, "--node", "fake-node", "--time", "5", "--log", "--export", "none",
                    env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
-    assert not list((tmp_path / "logs").glob("*.json"))
+    assert not list((tmp_path / "logs").rglob("*.json"))
 
 
 def test_set_baseline_then_next_run_is_checked(tmp_path):
@@ -141,6 +141,6 @@ def test_export_log_command(tmp_path):
     run_tool(tmp_path, "--node", "fake-node", "--time", "5", "--log", "--export", "none", env_extra={"FAKE_RUN": "3"})
     res = run_tool(tmp_path, "--export-log", "fake-node")
     assert res.returncode == 0, res.stdout + res.stderr
-    assert list((tmp_path / "logs").glob("*.csv")) and list((tmp_path / "logs").glob("*.json"))
+    assert list((tmp_path / "logs").rglob("*.csv")) and list((tmp_path / "logs").rglob("*.json"))
     bad = run_tool(tmp_path, "--export-log", "nonexistent-node")
     assert bad.returncode != 0

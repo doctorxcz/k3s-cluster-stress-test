@@ -4,7 +4,8 @@
 
 # Kubernetes stress test (Python)
 
-> **Version 1.15.0 (English).** New here? Start with [`HELPDESK.md`](HELPDESK.md) — a step-by-step
+> **Version 1.16.0 (English)** (GPU test, GPU scan of the nodes, live screens, start modes, FULL self-test, day folders - see
+> [`CHANGELOG.md`](CHANGELOG.md)). New here? Start with [`HELPDESK.md`](HELPDESK.md) — a step-by-step
 > installation and troubleshooting guide. Quick start: `./stress.sh --list-nodes`, then
 > `./stress.sh --node <worker> --time 60 --cpu-load 50` (a safe first test) or just `./stress.sh` for the menu.
 
@@ -13,24 +14,150 @@ node, measures load, temperatures and CPU clock during the test and **stops the 
 overheats**. It is a rewrite of the original script `stress-node-v5.sh` in Python (no external
 dependencies, only the standard library and `kubectl`).
 
-## Main menu (since 1.15.0)
+## Main menu
+Run `./stress.sh` with no options in a terminal:
 ```
-==============================================
-   KUBERNETES STRESS TEST          v1.15.0
-   cluster: 4 nodes (3 workers + 1 master), all Ready
-==============================================
-  [1] CPU load             classic · stepped · spike
-  [2] Disk                 fio: MB/s, IOPS, latency · SMART
-  [3] Network              one node · matrix of all nodes
-  [4] Quick test           one node, 10 min, few questions
-  [5] Results              compare · baseline · export
-  [6] Management           what runs · stop · nodes
-  [0] Quit
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━ github.com/doctorxcz/k3s-cluster-stress-test ━┓
+┃ ◖●▲●◗ K3S·STRESS                                                v1.16.0 ┃
+┃ › cluster: 4 nodes (3 workers + 1 master), all Ready                    ┃
+┃ 🔥 last measured max 52 °C (hp-g2-celeron)                              ┃
+┃ 🔁 last: ./stress.sh --profile stepped · 2026-09-30 19:40               ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ TESTS                                                                   ┃
+┃ 1 ▸ ⚡ CPU    classic · stepped · spike                                 ┃
+┃ 2 ▸ 🎮 GPU    NVIDIA burn · temperature, clocks                         ┃
+┃ 3 ▸ 💾 DISK   fio · SMART                                               ┃
+┃ 4 ▸ 📡 NET    one node · matrix of all nodes                            ┃
+┃ 5 ▸ 🚀 QUICK  one node, 10 min, few questions                           ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ CLUSTER                                                                 ┃
+┃ 6 ▸ 🧪 FULL   self-test of the whole cluster · one report               ┃
+┃ 7 ▸ 📊 DATA   compare · baseline · export                               ┃
+┃ 8 ▸ 🔧 ADMIN  what runs · stop · nodes                                  ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ R ▸ repeat   S ▸ settings   ? ▸ help   Q ▸ quit                         ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
-Run `./stress.sh` with no options. Each entry (some open a submenu) only picks WHAT to do; the program then asks the usual
-questions (node, duration, ...). The chosen options are printed as the equivalent command, so you learn the flags, and after the
-test you are back in the menu. The menu is skipped when you give any option, when the input is not a terminal, or with
-`STRESS_NO_MENU=1`.
+Each entry (some open a submenu) only picks WHAT to do; the program then asks the usual questions (node, duration, ...). The chosen
+options are printed as the equivalent command (`▶ ./stress.sh --profile stepped ...`), so you learn the flags, and after the test you
+are back in the menu. The menu is skipped when you give any option, when the input is not a terminal, or with `STRESS_NO_MENU=1`.
+
+| Key | What it does |
+|---|---|
+| `1`-`8` | open the entry (CPU, GPU, DISK, NET, QUICK, FULL, DATA, ADMIN) |
+| `R` | repeat the last action exactly as it ran (shown in the header line `last:`) |
+| `S` | settings: default node, temperature limit, live frames on/off (kept in `.logs/menu-state.json`) |
+| `?` | help: what every entry does, in pages that fit a small terminal, with the links to this README and `HELPDESK.md` |
+| `Q` (or `0`) | quit |
+
+**The whole program follows the width of your terminal** (measured every time something is printed, so a resized window is fine). There are
+three modes: **compact** up to 59 columns, **normal** 60-99 columns (the layout above) and **wide** from 100 columns up to 200 columns.
+- *Menu:* compact = icons and names only; wide = two columns - TESTS with longer descriptions and tips on the left, CLUSTER and a NODES list
+  (role, state, the last measured temperature of every node) on the right.
+- *Submenus and questions* (CPU, DISK, NET, DATA, ADMIN, SETTINGS, every question with its choices): compact puts the hint under the name,
+  normal puts it beside, wide shows two columns of choices. A long question is printed wrapped above the prompt, so the input never wraps.
+- *Help `?`*: pages that fit the window; two columns in wide mode.
+- *Test settings, summaries, `--status`, `--list-nodes`, `--compare`, the cluster summary, the network matrix and the FULL self-test
+  screens:* long sentences are wrapped at word boundaries with a hanging indent (URLs and paths are never split, they are cut with `…`),
+  `Label:  value` blocks become two columns in wide mode and a label-above-value layout in compact mode, tables drop or shorten the least
+  important columns when the window is narrow (and show extra columns such as average temperature, clock and power when it is wide), the
+  matrix splits its columns into blocks. `--help` is wrapped the same way.
+- The saved files (`.log`, `.json`, exports) always keep their fixed format and never contain colours; only what is shown on the screen adapts.
+  Without a terminal (pipe, file) the plain 76-column layout is printed. For tests and screen recordings `STRESS_TEST_COLUMNS=NN` forces a
+  width (it also works without a terminal).
+
+The header also shows a yellow line while a test of the tool is running in the cluster, and the hottest temperature seen in the newest
+result logs (from the logs, not measured live).
+
+## Live screens (terminal only)
+In a terminal a running test is **one framed block that is redrawn in place** - nothing scrolls:
+- one node: a progress bar (yellow `▰▱` while the node is prepared, green `█░` during the load, snowflakes `❄️` during the cooldown),
+  the stage, the time left, CPU, RAM, temperature, clock, power and ping, and the last events; under the title the CPU model with
+  cores / threads (`Intel Core i7-4790S · 4c/8t @ 3.2 GHz`);
+- GPU test: its own frame with the card, bars, VRAM, throttling and (for several nodes) the table of all nodes - see the GPU section;
+- `--parallel`: one table with a line per node (its own bar, state, CPU, temperature, clock, RAM);
+- `--net-matrix`: the node x node grid fills in as the pairs finish.
+
+The preparation of a node (checks, probe pod, hardware, pod start, installing the tool) is shown as a bar with the current step.
+The frames adapt to the window (same three width modes as everywhere: compact < 60, normal 60-99, wide 100-200 columns): a wide window gives wider frames and more columns, a narrow one fewer columns (a node line keeps the
+name, state and temperature even in a 45-column window) and fewer event rows. **Resizing the window while a test runs is handled**: the
+frame is cleared and drawn again from the top at the new size, so no pieces of the old one stay on the screen. Without a terminal
+(pipe, file, `NO_COLOR`) or with `STRESS_NO_LIVE=1` (or **S** ▸ live frames off) the original line-by-line text is printed; the log
+files never contain colours.
+
+## FULL self-test of the whole cluster (`6 FULL`, or `--self-test`)
+One click checks everything the tool can test and ends with **one report**:
+
+| Phase | What runs |
+|---|---|
+| 1. Network | the node x node matrix (TCP, ping, UDP is optional) |
+| 2. Disks | fio benchmark + SMART health on every node |
+| 3. CPU | the stepped test 25 / 50 / 75 / 100 %: temperatures, clock, throttling; hardware is read with a read-only privileged pod (RAM modules, GPU, disks) |
+| 4. GPU | gpu-burn on every node that offers `nvidia.com/gpu` (alone, never together with the CPU load; the phase is left out when no node has a GPU) |
+| 5. RAM | memory allocation under a moderate CPU load (workers only) |
+
+Between the phases it waits until the nodes cool down: the target is each node's **own idle temperature + 8 °C** (at least 45 °C), it
+stops waiting when the target is reached, when the hottest node has stopped falling for 2 minutes (a room / case limit) or after
+10 minutes. Workers run at once; the **master is optional** (asked, default `n`) and runs last, capped at 70 % CPU.
+
+`--nodes A,B` limits the self-test to the chosen nodes (a master only when named; with a single node the network matrix is skipped).
+Levels: `quick` (about 15-20 min for a few nodes), `standard` (about 35 min, default), `thorough` (about 70 min) - `--self-test-level`.
+**It loads everything at full power: the cluster is not usable meanwhile, the power draw and the room temperature rise.** It shows a
+warning box and needs two confirmations (`y`, then the word `START`; for scripts `--self-test-ack`). The result:
+`logs/<day>/selftest-<time>/full-selftest-<time>.log` + `.json` (phases, a table per node, findings such as a slow disk with its model,
+SMART warnings, throttling, the hardware of every node, the network matrix, and a verdict), and a summary frame on the screen.
+
+## GPU test (NVIDIA) - `--profile gpu`, main menu `2 GPU`
+```bash
+./stress.sh --list-gpus                                                    # which nodes have a usable GPU?
+./stress.sh --profile gpu --node dell-9020-sff-i7 --time 2m --gpu-max-temp 80
+./stress.sh --profile gpu --nodes dell-9020-sff-i7,gpu-node-2 --time 2m   # several nodes, one after another
+```
+Burns the node's NVIDIA GPU with gpu-burn (a pod with `runtimeClassName: nvidia` and `nvidia.com/gpu: 1`, unprivileged, no hostPath) and reads
+`nvidia-smi` every interval: GPU temperature, utilization, clock, VRAM, power (`N/A` on cards that do not report it, e.g. Quadro P620), throttle
+reasons and the GPU fan speed in % (`nvidia-smi` gives no RPM; the CPU fan is not read). No CPU / RAM / disk load is combined with it.
+
+**Menu `2 GPU`** starts with a **scan of every node** (also `--list-gpus`): the Kubernetes API (`nvidia.com/gpu`) plus `lspci` in a short read-only
+pod are combined into one table:
+
+| Mark | Meaning |
+|---|---|
+| ✅ OK | a usable dedicated NVIDIA GPU (model and `nvidia.com/gpu 1` shown) |
+| ⚠️ ERROR | an NVIDIA card is there, but Kubernetes does not offer it (driver / toolkit / runtime / device plugin missing) |
+| ❌ none | no dedicated GPU (only an integrated Intel / AMD one, or no card) |
+| ❓ `? ERROR` | the scan failed, it cannot be said whether a GPU is there |
+| 💤 not Ready | the node is down |
+
+Only ✅ nodes can be chosen: with a single one it is picked automatically, with several you type numbers (`1,3`) or `a` for all - they are tested
+**one after another**. Then a settings dialog asks for the length (1 / 2 / 5 / 10 min or custom), the **GPU stop temperature** (default 80 °C, a
+warning 5 °C lower), the share of the GPU memory (default 90 %), single / double precision, the cooldown, the image, pre-pulling the image and the
+extras, and shows a summary. The CPU temperature limit is not asked (the default 85 °C guard stays; `--max-temp` changes it).
+
+**Live frame** (its own `GpuScreen`): the card, VRAM, driver, CUDA capability and PCIe in the title; bars for the GPU temperature (with the stop and
+warning marks and a small history graph), clock (against the card maximum), VRAM used / total and load; power, throttle reason and fan; the host
+(CPU load, RAM, CPU temperature and clock) on one row; the last events. With several nodes the frame starts with **one table of all nodes**
+(✅ done with max temperature, clock and throttling · ▶ running with progress and live temperature · ⏳ waiting · ❌ failed), and the same table is
+printed at the end instead of the CPU cluster summary. Before the load the card's static data (`GPU INFO`: model, driver, memory, power limit,
+maximum clocks, PCIe, VBIOS) is read and written to the log. CPU tests show the model and cores / threads under their title
+(`Intel Core i7-4790S · 4c/8t @ 3.2 GHz`).
+
+**Safety:** the test stops at `--gpu-max-temp` (2 readings in a row), at the CPU limit, and also when `nvidia-smi` stops answering (3 failed readings
+- the GPU could not be watched). The cooldown measures the GPU cooling (the pod idles after the load). A GPU used by another pod is refused.
+
+| Option | Meaning |
+|---|---|
+| `--gpu-max-temp °C` | GPU stop temperature (50-95, default 80; asked in the dialog) |
+| `--gpu-mem-pct %` | share of the GPU memory gpu-burn fills (default 90) |
+| `--gpu-double` | double precision (very slow on consumer cards) |
+| `--gpu-image IMAGE` | image of the load pod (default a CUDA 12.x devel image; one that contains `gpu_burn` skips the build) |
+| `--gpu-prepull` | pull the CUDA image on the chosen nodes first, all at once (asked in the menu dialog) |
+| `--list-gpus` | scan all nodes for graphics cards and show the table above, then exit |
+
+Needs on each GPU node: the NVIDIA driver, `nvidia-container-toolkit`, runtime `nvidia` in containerd and the NVIDIA device plugin - a step-by-step
+guide and the manifests (`deploy/nvidia-device-plugin-k3s.yaml`, `deploy/gpu-smoke-test.yaml`) are in [`HELPDESK.md`](HELPDESK.md). The first run
+pulls a ~3 GB image and builds gpu-burn (a few minutes); `--gpu-prepull` or a `--gpu-image` with a ready `gpu_burn` avoids waiting later.
+The `--gpu-*` options without `--profile gpu` are ignored (a note is printed). The FULL self-test (below; `--nodes A,B` limits it to chosen nodes)
+adds a GPU phase for every node that offers `nvidia.com/gpu`.
 
 ## Requirements
 - Python 3.9+ (tested on 3.12)
@@ -57,37 +184,43 @@ python3 -m stress_test --help
 |---|---|
 | `--node NAME` | the node to test (otherwise it offers a list) |
 | `--time DURATION` | test duration: seconds or `30s`, `5m`, `1h`, `1h30m` (no unit = seconds) |
-| `--max-temp °C` | the test stops at this CPU temperature (2 readings in a row), 60–95, default 85 |
+| `--max-temp °C` | the test stops at this CPU temperature (2 readings in a row), 60–95, default 85 (not asked for the disk, network and GPU tests; the default guard stays) |
 | `--cpu-load %` | CPU load, default 100 |
 | `--ram-pct %` | enables the RAM test: how many % of **free** memory to allocate |
 | `--hdd` / `--no-hdd` | stress the disk |
 | `--log` / `--no-log` | save the test results to `logs/<node>-<duration>s-<date>.log` |
-| `--log-dir DIR` | folder with the results (default `logs` in the project directory; a relative path is taken from the project, an absolute one is used unchanged) |
+| `--log-dir DIR` | folder with the results (default `logs` in the project directory; a relative path is taken from the project, an absolute one is used unchanged). A run writes into a **day folder** inside it: `DIR/YYYY-MM-DD/` (created when it does not exist) |
+| `--migrate-logs` | one-off: move old flat result / debug / pytest logs into day folders by their date |
 | `-b`, `--background` | run the test **in the background** (see below), logging turns on by itself. Default: no |
 | `--status` | shows tests running in the background and the tool's pods in the cluster |
 | `--stop ID\|NODE\|PID` | gracefully stops a test running in the background (pod cleanup) |
 | `--compare LOG [LOG]` | compare two tests from logs (or just a node name = its two newest), see below |
-| `--profile classic\|stepped\|spike\|disk\|net` | classic test (default), stepped 25/50/75/100 % (always logged), spike (repeating jump between a low and a high load), disk benchmark (fio) or network test (iperf3) |
+| `--profile classic\|stepped\|spike\|disk\|net\|gpu` | classic test (default), stepped 25/50/75/100 % (always logged), spike (repeating jump between a low and a high load), disk benchmark (fio), network test (iperf3) or GPU test (gpu-burn, see the GPU section) |
 | `--spike-target %` | spike test: target CPU load of the high phase (see `--help` for the allowed values) |
 | `--spike-low-time DURATION` / `--spike-high-time DURATION` | spike test: length of the low (10 %) and the high phase in every cycle |
 | `--net-time DURATION` | network test: length of one iperf3 test (5–60 s) |
 | `--schedule HH:MM` | start the test later (the nearest occurrence of that time), typically together with `-b` |
 | `--dry-run` | only show what would be started (node, settings) and exit; nothing runs on the cluster |
 | `--list-nodes` | list the cluster's nodes (role, state) and exit |
+| `--list-gpus` | scan every node for graphics cards (read-only pods) and show which have a usable dedicated NVIDIA GPU, then exit |
 | `--no-background` | run in the foreground (the opposite of `-b`) |
 | `--steps 25,50,75,100` | stages of the stepped test in % |
 | `--step-time DURATION` | length of one stage (default 3 min) |
 | `--workers` / `--cluster` / `--nodes a,b` | test several nodes one after another (workers / the whole cluster / a list) |
 | `--parallel` / `--no-parallel` | workers at once (master alone afterwards) / one after another; without a flag a question is asked |
+| `--start-mode rolling\|sync` | with `--parallel`: `rolling` (default) every node starts its load as soon as it is ready and runs the full time from its own start; `sync` all nodes wait until every one is ready and start together |
+| `--ready-timeout SEC` | with `--start-mode sync`: how long to wait until all nodes are ready (default 900); a node that is late is left out |
+| `--self-test` | the FULL self-test of the whole cluster (see above); `--self-test-level quick\|standard\|thorough`, `--self-test-ack` (the second confirmation for scripts) |
+| `--net-extra LIST` | network test extras: `dns`, `internet`, `mtr`, `service`, `all`, and `no-udp` (leave the UDP test out) |
 | `--api-limit SEC` | when running in parallel: an API response slower than this many seconds (2× in a row) stops all tests |
 | `--include-master` | also include the master with `--workers`; in the stepped test without a question |
-| `--cooldown DURATION` | after the test keep measuring temperature and clock (default 60 s, `0` = off, max 600 s) |
+| `--cooldown DURATION` | after the test keep measuring temperature and clock (default 60 s, `0` = off, max 600 s; the network and disk tests have none unless you ask) |
 | `--notes TEXT` | a note for the log |
 | `--force` | bypass the master protection (`FORCE=1 python3 -m stress_test` works too) |
 | `-y`, `--yes` | confirm questions automatically (e.g. for the master) |
 | `--allow-no-sensor` | continue even without a CPU temperature sensor |
 | `--no-hw` | do not detect node hardware (the `hw-info` pod is not started) |
-| `--hw-privileged` | the `hw-info` pod runs privileged (to list RAM modules via `dmidecode`); the default is without `privileged` |
+| `--hw-privileged` | the `hw-info` pod runs privileged (to list RAM modules via `dmidecode`); the default is without `privileged`. The hardware list also shows the GPU (`lspci`) and the disks (`lsblk`) |
 | `--non-interactive` | do not ask anything, take missing values from the defaults (`--node` required) |
 | `--interval S` | measurement interval, default 5 s |
 | `--remaining-every N` | every Nth measurement also prints how much is left (default 3, `0` = off) |
@@ -144,7 +277,7 @@ Return to idle (≤ 44 °C): after 35 s (idle before test 39 °C + 5)
 - **CPU % and RAM are read directly from the node** (`/proc/stat` counters and `MemTotal`/`MemAvailable`
   from the probe), not from `kubectl top`. The line is therefore always current. The metrics server only
   refreshes its data now and then and the line used to lag by tens of seconds.
-- **Throttling** is judged from the clock under full load (utilisation above 80 %): the average of the first
+- **Throttling** (only when the CPU also got warm: a lower clock while the CPU stays below 65 °C is reported as "not thermal - power saving / governor") is judged from the clock under full load (utilisation above 80 %): the average of the first
   and the last third of the measurements is compared. A drop of 10 % or more is flagged as a *suspicion*.
   It is an estimate from measured values, not proof.
 - **Two cooldown phases:** the *drop after the load stops* is the fast fall right after the load ends (the
@@ -205,6 +338,8 @@ The baselines are in `logs/baselines/<node>.json`.
 `--profile net` and `--net-matrix` run an `iperf3` server on one node and a client on another. The port comes from the
 Kubernetes **NodePort range** (32000–32699; the matrix uses 32100 and up). **A node firewall that lets in only chosen ports
 makes these tests fail** (the pair shows `x`, "iperf3 failed (peer unreachable / port blocked?)") - even though ping works.
+If only **UDP** is blocked, the test does not stop: the UDP job is reported as `skipped` (with the reason) and the rest goes on; use
+`--net-extra no-udp` to leave it out for good.
 
 | Protocol | Ports | For |
 |---|---|---|
@@ -226,7 +361,8 @@ That range is usually open on a Kubernetes node already (NodePort Services use i
 ```
 An iperf3 server pod starts on the peer, the tested node runs the client (both pods `hostNetwork` in `host` mode, so the
 real NIC is measured; `pod` mode goes through the pod network). Jobs: link speed/duplex, ping (latency, jitter, loss), path MTU,
-TCP up/down, TCP with 4 streams, UDP (jitter, loss), NIC error counters. Typical findings the summary points out: a link
+TCP up/down, TCP with 4 streams, UDP (jitter, loss; optional and never fatal), NIC error counters. There is no CPU load and no
+cooldown in this test, and its summary only shows the node's CPU, RAM and temperature as information. Typical findings the summary points out: a link
 negotiated at 100 Mb/s (bad cable/port), half duplex, packet loss, big difference between up and down, retransmits.
 `--net-rate` caps the TCP tests; when the master is on either end they are capped at 300 Mbit/s so the API keeps its network.
 Needs internet on both nodes (apt installs iperf3 and iputils-ping) and a free TCP/UDP port (5201 + a per-run offset).
@@ -292,12 +428,16 @@ always last.
   `--stop cluster`).
 
 **Workers at once** (`--parallel`, since 1.6.0): every worker runs in its own subprocess, the tool only
-controls them and shows one table in the terminal (redrawn in place in a terminal, otherwise printed once per
-30 s):
+controls them and shows one framed table in the terminal (redrawn in place; without a terminal a text table is printed every
+30 s). In a terminal every node has its own bar; a text line looks like this:
 ```
 dell-9020-sff-i7          ▶ Stage 3/4 (75 %)      CPU   74 %    71 °C   3591 MHz  left ~6 min
 hp-g2-celeron             ▶ Stage 3/4 (75 %)      CPU   76 %    52 °C   1600 MHz  left ~6 min
 ```
+- **Start mode:** by default (`--start-mode rolling`) every node starts its load **as soon as it is ready** and runs the full time from
+  its **own** start, so a slow node (slow CPU, slow network, `apt`) never holds the others back; the text output says
+  `🟢 <node> started its load (k/N)`. With `--start-mode sync` every node prepares, says READY (`🚦 <node> READY (k/N)`), and the load
+  starts on all nodes at the same moment (`🟢 GO`); a node that is not ready within `--ready-timeout` is left out.
 - The total time is the longest worker, not the sum. Without `--parallel` it asks interactively (**at once /
   one after another**), otherwise it tests one after another (`--no-parallel` forces that). Running in parallel
   makes sense from two workers.
@@ -326,7 +466,8 @@ hp-prodesk-400-g6 (master) OK         61      0 s        no          410.2      
 
 ## How a test runs
 1. Leftovers of earlier tests are removed (finished pods of this tool; running ones are never touched).
-2. The `hw-info` pod runs briefly (unprivileged by default): CPU, threads, system, motherboard, RAM modules.
+2. The `hw-info` pod runs briefly (unprivileged by default): CPU, threads, system, motherboard, RAM total, GPU, disks (model, size,
+   HDD/SSD); RAM modules need `--hw-privileged`.
 3. The `temp-probe` pod is started (busybox, `/sys` **read-only**) and it is verified that the node has a CPU
    temperature sensor. Without it the overheating protection would not work, so the tool asks (or refuses,
    with `--non-interactive` without `--allow-no-sensor`).
@@ -340,23 +481,29 @@ hp-prodesk-400-g6 (master) OK         61      0 s        no          410.2      
 
 ## Logs: where to find what
 Three different things in two places, always inside the project directory (it does not matter where you
-start the tool from):
+start the tool from). **Everything is written into a folder of the day** (`YYYY-MM-DD`): a run looks whether today's folder
+exists, creates it when it does not, and writes only into it - so 20 tests in one day stay together and tomorrow starts a new folder.
 
 | Where | For whom | What is in it |
 |---|---|---|
-| `logs/` (visible) | the user | test results: hardware, ongoing measurements, remaining time, the reason for ending. Created only with `--log`. File `<node>-<duration>s-<date_time>.log` |
-| `.logs/debug/` (hidden) | debugging | **a technical log of every run** (even without `--log`): all called `kubectl` commands with the return code and time, every measurement and decision of the temperature guard, all user-facing output and the full traceback on an error. One file per run: `<date>_<time>_<pid>.log` |
-| `.logs/tests/<date>_<time>_<pid>/` (hidden) | debugging | history of pytest runs: `pytest.log` (results, errors, summary), `inprocess-debug.log`, `tool-runs/` (debug logs of the tool started from the integration tests) |
+| `logs/<day>/` (visible) | the user | test results: hardware, ongoing measurements, remaining time, the reason for ending. Created only with `--log`. File `<node>-<duration>s-<date_time>.log` (+ `.json`/`.csv`, series logs `cluster-<date_time>.log`, `net-matrix-...`, and `selftest-<time>/` folders of the FULL self-test) |
+| `logs/baselines/` | the user | the baseline of every node (outside the day folders, so it is found from any day) |
+| `.logs/debug/<day>/` (hidden) | debugging | **a technical log of every run** (even without `--log`): all called `kubectl` commands with the return code and time, every measurement and decision of the temperature guard, all user-facing output and the full traceback on an error. One file per run: `<date>_<time>_<pid>.log` |
+| `.logs/tests/<day>/<date>_<time>_<pid>/` (hidden) | debugging | history of pytest runs: `pytest.log` (results, errors, summary), `inprocess-debug.log`, `tool-runs/` (debug logs of the tool started from the integration tests) |
+| `.logs/running/`, `.logs/menu-state.json` | the tool | registry of background tests, the menu's last action and settings (not in day folders) |
+
+With `--log-dir DIR` the day folder is made inside `DIR`. `--compare`, `--export-log` and `--set-baseline` search **all day folders**
+(a node name = its newest logs from any day). Older flat files can be moved into day folders once with `python3 -m stress_test --migrate-logs`.
 
 The history of the debug logs is complete, nothing is deleted automatically. The hidden folders have a dot
 in their name (`ls -a`). On an error (exit code 1) the tool prints the path to the debug log. If the debug
-log cannot be created (e.g. permissions), the tool keeps running without it.
+log cannot be created (e.g. permissions), the tool keeps running without it. New folders are private (`0700`).
 
 Quick looks into the history:
 ```bash
-ls -lt .logs/debug | head                       # the latest runs
-grep -l "ERROR" .logs/debug/*.log               # which run went wrong
-tail -n 60 "$(ls -t .logs/debug/*.log | head -1)"   # the end of the last run
+ls -lt .logs/debug/$(date +%F) | head                    # the latest runs of today
+grep -l "ERROR" .logs/debug/*/*.log                      # which run went wrong (any day)
+tail -n 60 "$(ls -t .logs/debug/*/*.log | head -1)"      # the end of the last run
 ```
 The path to the hidden folder with the debug logs can be overridden with the `STRESS_TEST_DEBUG_DIR` variable.
 
@@ -433,22 +580,30 @@ stress_test/
   compare.py    comparing two tests (--compare)
   series.py     testing several nodes one after another, plan, summary and series log
   parallel.py   workers at once (subprocesses), live table, API response guard
-  paths.py      where logs are stored (logs/, .logs/debug/, .logs/tests/)
+  paths.py      where logs are stored: day folders (logs/<day>/, .logs/debug/<day>/, .logs/tests/<day>/), log migration
   debuglog.py   the hidden technical log of every run
-  menu.py       the main menu (since 1.15.0)
+  menu.py       the main menu (sections, R repeat, S settings, ? help, status rows)
+  ui.py         the retro look: frames, bars, icons, live screens (single node, matrix), width-aware drawing
+  selftest.py   the FULL self-test: phases, cooling pauses, hardware / disk findings, one report
   export.py     export of results (--export, --export-log)
   baseline.py   baseline of a node and the comparison with it (--set-baseline)
   smart.py      SMART disk health (--smart)
   disk.py       fio disk benchmark (--profile disk)
+  gpu.py        GPU test: gpu-burn command, nvidia-smi parsing, throttle reasons, guard, summary, log field
+  gpuscan.py    GPU scan of all nodes (--list-gpus, menu 2), node choice, the multi-node table (GpuBoard), image pre-pull
   net.py        network test of one node (--profile net, --net-extra, --net-watch)
   netmatrix.py  network matrix of all nodes (--net-matrix)
-conftest.py     writes the history of pytest runs to .logs/tests/
+conftest.py     writes the history of pytest runs to .logs/tests/<day>/
 tests/
   test_parsing.py, test_models.py, test_monitor.py, test_summary.py, test_compare.py,
   test_series.py, test_parallel.py, test_background.py,
   test_paths_and_debuglog.py, test_spike.py, test_export_baseline.py, test_smart.py, test_disk.py,
   test_net.py, test_net_extras.py, test_net_watch.py, test_netmatrix.py, test_power.py,
-  test_menu.py, test_security.py                      unit tests
+  test_menu.py, test_menu_v2.py, test_security.py, test_live_ui.py, test_sync_start.py,
+  test_net_udp_light.py, test_selftest.py, test_daily_logs.py, test_gpu.py, test_gpu_profile.py,
+  test_gpuscan.py, test_gpu_board.py, test_gpu_fan.py, test_width_modes.py, test_responsive.py   unit tests
+deploy/
+  nvidia-device-plugin-k3s.yaml, gpu-smoke-test.yaml   manifests for the GPU node setup (see HELPDESK.md)
   fake_kubectl.py + test_integration.py               the whole flow against a fake kubectl
 ```
 

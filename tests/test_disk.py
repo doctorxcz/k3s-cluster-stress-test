@@ -113,9 +113,9 @@ def test_run_disk_benchmark_against_fake(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     assert "DISK BENCHMARK" in res.stdout and "seq-write" in res.stdout and "300.0 MB/s" in res.stdout
     assert "Test completed" in res.stdout
-    log = next((tmp_path / "logs").glob("fake-node-20s-*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("fake-node-20s-*.log")).read_text(encoding="utf-8")
     assert log.count("Disk result:") == 4 and "Profile: disk" in log
-    data = json.loads(next((tmp_path / "logs").glob("*.json")).read_text())
+    data = json.loads(next((tmp_path / "logs").rglob("*.json")).read_text())
     assert len(data["disk_results"]) == 4 and data["profile"] == "disk"
 
 

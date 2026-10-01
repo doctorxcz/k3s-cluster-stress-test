@@ -26,6 +26,19 @@ Controlled by environment variables:
   FAKE_MEM_AVAILABLE_KB  MemAvailable from the probe in kB (default 6000000)
   FAKE_NO_MEM      "1" = the probe does not return MemAvailable (test of the fallback computation)
   FAKE_OTHER_PODS  JSON list of other pods of the tool
+  GPU simulation (profile gpu):
+  FAKE_GPU         "1" = the node has allocatable nvidia.com/gpu: 1 and the hw script prints an NVIDIA GPU line;
+                   "plugin-missing" = the hw script prints NVIDIA, but allocatable has no nvidia.com/gpu;
+                   anything else = no GPU at all
+  FAKE_GPU_TEMP    GPU temperature in °C under the gpu-burn load (default 60)
+  FAKE_GPU_IDLE_TEMP  GPU temperature when idle / after the load (default 40)
+  FAKE_GPU_POWER   "na" = power.draw/power.limit are [N/A] (Quadro P620), otherwise watts (default 55)
+  FAKE_GPU_THROTTLE  clocks_throttle_reasons mask under load, e.g. 0x20 (default 0x0)
+  FAKE_GPU_FAIL    "faulty" = gpu_burn reports FAULTY, "nofinish" = it prints no result, "build" = gpu-burn
+                   cannot be built (the pod prints the FAILED marker)
+  FAKE_GPU_BUSY    "1" = another pod on the node already requests nvidia.com/gpu: 1
+  FAKE_GPU_FAN     GPU fan.speed as nvidia-smi prints it ("45", or "[N/A]"); unset = the field is not printed
+  FAKE_GPU_SMI_FAIL  "1" = `exec ... nvidia-smi` fails
 The file events.txt in FAKE_STATE receives lines "<time> start|end <node>" (when the load was running).
 """
 import json
@@ -72,13 +85,20 @@ def event(kind, node):
         fh.write(f"{time.time():.3f} {kind} {node}\n")
 
 
+def gpu_mode(node):
+    """FAKE_GPU_BY_NODE {"node": mode} overrides FAKE_GPU per node (modes: 1, plugin-missing, intel, none, scan-fail)."""
+    by_node = json.loads(os.environ.get("FAKE_GPU_BY_NODE", "{}"))
+    return by_node.get(node, os.environ.get("FAKE_GPU", ""))
+
+
 def node_object(spec):
     labels = {"node-role.kubernetes.io/control-plane": "true"} if spec.get("master") else {}
     return {
         "metadata": {"name": spec["name"], "labels": labels},
         "status": {
             "conditions": [{"type": "Ready", "status": "True" if spec.get("ready", True) else "False"}],
-            "allocatable": {"memory": "8000000Ki"},
+            "allocatable": dict({"memory": "8000000Ki"},
+                                **({"nvidia.com/gpu": "1"} if gpu_mode(spec["name"]) == "1" else {})),
             "capacity": {"cpu": "8"},
             "addresses": [{"type": "InternalIP", "address": spec.get("ip", "10.0.0.1")},
                           {"type": "Hostname", "address": spec["name"]}],
@@ -117,6 +137,10 @@ if cmd == "get":
             items.append({"metadata": {"name": p["name"], "namespace": p["ns"],
                                        "labels": p.get("labels", {})},
                           "status": {"phase": p.get("phase", "Running")}})
+        if os.environ.get("FAKE_GPU_BUSY") == "1":              # another pod holds the GPU
+            items.append({"metadata": {"name": "cuda-job", "namespace": "default", "labels": {}},
+                          "spec": {"containers": [{"resources": {"limits": {"nvidia.com/gpu": "1"}}}]},
+                          "status": {"phase": "Running"}})
         print(json.dumps({"items": items}))
     elif args[1] == "pods":                       # list of the tool's pods (-l app=...)
         items = []
@@ -205,6 +229,7 @@ elif cmd == "logs":
             print(f"stress-ng: metrc: [1] cpu               {percent * 800}    180.01    112.28      0.21       {percent * 6.5:.2f}         702.96", flush=True)
             print("stress-ng: info:  [1] successful run completed in 3 mins, 0.01 secs", flush=True)
 
+        gpu_run = "GPU-DONE" in script
         net_jobs = re.findall(r'NET-JOB \$i/\d+ (\S+)"', script)
         if net_jobs:                                                # network test: one result per job
             print("STRESS-NG STARTED", flush=True)
@@ -257,6 +282,20 @@ elif cmd == "logs":
         disk_jobs = re.findall(r'"(\S+) (?:read|write|randread|randwrite) ', script) if "DISK-JOB" in script else []
         if net_jobs:
             pass
+        elif gpu_run:                                               # gpu-burn: ends with GPU-INFO lines + GPU-DONE / GPU-FAILED
+            print("STRESS-NG STARTED", flush=True)
+            finished = run_for(run_total)
+            if finished:
+                fail = os.environ.get("FAKE_GPU_FAIL", "")
+                print("GPU-INFO GPU 0: OK" if fail != "faulty" else "GPU-INFO GPU 0: FAULTY", flush=True)
+                print("GPU-PERF 100.0%  proc'd: 56 (1086 Gflop/s)   errors: 0   temps: 65 C", flush=True)
+                print("GPU-INFO Tested 1 GPUs:", flush=True)
+                if fail == "faulty":
+                    print("GPU-FAILED faulty (compute errors)", flush=True)
+                elif fail == "nofinish":
+                    print("GPU-FAILED gpu_burn did not finish correctly", flush=True)
+                else:
+                    print("GPU-DONE", flush=True)
         elif disk_jobs:                                             # disk benchmark (fio): one result per job
             mbs = float(os.environ.get("FAKE_DISK_MBS", "400"))
             print("STRESS-NG STARTED", flush=True)
@@ -324,10 +363,69 @@ elif cmd == "logs":
                                       {"id": 5, "raw": {"value": int(realloc)}},
                                       {"id": 197, "raw": {"value": 0}}]}}))
                 print("SMART-END")
+        elif kind == "gpu-scan":                                  # GPU scan: lspci of the node (FAKE_GPU_BY_NODE)
+            try:
+                node = json.load(open(flag(f"manifest-{pod}.json")))["spec"]["nodeName"]
+            except (OSError, KeyError, ValueError):
+                node = "?"
+            mode = gpu_mode(node)
+            if mode == "scan-fail":
+                sys.exit(1)
+            print("GPU-CARD Intel Corporation HD Graphics 4600 [8086:0412] (rev 06)")
+            if mode in ("1", "plugin-missing"):
+                print("GPU-CARD NVIDIA Corporation GP107GL [Quadro P620] [10de:1cb6] (rev a1)")
+            print("SCAN-DONE")
         else:
             print("CPU: Fake CPU\nThreads: 8")
+            if os.environ.get("FAKE_GPU") in ("1", "plugin-missing"):
+                print("GPU: NVIDIA Corporation GP107GL [Quadro P620]")
     else:
-        print("STRESS-NG STARTED")
+        gated = False
+        try:
+            gated = "STRESS-NG READY" in json.load(open(flag(f"manifest-{pod}.json")))["spec"]["containers"][0]["command"][2]
+        except (OSError, KeyError, ValueError):
+            pass
+        if gated:
+            print("STRESS-NG READY")
+        script_txt = ""
+        try:
+            script_txt = json.load(open(flag(f"manifest-{pod}.json")))["spec"]["containers"][0]["command"][2]
+        except (OSError, KeyError, ValueError):
+            pass
+        if "GPU-DONE" in script_txt and os.environ.get("FAKE_GPU_FAIL") == "build":
+            print("STRESS-NG FAILED")
+            sys.exit(0)
+        if not gated or os.path.exists(sflag("gate-go", rid)):
+            print("STRESS-NG STARTED")
+elif cmd == "exec" and "touch /tmp/go" in args[-1]:              # synchronised start: the GO for the stress pod
+    open(sflag("gate-go", rid_of(args[1])), "w").close()
+elif cmd == "exec" and "nvidia-smi" in args[-1]:               # GPU readings from the stress pod
+    if os.environ.get("FAKE_GPU_SMI_FAIL") == "1":
+        print("NVIDIA-SMI has failed", file=sys.stderr)
+        sys.exit(9)
+    if "driver_version" in args[-1]:                              # static card info (read once before the load)
+        print("Quadro P620, 580.178.04, 2048, [N/A], 1island, 3504, 3, 16, 6.1, 86.07.3C.00.0B".replace("1island", "1721"))
+        sys.exit(0)
+    rid = rid_of(args[1])
+    started = os.path.exists(sflag("stress-started", rid))
+    ended = os.path.exists(sflag("stress-ended", rid))
+    idle_t = int(os.environ.get("FAKE_GPU_IDLE_TEMP", "40"))
+    load_t = int(os.environ.get("FAKE_GPU_TEMP", "60"))
+    if started and not ended:
+        temp, util, sm, used, mask = load_t, 100, 1300, 1800, os.environ.get("FAKE_GPU_THROTTLE", "0x0")
+    else:
+        temp, util, sm, used, mask = idle_t, 0, 139, 0, "0x0000000000000001"
+        if started:
+            n = read_int(sflag("gpu-cool", rid)) + 1
+            write_int(sflag("gpu-cool", rid), n)
+            temp = max(idle_t, load_t - n * int(os.environ.get("FAKE_COOL_STEP", "2")))
+    if os.environ.get("FAKE_GPU_POWER", "55") == "na":
+        power, limit = "[N/A]", "[N/A]"
+    else:
+        power = os.environ.get("FAKE_GPU_POWER", "55") if util else "10"
+        limit = "120"
+    fan_field = ", " + os.environ["FAKE_GPU_FAN"] if "FAKE_GPU_FAN" in os.environ else ""
+    print(f"{temp}, {power}, {limit}, {sm}, 3504, {util}, {used}, 2048, {'P0' if util else 'P8'}, {mask}{fan_field}")
 elif cmd == "exec" and args[1].startswith("net-mx"):           # network matrix helper pods
     script = args[-1]
     try:

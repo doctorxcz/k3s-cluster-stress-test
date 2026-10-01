@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from . import ui
 from .kube import Kubectl
 from .models import MAX_NODE_BUSY_PCT, WARN_TEMP, NodeInfo, NodeWorkload, StressConfig
 from .parsing import describe_duration, describe_steps, format_duration, format_workload
@@ -196,8 +197,57 @@ def _recovery(stats: RunStats) -> str:
     return f"{stats.recovery_s:.0f} s" if stats.recovery_reached else "not reached"
 
 
-def format_cluster_summary(outcomes: Sequence[NodeOutcome], warn_temp: int = WARN_TEMP) -> list[str]:
-    """Final table of the series (terminal and log)."""
+def _screen_cluster_summary(outcomes: Sequence[NodeOutcome], warn_temp: int, width: int) -> list[str]:
+    """The table of the series laid out for the terminal: the important columns first, more columns when there is room
+    (the log keeps the classic table)."""
+    columns = [("Node", 0, "<"), ("State", 0, "<"), ("max °C", 1, ">"), (f"over {warn_temp} °C", 2, ">"),
+               ("throttling", 3, "<"), ("cpu perf", 4, ">"), ("return to idle", 5, "<"),
+               ("avg °C", 6, ">"), ("avg MHz", 7, ">"), ("avg W", 8, ">")]
+    rows, untested = [], []
+    for o in outcomes:
+        name = o.name + (" (master)" if o.is_master else "")
+        if o.stats is None:
+            rows.append([name, o.status, "", "", "", "", "", "", "", ""])
+            if o.reason:
+                untested.append((o.name, o.reason))
+            continue
+        s = o.stats
+        rows.append([name, o.status, f"{s.temp_max}" if s.temp_max is not None else "?",
+                     format_duration(round(s.above_s)), "SUSPECTED" if s.throttling else "no", _cpu_ops(o), _recovery(s),
+                     f"{s.temp_avg:.0f}" if s.temp_avg is not None else "-",
+                     f"{s.freq_avg:.0f}" if s.freq_avg is not None else "-",
+                     f"{s.power_avg:.1f}" if s.power_avg is not None else "-"])
+    grid = ui.table(columns, rows, width)
+    width = min(width, max(max((ui.visible_len(x) for x in grid), default=0), 50))       # the rules are as wide as the table
+    out = ["=" * width, "CLUSTER SUMMARY", "=" * width, *grid]
+    out.append("-" * width)
+    if untested:
+        out.append("Not tested:")
+        out += ui.kv_block(untested, width, lead="  ", label_w=24)
+    staged = [o for o in outcomes if o.stats and o.stats.stages]
+    if staged:
+        out.append("Temperatures per stage (max):")
+        out += ui.kv_block([(o.name, " | ".join(f"{st.target} % → {st.temp_max if st.temp_max is not None else '?'} °C"
+                                                for st in o.stats.stages)) for o in staged],
+                           width, lead="  ", label_w=24, colon=False)
+        out.append("-" * width)
+    tested = [o for o in outcomes if o.stats and o.stats.temp_max is not None]
+    if tested:
+        hottest = max(tested, key=lambda o: o.stats.temp_max)
+        out.append(f"Hottest: {hottest.name} ({hottest.stats.temp_max} °C).")
+    logs = [o for o in outcomes if o.log_path]
+    if logs:
+        out.append("Node logs:")
+        out += ui.kv_block([(o.name, o.log_path) for o in logs], width, lead="  ", label_w=24)
+    out.append("=" * width)
+    return out
+
+
+def format_cluster_summary(outcomes: Sequence[NodeOutcome], warn_temp: int = WARN_TEMP,
+                           width: Optional[int] = None) -> list[str]:
+    """Final table of the series (terminal and log). `width` = lay it out for that many columns (terminal only)."""
+    if width is not None:
+        return _screen_cluster_summary(outcomes, warn_temp, width)
     width = 104
     head = (f"{'Node':<26}{'State':<12}{'max °C':<8}{f'over {warn_temp} °C':<11}"
             f"{'throttling':<12}{'cpu perf':<11}{'return to idle'}")
@@ -253,6 +303,10 @@ class SeriesRunner:
         self.options = options
         self.log_path = log_path
         self.abort_reason = ""         # non-empty = the series was stopped from outside (e.g. API response)
+        self.board = None
+        if template.gpu and len(self.nodes) > 1 and not self.parallel:      # GPU test of several nodes: one table of all of them
+            from .gpuscan import GpuBoard
+            self.board = GpuBoard([n.name for n in self.nodes])
 
     def _log(self, text: str) -> None:
         with open_private(self.log_path, "a") as fh:
@@ -273,6 +327,8 @@ class SeriesRunner:
             self._log(f"Profile: spike - {t.spike_cycles}x "
                       f"({describe_duration(t.spike_low_time)} / "
                       f"{describe_duration(t.spike_high_time)} at {t.spike_target} %)")
+        elif t.gpu:
+            self._log(f"Profile: gpu - gpu-burn {t.gpu_mem_pct} % of the GPU memory for {describe_duration(t.duration)} per node")
         else:
             self._log(f"Profile: classic, CPU {t.cpu_load} % for {describe_duration(t.duration)}")
         self._log("Nodes: " + ", ".join(n.name + (" (master)" if n.is_control_plane else "")
@@ -304,7 +360,9 @@ class SeriesRunner:
             out=self.options.out, hw_privileged=self.options.hw_privileged,
             skip_hw=self.options.skip_hw, max_busy_pct=self.options.max_busy_pct,
             allow_busy_node=self.options.allow_busy_node,
-            skip_capacity_check=self.options.skip_capacity_check)
+            skip_capacity_check=self.options.skip_capacity_check, gpu_board=self.board)
+        if self.board:
+            self.board.start(node.name)
         try:
             code = runner.run()
         except Exception as exc:                       # noqa: BLE001 - one node does not stop the series
@@ -312,6 +370,10 @@ class SeriesRunner:
             self._say(f"❌ Test of node {node.name} failed: {exc}")
             code = EXIT_ERROR
         outcome.code = code
+        if self.board:
+            self.board.finish(node.name, code, runner.gpu_summary)
+            if not ui.LiveScreen.wanted():                 # plain output: the table after every node
+                self.options.out("\n".join(self.board.table(False)))
         outcome.stats = runner.stats
         outcome.metrics = runner.metrics
         outcome.log_path = log_path
@@ -353,8 +415,22 @@ class SeriesRunner:
         for name, reason in self.skipped:
             outcomes.append(NodeOutcome(name, reason=reason))
         self._say("")
-        for line in format_cluster_summary(outcomes):
-            self._say(line)
+        if self.board:                                  # GPU test: the GPU table instead of the CPU-oriented cluster summary
+            if interrupted or self.abort_reason:
+                self.board.skip_rest("not tested (interrupted)")
+            self.options.out("\n".join(self.board.table(ui.color_enabled())))
+            for line in self.board.table(False):
+                self._log(line)
+            for o in outcomes:
+                if o.log_path:
+                    self._say(f"  {o.name}: {o.log_path}")
+        elif ui.adaptive():
+            self.options.out("\n".join(format_cluster_summary(outcomes, width=ui.avail(130))))     # laid out for the terminal
+            for line in format_cluster_summary(outcomes):
+                self._log(line)
+        else:
+            for line in format_cluster_summary(outcomes):
+                self._say(line)
         self._say(f"📁 Series log saved to: {self.log_path}")
         code = EXIT_ERROR if self.abort_reason else aggregate_code(outcomes)
         log.info("Series done, exit code %s", code)

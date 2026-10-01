@@ -67,6 +67,9 @@ def seconds_above(samples: Sequence[Sample], limit: int) -> float:
     return total
 
 
+THERMAL_MIN_TEMP = 65     # °C: a clock drop while the CPU stays below this is not judged as thermal throttling
+
+
 def detect_throttling(test: Sequence[Sample],
                       min_cpu_pct: float = LOADED_CPU_PCT) -> tuple[bool, str]:
     """Assesses whether the CPU clock under load did not drop. Returns (suspicion, text).
@@ -86,6 +89,11 @@ def detect_throttling(test: Sequence[Sample],
     spread = (max(freqs) - min(freqs)) / max(freqs) * 100 if max(freqs) else 0.0
     last_temp = next((s.cpu_temp for s in reversed(loaded) if s.cpu_temp is not None), None)
     temp_txt = f" at a temperature of {last_temp} °C" if last_temp is not None else ""
+    temps = [s.cpu_temp for s in loaded if s.cpu_temp is not None]
+    if drop >= THROTTLE_DROP_PCT and temps and max(temps) < THERMAL_MIN_TEMP:
+        # a lower clock on a cool CPU is not thermal throttling: power saving, the governor, or the turbo budget
+        return False, (f"clock dropped by {drop:.0f} % ({first:.0f} → {last:.0f} MHz), but the CPU stayed cool "
+                       f"(max {max(temps)} °C) - not thermal: power saving / governor / turbo budget")
     if drop >= THROTTLE_DROP_PCT:
         return True, (f"SUSPECTED THROTTLING: clock dropped by {drop:.0f} % "
                       f"({first:.0f} → {last:.0f} MHz){temp_txt}")
@@ -331,6 +339,7 @@ def build_summary(samples: Sequence[Sample], baseline: Optional[ProbeData],
     out = ["=" * 52, "TEST SUMMARY", "=" * 52]
     if not test:
         out.append("No measurement could be obtained during the test.")
+        out.append("=" * 52)
         return out
 
     counts = f"{len(test)} during the test" + (f", {len(cool)} during cooldown" if cool else "")

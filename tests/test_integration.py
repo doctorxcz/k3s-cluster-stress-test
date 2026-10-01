@@ -32,7 +32,7 @@ def test_normal_run_completes_and_writes_log(tmp_path):
                    env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Test completed" in res.stdout
-    logs = list((tmp_path / "logs").glob("fake-node-5s-*.log"))
+    logs = list((tmp_path / "logs").rglob("fake-node-5s-*.log"))
     assert len(logs) == 1
     text = logs[0].read_text(encoding="utf-8")
     assert "Notes: test" in text and "Fake CPU" in text
@@ -44,7 +44,7 @@ def test_overheat_stops_test(tmp_path):
                    env_extra={"FAKE_TEMP": "92", "FAKE_RUN": "30"})
     assert res.returncode == 3, res.stdout + res.stderr
     assert "stopped because of overheating" in res.stdout
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "stopped because of overheating" in log
 
 
@@ -96,7 +96,7 @@ def test_summary_and_duration_units(tmp_path):
     assert "1 min (60 s)" in res.stdout          # given as 1m
     assert "ends around" in res.stdout
     assert "Actual run time:" in res.stdout
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "Test duration: 1 min (60 s)" in log
 
 
@@ -111,7 +111,7 @@ def test_remaining_time_printed_and_logged(tmp_path):
                    env_extra={"FAKE_RUN": "4"})
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Remaining" in res.stdout and "of 10 min" in res.stdout
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "Remaining" in log
 
 
@@ -126,7 +126,7 @@ def test_logs_go_to_given_folder_not_cwd(tmp_path):
     assert not (tmp_path / "logs").exists()
     res = run_tool(tmp_path, "--time", "5", "--log", env_extra={"FAKE_RUN": "2"})
     assert res.returncode == 0, res.stdout + res.stderr
-    logs = list((tmp_path / "logs").glob("fake-node-5s-*.log"))
+    logs = list((tmp_path / "logs").rglob("fake-node-5s-*.log"))
     assert len(logs) == 1
     assert list(tmp_path.glob("*.log")) == []      # nothing in the launch folder outside logs/
     assert str((tmp_path / "logs").resolve()) in res.stdout   # the full path is printed
@@ -136,7 +136,7 @@ def test_custom_log_dir(tmp_path):
     res = run_tool(tmp_path, "--time", "5", "--log", "--log-dir", str(tmp_path / "mine" / "results"),
                    env_extra={"FAKE_RUN": "2"})
     assert res.returncode == 0, res.stdout + res.stderr
-    assert len(list((tmp_path / "mine" / "results").glob("*.log"))) == 1
+    assert len(list((tmp_path / "mine" / "results").rglob("*.log"))) == 1
 
 
 # ---------------- hidden technical (debug) log ----------------------------------
@@ -206,7 +206,7 @@ def test_premature_end_is_not_reported_as_success(tmp_path):
     assert "of 1 min" in res.stdout
     assert "Test completed" not in res.stdout
     assert "the pod no longer exists" in res.stdout
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "PREMATURE" in log and "Test completed" not in log
     dbg = next((tmp_path / "debug").glob("*.log")).read_text(encoding="utf-8")
     assert "Premature end" in dbg
@@ -278,11 +278,11 @@ def kill_leftovers(tmp_path):
 
 
 def console_files(tmp_path):
-    return list((tmp_path / "logs").glob("*.console.txt"))
+    return list((tmp_path / "logs").rglob("*.console.txt"))
 
 
 def result_logs(tmp_path):
-    return list((tmp_path / "logs").glob("*.log"))
+    return list((tmp_path / "logs").rglob("*.log"))
 
 
 def test_background_returns_immediately_and_logs_automatically(tmp_path):
@@ -480,7 +480,7 @@ def test_ram_target_from_mem_available_and_memory_limit(tmp_path):
     cmd = pod["spec"]["containers"][0]["command"][2]
     assert "--vm-bytes 4096M" in cmd
     assert pod["spec"]["containers"][0]["resources"]["limits"]["memory"] == "5120Mi"
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "RAM target: 4096 MiB" in log
     dbg = next((tmp_path / "debug").glob("*.log")).read_text(encoding="utf-8")
     assert "memory limit 5120 MiB" in dbg
@@ -549,7 +549,7 @@ def test_log_files_and_dirs_are_private(tmp_path):
     env = {"FAKE_RUN": "2", "STRESS_TEST_DEBUG_DIR": str(tmp_path / "debug")}
     res = run_tool(tmp_path, "--time", "5", "--log", env_extra=env)
     assert res.returncode == 0, res.stdout
-    assert mode(next((tmp_path / "logs").glob("*.log"))) == 0o600         # results
+    assert mode(next((tmp_path / "logs").rglob("*.log"))) == 0o600         # results
     assert mode(next((tmp_path / "debug").glob("*.log"))) == 0o600        # debug log
     assert mode(tmp_path / "logs") == 0o700 and mode(tmp_path / "debug") == 0o700
 
@@ -577,7 +577,7 @@ def test_cooldown_measures_after_test_and_summary_is_shown_and_logged(tmp_path):
     assert "❄️" in out                                        # measurement lines during cooldown
     assert "TEST SUMMARY" in out and "Cooldown (" in out
     assert "cpu 658.9 | matrix 1458.5" in out                 # stress-ng performance
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "TEST SUMMARY" in log and "Cooldown (" in log     # the summary is in the log too
     assert "[cooldown] " in log and "Cooldown after test: 3 s" in log
     # order: test result, cooldown, summary, only then the log path
@@ -600,7 +600,7 @@ def test_cpu_and_ram_are_live_from_probe_not_from_metrics_server(tmp_path):
 
 
 def test_throttling_is_reported_in_summary(tmp_path):
-    env = {"FAKE_FREQ_DROP": "1", "FAKE_RUN": "8"}
+    env = {"FAKE_FREQ_DROP": "1", "FAKE_RUN": "8", "FAKE_TEMP": "70"}      # a clock drop on a cool CPU is not judged as thermal
     res = run_tool(tmp_path, "--time", "60", env_extra=env)
     assert res.returncode == 0, res.stdout
     assert "SUSPECTED THROTTLING" in res.stdout
@@ -666,7 +666,7 @@ def _run_logged(tmp_path, temp, run="4"):
 def test_summary_and_log_contain_jump_and_slow_cooling_rows(tmp_path):
     res = _run_logged(tmp_path, 70)
     assert "Drop after load stops:" in res.stdout and "Slow cooldown:" in res.stdout
-    log = next((tmp_path / "logs").glob("*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("*.log")).read_text(encoding="utf-8")
     assert "Drop after load stops:" in log and "Slow cooldown:" in log
 
 
@@ -674,7 +674,7 @@ def test_compare_two_real_logs_by_node_name_and_by_paths(tmp_path):
     _run_logged(tmp_path, 70)
     time.sleep(1.1)                                       # a different timestamp in the log name
     _run_logged(tmp_path, 60)
-    logs = sorted((tmp_path / "logs").glob("*.log"))
+    logs = sorted((tmp_path / "logs").rglob("*.log"))
     assert len(logs) == 2
 
     by_node = run_tool(tmp_path, "--compare", "fake-node")
@@ -739,11 +739,11 @@ def used_nodes(tmp_path):
 
 
 def node_logs(tmp_path, prefix=""):
-    return sorted(p for p in (tmp_path / "logs").glob(f"{prefix}*.log") if not p.name.startswith("cluster-"))
+    return sorted(p for p in (tmp_path / "logs").rglob(f"{prefix}*.log") if not p.name.startswith("cluster-"))
 
 
 def cluster_logs(tmp_path):
-    return sorted((tmp_path / "logs").glob("cluster-*.log"))
+    return sorted((tmp_path / "logs").rglob("cluster-*.log"))
 
 
 STEPPED_ENV = {"FAKE_RUN": "8", "FAKE_TEMP": "80", "FAKE_TEMP_IDLE": "40"}
@@ -911,7 +911,7 @@ def test_interactive_scope_menu_offers_single_workers_and_cluster(tmp_path):
     res = run_series(tmp_path, env_extra={"FAKE_NODES": THREE, "FAKE_RUN": "2"},
                      stdin="2\n1\n5\n\n\nn\nn\nn\n\nn\ny\n", interactive=True)
     assert res.returncode == 0, res.stdout + res.stderr
-    assert "What to test?" in res.stdout and "the whole cluster" in res.stdout
+    assert "WHAT TO TEST" in res.stdout and "whole cluster" in res.stdout
     assert used_nodes(tmp_path) == ["w1", "w2"]
 
 
@@ -1038,7 +1038,7 @@ def test_parallel_workers_run_at_the_same_time(tmp_path):
         body = f.read_text(encoding="utf-8")
         assert "Concurrency: yes (2 nodes at once)" in body and "TEST SUMMARY" in body
         assert mode(f) == 0o600
-    assert len(list((tmp_path / "logs").glob("w*.console.txt"))) == 2       # output of the subprocesses
+    assert len(list((tmp_path / "logs").rglob("w*.console.txt"))) == 2       # output of the subprocesses
     assert children_alive(tmp_path) == []
 
 
@@ -1139,7 +1139,7 @@ def test_parallel_series_in_background_can_be_stopped_and_children_end(tmp_path)
         stop = run_series(tmp_path, "--stop", "cluster")
         assert stop.returncode == 0, stop.stdout + stop.stderr
         assert wait_for(lambda: not list((tmp_path / "running").glob("*.json")))
-        console = next((tmp_path / "logs").glob("cluster-*.console.txt")).read_text(encoding="utf-8")
+        console = next((tmp_path / "logs").rglob("cluster-*.console.txt")).read_text(encoding="utf-8")
         assert "Series interrupted" in console and "CLUSTER SUMMARY" in console
         assert wait_for(lambda: children_alive(tmp_path) == [], timeout=30)
         assert len(list(tmp_path.glob("deleted-stress-test-*"))) == 2       # pods of both nodes deleted

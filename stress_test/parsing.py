@@ -46,6 +46,12 @@ def clean_text(text: str, limit: int = MAX_TEXT) -> str:
     return _CTRL_RE.sub(" ", str(text)).strip()[:limit]
 
 
+def clean_block(text: str, limit: int = 400) -> str:
+    """Text that comes from a pod (hardware, card names, tool output): every line cleaned like `clean_text`, newlines kept
+    between lines only - a device name or a pod output cannot forge log lines or send terminal escape codes."""
+    return "\n".join(clean_text(line, limit) for line in str(text).splitlines())
+
+
 _UNITS_TO_MIB = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024, "Ti": 1024 * 1024}
 
 
@@ -302,6 +308,39 @@ def parse_stressng_outcome(lines: list[str]) -> str:
     return "unknown"
 
 
+def _gpu_count(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def cpu_summary(hardware: str) -> str:
+    """'Intel Core i7-4790S · 4c/8t @ 3.2 GHz' from the hardware text ('' if there is no CPU line)."""
+    model = threads = cores = ""
+    for line in hardware.splitlines():
+        key, _, value = line.partition(":")
+        if key == "CPU" and not model:
+            model = value.strip()
+        elif key == "Threads":
+            threads = value.strip()
+        elif key == "Cores":
+            cores = value.strip()
+    if not model:
+        return ""
+    freq = ""
+    match = re.search(r"@\s*([\d.]+)\s*GHz", model, re.I)
+    if match:
+        freq = f" @ {float(match.group(1)):g} GHz"
+    name = re.sub(r"@.*$", "", model)
+    name = re.sub(r"\((R|TM|tm|r)\)", "", name)
+    name = re.sub(r"\b(CPU|Processor)\b", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    count = (f"{cores}c/{threads}t" if cores.isdigit() and cores != "0" and threads.isdigit()
+             else f"{threads}t" if threads.isdigit() else "")
+    return f"{name}" + (f" · {count}" if count else "") + freq
+
+
 def node_from_json(data: dict) -> NodeInfo:
     """Builds NodeInfo from the output of `kubectl get node -o json`."""
     meta = data.get("metadata", {})
@@ -325,6 +364,7 @@ def node_from_json(data: dict) -> NodeInfo:
         kernel=info.get("kernelVersion", "?"),
         architecture=info.get("architecture", "?"),
         runtime=info.get("containerRuntimeVersion", "?"),
+        gpu_count=_gpu_count(status.get("allocatable", {}).get("nvidia.com/gpu", "0")),
         internal_ip=next((clean_ip(a.get("address", "")) for a in status.get("addresses", [])
                           if a.get("type") == "InternalIP" and clean_ip(a.get("address", ""))), ""),
     )

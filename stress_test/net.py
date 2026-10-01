@@ -23,7 +23,7 @@ DROP_WARN = 20                          # new dropped packets during the test fr
 WARN_LINK_MBIT = 1000                    # a slower negotiated link is highlighted
 
 
-EXTRAS = ("dns", "internet", "mtr", "service")     # optional jobs (--net-extra)
+EXTRAS = ("dns", "internet", "mtr", "service", "no-udp")     # optional jobs (--net-extra); "no-udp" leaves the UDP test out
 EXTRA_SECONDS = {"dns": 3, "internet": 12, "mtr": 5}   # "service" takes one iperf3 test
 INTERNET_HOST = "1.1.1.1"
 INTERNET_URL = "http://archive.ubuntu.com/ubuntu/dists/noble/Contents-$(dpkg --print-architecture).gz"
@@ -35,7 +35,7 @@ def normalize_extras(extras) -> tuple[str, ...]:
     """Valid extras in the canonical order (ValueError for an unknown one)."""
     wanted = set(extras or ())
     if "all" in wanted:
-        wanted = set(EXTRAS)
+        wanted = set(EXTRAS) - {"no-udp"}
     unknown = wanted - set(EXTRAS)
     if unknown:
         raise ValueError(f"Unknown network extra: {', '.join(sorted(unknown))} (choose from {', '.join(EXTRAS)}, all).")
@@ -45,8 +45,8 @@ def normalize_extras(extras) -> tuple[str, ...]:
 def job_names(mode: str = "host", extras=()) -> tuple[str, ...]:
     """Names of the jobs in the order they run (the link checks are only meaningful on the host network)."""
     extras = normalize_extras(extras)
-    core = ("ping", "mtu", "tcp-up", "tcp-down", "tcp-x4", "udp")
-    extra_jobs = tuple(e for e in extras if e != "service" or mode == "pod")
+    core = ("ping", "mtu", "tcp-up", "tcp-down", "tcp-x4") + (() if "no-udp" in extras else ("udp",))
+    extra_jobs = tuple(e for e in extras if e != "no-udp" and (e != "service" or mode == "pod"))
     extra_jobs = tuple("tcp-svc" if e == "service" else e for e in extra_jobs)
     return ("link", *core, *extra_jobs, "link-end") if mode == "host" else (*core, *extra_jobs)
 
@@ -57,6 +57,8 @@ def net_duration(net_time: int, extras=(), mode: str = "host") -> int:
     for e in normalize_extras(extras):
         if e == "service":
             total += net_time if mode == "pod" else 0
+        elif e == "no-udp":
+            total -= net_time                       # the UDP test is left out
         else:
             total += EXTRA_SECONDS[e]
     return total
@@ -320,14 +322,18 @@ def build_net_command(target: str, port: int, mode: str, net_time: int, rate_mbi
     rate = f" -b {rate_mbit}M" if rate_mbit else ""
     udp_rate = min(NET_UDP_MBIT, rate_mbit) if rate_mbit else NET_UDP_MBIT
 
-    def iperf(name: str, opts: str, host: str = target) -> str:
+    def iperf(name: str, opts: str, host: str = target, soft: bool = False) -> str:
         # iperf3 3.16 sometimes dies at the end of a line-rate test with "unable to cancel thread: Permission denied"
         # (no result in the JSON): one retry, and only then the test counts as failed
         run = f"iperf3 -c {host} -p {port} -t {net_time} -J{opts}"
+        # a soft job (UDP: the firewall often lets in only TCP) does not stop the test, it is reported as skipped with the reason
+        fail = (f"echo \"NET-SKIPPED {name} $(echo \"$out\" | tr -d '\\n' | cut -c1-160)\"; " if soft
+                else f"echo \"NET-FAILED {name}\"; exit 1; ")
+        ok = f"echo \"NET-RESULT {name} $(echo \"$out\" | tr -d '\\n')\"; "
+        run = f"timeout {net_time + 10} {run}" if soft else run
         return (f"out=$({run} 2>&1); echo \"$out\" | grep -q 'sum_received\\|lost_percent' || "
                 f"{{ sleep 2; out=$({run} 2>&1); }}; "
-                f"echo \"$out\" | grep -q 'sum_received\\|lost_percent' || {{ echo \"NET-FAILED {name}\"; exit 1; }}; "
-                f"echo \"NET-RESULT {name} $(echo \"$out\" | tr -d '\\n')\"; ")
+                f"if echo \"$out\" | grep -q 'sum_received\\|lost_percent'; then {ok}else {fail}fi; ")
 
     def job(name: str) -> str:
         return f'i=$((i+1)); echo "NET-JOB $i/{n} {name}"; '
@@ -343,8 +349,9 @@ def build_net_command(target: str, port: int, mode: str, net_time: int, rate_mbi
               f'then mtu=$((s+28)); break; fi; done; echo "NET-RESULT mtu mtu=$mtu"; ',
               job("tcp-up"), iperf("tcp-up", rate),
               job("tcp-down"), iperf("tcp-down", f" -R{rate}"),
-              job("tcp-x4"), iperf("tcp-x4", f" -P 4{rate}"),
-              job("udp"), iperf("udp", f" -u -b {udp_rate}M")]
+              job("tcp-x4"), iperf("tcp-x4", f" -P 4{rate}")]
+    if "udp" in names:
+        parts += [job("udp"), iperf("udp", f" -u -b {udp_rate}M", soft=True)]
     if "dns" in names:
         parts += [job("dns"),
                   'f=0; t0=$(date +%s%N); for k in 1 2 3 4 5 6 7 8 9 10; do '

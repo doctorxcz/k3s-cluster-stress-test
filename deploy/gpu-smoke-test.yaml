@@ -1,0 +1,18 @@
+# One-shot check that a pod can use the GPU: prints nvidia-smi and exits. Apply after nvidia.com/gpu: 1 shows on the node.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-smoke-test
+  namespace: default
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  nodeName: GPU-NODE-NAME      # <- replace with your GPU node
+  activeDeadlineSeconds: 300
+  containers:
+  - name: smi
+    image: nvidia/cuda:12.9.1-base-ubuntu24.04
+    command: ["nvidia-smi"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1

@@ -305,3 +305,13 @@ def test_count_completed_runs_ignores_unsuccessful():
              "stress-ng: info: [2] unsuccessful run completed in 1 min",
              "stress-ng: info: [3] successful run completed in 3 mins", "x"]
     assert count_completed_runs(lines) == 2
+
+
+def test_cpu_summary_name_cores_threads_and_freq():
+    from stress_test.parsing import cpu_summary
+    assert cpu_summary("CPU: Intel(R) Core(TM) i7-4790S CPU @ 3.20GHz\nThreads: 8\nCores: 4") == \
+        "Intel Core i7-4790S · 4c/8t @ 3.2 GHz"
+    assert cpu_summary("CPU: Intel(R) Celeron(R) CPU G1840 @ 2.80GHz\nThreads: 2\nCores: 2") == \
+        "Intel Celeron G1840 · 2c/2t @ 2.8 GHz"
+    assert cpu_summary("CPU: AMD A10-9700E\nThreads: 4") == "AMD A10-9700E · 4t"        # no Cores line (old logs / lscpu missing)
+    assert cpu_summary("Threads: 4") == ""

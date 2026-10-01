@@ -72,7 +72,7 @@ def test_run_with_net_watch_logs_and_summarizes(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Network watch: pinging master-1 (10.0.0.9)" in res.stdout and "Ping: 5.00 ms" in res.stdout
     assert "Network latency (test)" in res.stdout and "rose from 0.40 ms" in res.stdout
-    log = next((tmp_path / "logs").glob("fake-node-5s-*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("fake-node-5s-*.log")).read_text(encoding="utf-8")
     assert "Network watch: master-1 (10.0.0.9)" in log
 
 

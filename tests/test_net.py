@@ -193,9 +193,9 @@ def test_run_network_test_against_fake(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Network peer: peer-node (10.0.0.2:" in res.stdout and "NETWORK TEST (iperf3 + ping)" in res.stdout
     assert "940.0 Mbit/s" in res.stdout and "Nothing suspicious" in res.stdout and "Test completed" in res.stdout
-    log = next((tmp_path / "logs").glob("fake-node-*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("fake-node-*.log")).read_text(encoding="utf-8")
     assert "Network peer: peer-node (10.0.0.2), mode host" in log and log.count("Net result:") >= 8
-    data = json.loads(next((tmp_path / "logs").glob("*.json")).read_text())
+    data = json.loads(next((tmp_path / "logs").rglob("*.json")).read_text())
     assert data["profile"] == "net" and any(r["name"] == "tcp-up" for r in data["net_results"])
 
 

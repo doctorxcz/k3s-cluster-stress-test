@@ -124,7 +124,7 @@ def test_run_with_all_extras_in_pod_mode(tmp_path):
     for expected in ("cluster name 1.2 ms", "download 200.0 Mbit/s", "hop(s), last hop", "via the Service / kube-proxy",
                      "Nothing suspicious", "Test completed"):
         assert expected in res.stdout
-    log = next((tmp_path / "logs").glob("fake-node-*.log")).read_text(encoding="utf-8")
+    log = next((tmp_path / "logs").rglob("fake-node-*.log")).read_text(encoding="utf-8")
     for name in ("dns", "internet-ping", "internet-down", "mtr", "tcp-svc"):
         assert f"Net result: {name} |" in log
 

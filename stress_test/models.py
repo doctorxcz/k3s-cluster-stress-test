@@ -22,6 +22,7 @@ PROFILE_CLASSIC = "classic"      # one load for the whole time
 PROFILE_STEPPED = "stepped"      # gradually 25 -> 50 -> 75 -> 100 %
 PROFILE_NET = "net"            # network test (iperf3 + ping) between the node and a peer
 PROFILE_DISK = "disk"          # fio disk benchmark (IOPS, MB/s, latency), no CPU stress
+PROFILE_GPU = "gpu"            # NVIDIA GPU burn (gpu-burn) + nvidia-smi readings, no CPU stress
 PROFILE_SPIKE = "spike"          # repeating jump: low % <-> target %, on and off, for the whole time
 STEPS_DEFAULT = (25, 50, 75, 100)
 STEP_TIME_DEFAULT = 180          # s, one stage (3 min, 12 min in total)
@@ -93,6 +94,7 @@ class NodeInfo:
     architecture: str = "?"
     runtime: str = "?"
     internal_ip: str = ""
+    gpu_count: int = 0                # allocatable nvidia.com/gpu
 
 
 @dataclass
@@ -121,6 +123,10 @@ class StressConfig:
     disk_read_only: bool = False      # disk benchmark: read jobs only (set for the master)
     smart: bool = False               # preflight: read disk health (SMART) with a privileged pod
     allow_bad_disk: bool = False      # continue even if a disk reports a failed SMART health check
+    gpu_max_temp: int = 80            # GPU test: GPU temperature that stops the test
+    gpu_mem_pct: int = 90             # GPU test: % of the GPU memory gpu-burn uses
+    gpu_double: bool = False          # GPU test: double precision (much slower on consumer cards)
+    gpu_image: str = ""               # GPU test: image of the load pod ("" = default CUDA devel image)
     baseline_check: bool = True       # compare the finished test with the node's saved baseline
     profile: str = PROFILE_CLASSIC    # "classic", "stepped" (stages) or "spike" (jump)
     steps: tuple[int, ...] = STEPS_DEFAULT    # CPU load stages in % (stepped test only)
@@ -146,6 +152,10 @@ class StressConfig:
     @property
     def disk(self) -> bool:
         return self.profile == PROFILE_DISK
+
+    @property
+    def gpu(self) -> bool:
+        return self.profile == PROFILE_GPU
 
     @property
     def multi_stage(self) -> bool:
@@ -174,8 +184,20 @@ class StressConfig:
         if self.export not in ("json", "csv", "both", "none"):
             raise ValueError("The export must be json, csv, both or none.")
         if self.profile not in (PROFILE_CLASSIC, PROFILE_STEPPED, PROFILE_SPIKE, PROFILE_DISK,
-                                PROFILE_NET):
-            raise ValueError("The test profile must be classic, stepped, spike, disk or net.")
+                                PROFILE_NET, PROFILE_GPU):
+            raise ValueError("The test profile must be classic, stepped, spike, disk, net or gpu.")
+        if self.gpu:
+            from .gpu import MAX_GPU_TIME, MIN_GPU_TIME, valid_image
+            if not MIN_GPU_TIME <= self.duration <= MAX_GPU_TIME:
+                raise ValueError(f"The GPU test time must be {MIN_GPU_TIME}–{MAX_GPU_TIME} s.")
+            if not 50 <= self.gpu_max_temp <= 95:
+                raise ValueError("The GPU temperature limit must be 50–95 °C.")
+            if not 10 <= self.gpu_mem_pct <= 95:
+                raise ValueError("The GPU memory share must be 10–95 %.")
+            if self.ram_pct is not None or self.hdd:
+                raise ValueError("The GPU test does not combine with the RAM and disk load.")
+            if self.gpu_image and not valid_image(self.gpu_image):
+                raise ValueError("The GPU image name contains characters that are not allowed.")
         if self.net:
             from .net import MAX_NET_TIME, MIN_NET_TIME, NET_MODES, net_duration
             if not MIN_NET_TIME <= self.net_time <= MAX_NET_TIME:
@@ -250,7 +272,7 @@ class StressConfig:
                 f"Master: spike target limited from {self.spike_target} % to {MASTER_CPU_CAP} %."
             )
             self.spike_target = MASTER_CPU_CAP
-        if not self.stepped and not self.spike and not self.disk and not self.net and self.cpu_load > MASTER_CPU_CAP:
+        if not self.stepped and not self.spike and not self.disk and not self.net and not self.gpu and self.cpu_load > MASTER_CPU_CAP:
             messages.append(
                 f"Master: CPU load limited from {self.cpu_load} % to {MASTER_CPU_CAP} %."
             )
@@ -310,6 +332,7 @@ class ProbeData:
     ping_lost: bool = False                               # --net-watch: the ping got no reply
     pl2_w: Optional[float] = None                         # RAPL short-term power limit (PL2), W
 
+
     @property
     def cpu_temp(self) -> Optional[int]:
         return self.temps.get("CPU")
@@ -349,3 +372,10 @@ class Sample:
     power_w: Optional[float] = None   # CPU package power from RAPL (average since the previous reading)
     ping_ms: Optional[float] = None   # latency to the watched node (--net-watch), None = not measured / lost
     ping_lost: bool = False           # the ping to the watched node got no reply
+    gpu_temp: Optional[int] = None    # GPU test (nvidia-smi); all gpu_* stay None without a GPU
+    gpu_power_w: Optional[float] = None
+    gpu_sm_mhz: Optional[int] = None
+    gpu_util_pct: Optional[int] = None
+    gpu_mem_mib: Optional[int] = None
+    gpu_throttle: Optional[int] = None
+    gpu_fan_pct: Optional[int] = None # GPU fan speed in % (nvidia-smi gives no RPM)

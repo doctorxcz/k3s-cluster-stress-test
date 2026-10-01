@@ -157,6 +157,39 @@ master/control-plane nodes are protected automatically.
 
 ## Common issues
 
+### GPU test (`--profile gpu`, menu `2 GPU`)
+
+**One-time setup of a GPU node** (only NVIDIA cards; the other nodes need nothing). Do it on the GPU node unless it says otherwise:
+1. Driver: install the proprietary NVIDIA driver for your card (`sudo ubuntu-drivers install`, or `sudo apt install nvidia-driver-580`) and reboot.
+   `nvidia-smi` must print the card. Old cards (Pascal, e.g. Quadro P620) work with the 580 driver and **CUDA 12.x images** (the tool's default).
+2. Container toolkit: install `nvidia-container-toolkit` (NVIDIA apt repository), then `sudo systemctl restart k3s-agent` (on the master: `k3s`).
+   k3s notices the toolkit and adds the `nvidia` runtime: `sudo grep -n nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml`.
+3. RuntimeClass: `kubectl get runtimeclass nvidia` (k3s creates it; if missing: a `RuntimeClass` named `nvidia` with `handler: nvidia`).
+4. Device plugin (from the machine with `kubectl`): copy `deploy/nvidia-device-plugin-k3s.yaml`, put your GPU node name instead of `GPU-NODE-NAME`
+   and `kubectl apply -f` it. It needs `runtimeClassName: nvidia` (already in the file) - without it the plugin sees no GPU on k3s.
+5. Check: `kubectl describe node <node> | grep nvidia.com/gpu` shows `nvidia.com/gpu: 1`, and `deploy/gpu-smoke-test.yaml` (node name replaced)
+   prints `nvidia-smi` from inside a pod: `kubectl logs gpu-smoke-test`, then `kubectl delete pod gpu-smoke-test`.
+Then `./stress.sh --list-gpus` should show the node as ✅ OK.
+
+**Reading the GPU scan (`--list-gpus`, first step of menu `2 GPU`):**
+- **✅ OK**: ready for the test.
+- **⚠️ ERROR "found, but Kubernetes does not offer it"**: the card is in the machine, steps 1-4 above are not complete (most often the device plugin, or the
+  runtime was not picked up: restart `k3s-agent`, check the `config.toml` line from step 2).
+- **❌ none**: no dedicated NVIDIA GPU (an integrated Intel / AMD graphics cannot run the test).
+- **❓ `? ERROR` "the scan failed"**: the short `lspci` pod did not finish (no internet for `apt`, node busy). It does not say there is no GPU - run the scan again.
+
+**Other problems:**
+- **"does not offer nvidia.com/gpu"** when starting: same as ⚠️ above. With `--no-hw` the message names the possible causes (driver, toolkit, runtime, plugin).
+- **Pod stays Pending / timeout**: the GPU is used by another pod, or the first pull of the CUDA image (~3 GB) is still running
+  (`kubectl describe pod <stress-test-...>`). Use `--gpu-prepull` (asked in the menu) to pull the image on all chosen nodes first.
+- **The first run takes minutes**: image pull + building gpu-burn for your card. Later runs on the node are fast (the image is cached; the build repeats,
+  or use `--gpu-image` with a ready `gpu_burn`).
+- **Power shows `N/A`**: normal for some cards (Quadro P620); the test then judges temperature, clocks and throttling only. The GPU fan is in %, never RPM.
+- **"Test stopped because of a GPU failure ... nvidia-smi did not respond"**: `nvidia-smi` failed 3 times in a row, the GPU temperature could not be watched.
+- **"stopped because of overheating (GPU ...)"**: the card reached the GPU limit (default 80 °C, set with `--gpu-max-temp` or in the dialog). Check the cooling
+  or lower the limit. A throttling note in the summary (`sw_thermal`, `hw_slowdown`) means the card slowed itself down.
+- **No fan RPM**: the CPU fan is not read at all (Dell / HP desktops do not expose it to Linux); only the GPU fan % is shown.
+
 **`stress.sh: package stress_test not found in ...`**
 The script can't find the `stress_test/` folder next to itself. Make sure you didn't move `stress.sh`
 out of the project folder on its own. Fix: run from inside the project folder, or use
@@ -183,6 +216,10 @@ just answer `y` when asked.
 **Network test: `iperf3 failed (peer unreachable / port blocked?)`, `The iperf3 server did not start listening`, or the matrix shows `x`**
 Almost always a node firewall. Allow TCP/UDP **30000–32767** from the other nodes (see step 8). Ping working
 does not prove that TCP ports are open. Also check that the peer node can reach the internet (`apt` installs `iperf3`).
+
+**Network test: `udp skipped: ... UDP is probably blocked by a firewall`**
+Not an error: the TCP tests ran, only the UDP test (jitter / packet loss) got no answer - the node's firewall lets in TCP but not UDP
+on 30000–32767. Allow UDP (step 8) or leave it out with `--net-extra no-udp`.
 
 **Network test: many `x` in the matrix, but only for one node as the *server***
 That node's firewall drops incoming connections on the tool's port. The matrix runs the `iperf3` server on the
@@ -221,6 +258,27 @@ terminal/losing the SSH connection.
 Those belong to a launcher of the original author's private setup (a Czech and an English build side by
 side). This repository is the English build only; ignore them.
 
+**The live frame looks broken / lines are cut / I want plain text**
+The frame needs a terminal that understands ANSI codes and shows emoji two cells wide (most do). Every screen adapts to the window width
+(compact < 60 columns, normal 60-99, wide 100-200; it is re-measured for every screen, so resizing is fine). A window narrower than about
+40 columns cannot be laid out properly - widen it (long names and paths are then cut with `…`). `STRESS_TEST_COLUMNS=80 ./stress.sh ...`
+forces a width. Switch the frames off with `STRESS_NO_LIVE=1 ./stress.sh ...`, in the menu with `S` ▸ live frames, or by
+redirecting the output (then the original text is printed).
+
+**`--parallel`: one slow node - do the others wait for it?**
+No (default `--start-mode rolling`): every node starts as soon as it is ready and runs the full time from its own start. If you want all
+nodes to start at the same moment use `--start-mode sync` (a node that is not ready within `--ready-timeout` is left out).
+
+**The FULL self-test (menu `6`) - what does it do to my cluster?** (`--nodes A,B` limits it to chosen nodes; a GPU node gets an extra GPU phase)
+It loads everything at full power (network, disks, CPU, RAM) on all nodes for about 35 minutes in the `standard` level, so nothing else
+should run meanwhile. It asks twice before it starts and the master is only tested when you say `y` (default `n`). Read the warning
+box; start with `--self-test-level quick` the first time.
+
+**A report says `slow disk ...` or `CPU throttling`**
+`slow disk` names the disk and the usual reason (a mechanical hard disk does only about 100–300 random IOPS; SMART warnings like
+reallocated sectors mean the disk is ageing). `CPU throttling` is reported when the clock dropped **and** the CPU got hot; a lower clock
+on a cool CPU (under 65 °C) is power saving, not throttling.
+
 **Want to run the tests of the tool itself (no cluster needed)?**
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
@@ -229,5 +287,6 @@ pytest -q
 ```
 
 **Still stuck?**
-Check `logs/` (test results) and `.logs/debug/` (technical debug log per run) in the project folder —
-they usually have the actual error from `kubectl` or the pod.
+Check `logs/<today's date>/` (test results) and `.logs/debug/<today's date>/` (technical debug log per run) in the project folder —
+they usually have the actual error from `kubectl` or the pod. Everything a run writes goes into a folder of the day
+(`YYYY-MM-DD`); old flat files can be moved there once with `./stress.sh --migrate-logs`.

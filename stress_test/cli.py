@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import logging
 import os
 import shutil
@@ -16,20 +17,21 @@ from . import background, baseline, compare, debuglog, parallel, series
 from .kube import Kubectl, KubectlError
 from .disk import (DISK_JOB_TIME_DEFAULT, DISK_SIZE_DEFAULT, MAX_DISK_JOB_TIME, MAX_DISK_SIZE,
                    MIN_DISK_JOB_TIME, MIN_DISK_SIZE, jobs as disk_jobs)
-from . import menu, netmatrix
+from . import menu, netmatrix, ui
+from .gpu import GPU_MAX_TEMP_DEFAULT, GPU_MEM_PCT_DEFAULT, MAX_GPU_TIME, MIN_GPU_TIME
 from .net import (MAX_NET_TIME, MIN_NET_TIME, NET_MODES, NET_TIME_DEFAULT, net_duration,
                   normalize_extras)
 from .export import EXPORT_CHOICES, write_exports
 from .logparse import read_log
 from .models import (COOLDOWN_DEFAULT, COOLDOWN_MAX, DEFAULT_MAX_TEMP, MASTER_CPU_CAP,
                      MAX_MAX_TEMP, MAX_NODE_BUSY_PCT, MAX_SPIKE_PHASE_TIME, MIN_MAX_TEMP,
-                     MIN_SPIKE_PHASE_TIME, MIN_STEP_TIME, PROFILE_CLASSIC, PROFILE_DISK, PROFILE_NET, PROFILE_SPIKE,
+                     MIN_SPIKE_PHASE_TIME, MIN_STEP_TIME, PROFILE_CLASSIC, PROFILE_DISK, PROFILE_GPU, PROFILE_NET, PROFILE_SPIKE,
                      PROFILE_STEPPED, SPIKE_LOW_PCT, SPIKE_PHASE_TIME_DEFAULT, SPIKE_TARGETS,
                      STEP_TIME_DEFAULT, STEPS_DEFAULT, StressConfig)
 from .parsing import (clean_text, describe_duration, describe_steps, format_workload, is_node_name,
                       parse_duration, parse_steps)
-from .paths import make_private_dir, open_private, user_log_dir
-from .runner import EXIT_ERROR, EXIT_INTERRUPTED, RunnerError, StressRunner
+from .paths import make_private_dir, migrate_to_daily, open_private, user_log_dir, user_log_root
+from .runner import EXIT_ERROR, EXIT_INTERRUPTED, GATE_TIMEOUT, RunnerError, StressRunner
 
 YES = {"y", "yes"}
 log = logging.getLogger(__name__)
@@ -130,6 +132,13 @@ examples:
   ./stress.sh --stop hp-g2-celeron             stop a test running in the background
   ./stress.sh --compare dell-9020-sff-i7       compare the two latest tests of a node
   ./stress.sh --list-nodes                     list the cluster's nodes and exit
+  ./stress.sh --list-gpus                      scan the nodes for GPUs: which have a usable NVIDIA card
+  ./stress.sh --profile gpu --node dell-9020-sff-i7 --time 2m
+                                               GPU burn (gpu-burn) of one node; menu "2 GPU" scans and asks
+  ./stress.sh --profile gpu --nodes a,b --gpu-prepull
+                                               GPU test of several nodes one after another, image pulled first
+  ./stress.sh --self-test --nodes dell-9020-sff-i7
+                                               FULL self-test limited to the given node(s)
   ./stress.sh --set-baseline dell-9020-sff-i7  newest test of the node becomes its baseline
   ./stress.sh --export-log dell-9020-sff-i7    JSON+CSV export of the node's newest log
   ./stress.sh --node dell-9020-sff-i7 --time 10m --dry-run
@@ -156,14 +165,54 @@ durations are given as seconds or 30s, 5m, 1h, 1h30m.
 """
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """--help that follows the terminal width (also STRESS_TEST_COLUMNS): the option list is wrapped by argparse, the
+    hand-written description / epilog lines are wrapped at word boundaries; in a narrow window the help texts go under
+    the option names. Without a terminal it is the classic help."""
+
+    def __init__(self, prog, indent_increment=2, max_help_position=24, width=None):
+        cols = ui.term_cols()
+        if cols is not None:
+            width = max(ui.MIN_COLS, min(cols, ui.WIDE_MAX)) - 2
+            max_help_position = 24 if width >= 70 else 8
+        super().__init__(prog, indent_increment, max_help_position, width)
+
+    def add_argument(self, action):
+        super().add_argument(action)
+        if ui.term_cols() is not None:                    # a long option name must not push the help texts to the right
+            self._action_max_length = min(self._action_max_length, self._max_help_position - 2)
+
+    def _format_action_invocation(self, action):
+        text = super()._format_action_invocation(action)
+        cols = ui.term_cols()
+        if cols is not None and ui.visible_len(re.sub(r"\x1b\[[0-9;]*m", "", text)) + 4 > cols - 1:
+            text = re.sub(r"\{[^}]*\}", "{…}", text)       # a list of choices too long for the line
+        return text
+
+    def _fill_text(self, text, width, indent):
+        if ui.term_cols() is None:
+            return super()._fill_text(text, width, indent)
+        out = []
+        for line in text.splitlines():
+            out += ui.adapt_line(indent + line, max(20, width), ui.mode(width + 2)) if line.strip() else [""]
+        return "\n".join(out)
+
+
+def _usage() -> str:
+    cols = ui.term_cols()
+    if cols is None:
+        return "%(prog)s [options]      (no options = interactive)"
+    return "%(prog)s [options]" + (" (no options = interactive)" if cols >= 64 else "")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="./stress.sh",
-        usage="%(prog)s [options]      (no options = interactive)",
-        description="Stress test of a node in a k3s/Kubernetes cluster (CPU, RAM, disk)\n"
+        usage=_usage(),
+        description="Stress test of a node in a k3s/Kubernetes cluster (CPU, RAM, disk, network, GPU)\n"
                     "with temperature measurement and automatic stop on overheating.",
         epilog=HELP_EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_HelpFormatter,
         add_help=False)
 
     g = p.add_argument_group("quick test")
@@ -194,14 +243,25 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("what kind of test")
     g.add_argument("--time", type=duration_arg, dest="duration", metavar="DURATION",
                    help="test duration: seconds or 30s, 5m, 1h, 1h30m")
-    g.add_argument("--profile", choices=[PROFILE_CLASSIC, PROFILE_STEPPED, PROFILE_SPIKE, PROFILE_DISK, PROFILE_NET],
+    g.add_argument("--profile", choices=[PROFILE_CLASSIC, PROFILE_STEPPED, PROFILE_SPIKE, PROFILE_DISK, PROFILE_NET, PROFILE_GPU],
                    default=None,
                    help="test type: classic = one load for the whole time (default), "
                         "stepped = gradually 25/50/75/100 %% (always logged), "
                         "spike = repeating on/off jump between a low and a target %% "
                         "(always logged), disk = fio disk benchmark: MB/s, IOPS and latency "
                         "(always logged, installs fio in the pod), net = network test: iperf3 "
-                        "throughput, ping latency, MTU, link speed (always logged, installs iperf3)")
+                        "throughput, ping latency, MTU, link speed (always logged, installs iperf3), gpu = NVIDIA "
+                        "GPU burn with gpu-burn: temperature, clock, VRAM, throttling (always logged, one GPU node "
+                        "or several one after another with --nodes; see --list-gpus)")
+    g.add_argument("--self-test", action="store_true",
+                   help="FULL SELF-TEST of the whole cluster: network matrix, disks, CPU (stepped), GPU (nodes with "
+                        "an NVIDIA card) and RAM one after another with cooling pauses, then one big report. "
+                        "Loads everything at full power - asks for two confirmations. --nodes A,B limits it to "
+                        "the given nodes")
+    g.add_argument("--self-test-level", choices=["quick", "standard", "thorough"], default=None,
+                   help="how long the self-test phases are (default: asks, non-interactive = standard)")
+    g.add_argument("--self-test-ack", action="store_true",
+                   help="second confirmation of --self-test given on the command line (for scripts)")
     g.add_argument("--net-matrix", action="store_true",
                    help="network matrix: ping + iperf3 between EVERY pair of nodes (all Ready nodes, "
                         "or --nodes a,b,c), shown as tables; finds the weak node or cable. "
@@ -219,7 +279,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--net-extra", default=None, metavar="LIST",
                    help="network test: extra jobs, comma separated: dns (CoreDNS + external lookups), "
                         "internet (ping + download speed), mtr (path to the peer), service "
-                        "(TCP through a Kubernetes Service, needs --net-mode pod), or all")
+                        "(TCP through a Kubernetes Service, needs --net-mode pod), no-udp (leave the UDP test out), or all "
+                        "(dns, internet, mtr, service)")
     g.add_argument("--net-mode", choices=NET_MODES, default=None,
                    help="network test: host = the nodes' real network (default), "
                         "pod = the pod network (what workloads really use, flannel/CNI)")
@@ -232,6 +293,19 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--disk-job-time", type=duration_arg, default=None, metavar="DURATION",
                    help=f"disk test: length of one fio job ({MIN_DISK_JOB_TIME}-{MAX_DISK_JOB_TIME} s, "
                         f"default {DISK_JOB_TIME_DEFAULT} s); 4 jobs: seq read/write, random read/write")
+    g.add_argument("--gpu-max-temp", type=int, default=None, metavar="C",
+                   help=f"GPU test: GPU temperature that stops the test (default {GPU_MAX_TEMP_DEFAULT} °C; "
+                        f"a warning appears 5 °C below it); asked in the interactive GPU dialog")
+    g.add_argument("--gpu-mem-pct", type=int, default=None, metavar="%",
+                   help=f"GPU test: share of the GPU memory gpu-burn uses (default {GPU_MEM_PCT_DEFAULT})")
+    g.add_argument("--gpu-double", action="store_true",
+                   help="GPU test: double precision (much slower on consumer cards)")
+    g.add_argument("--gpu-prepull", action="store_true",
+                   help="GPU test: pull the CUDA image on the chosen nodes first (all at once), so that the tests "
+                        "do not wait for the 3 GB download one after another")
+    g.add_argument("--gpu-image", default=None, metavar="IMAGE",
+                   help="GPU test: image of the load pod (default a CUDA 12.x devel image; an image that "
+                        "already contains gpu_burn skips the build)")
     g.add_argument("--steps", type=steps_arg, default=None, metavar="LIST",
                    help=f"stages of the stepped test in %%, e.g. 25,50,75,100 "
                         f"(default {describe_steps(STEPS_DEFAULT)})")
@@ -271,6 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--api-limit", type=float, default=3.0, metavar="SEC",
                    help="when running in parallel: API response (kubectl) slower than this many seconds, or "
                         "a failure, twice in a row stops all tests (default 3)")
+    g.add_argument("--start-mode", choices=["rolling", "sync"], default="rolling",
+                   help="when running in parallel: rolling (default) = every node starts its load as soon as it is "
+                        "ready and runs the full time from its own start; sync = all nodes wait until every one "
+                        "is ready and start together")
+    g.add_argument("--no-sync-start", action="store_true", help=argparse.SUPPRESS)   # old name of --start-mode rolling
+    g.add_argument("--ready-timeout", type=int, default=GATE_TIMEOUT, metavar="SEC",
+                   help=f"with --start-mode sync: how long to wait until all nodes are ready "
+                        f"(default {GATE_TIMEOUT}); a node that is not ready in time is left out")
     g.add_argument("--force", action="store_true",
                    help="bypass the master protection (or the environment variable FORCE=1)")
     g.add_argument("--allow-no-sensor", action="store_true",
@@ -312,10 +394,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "= its newest log); later tests of that node are compared with it")
     g.add_argument("--no-baseline-check", action="store_true",
                    help="do not compare the finished test with the node's baseline")
+    g.add_argument("--migrate-logs", action="store_true",
+                   help="one-off: move old flat result / debug / pytest logs into day folders (YYYY-MM-DD) by their date")
     g.add_argument("--log-dir", default="logs", metavar="DIR",
-                   help="folder with test results (default 'logs' in the project directory "
-                        "python-stress-test, wherever you run it from; a relative path "
-                        "is taken from the project, an absolute one unchanged)")
+                   help="folder with test results (default 'logs' in the project directory, wherever you run it "
+                        "from; a relative path is taken from the project, an absolute one unchanged). Results of a "
+                        "run go into a day folder inside it: <DIR>/YYYY-MM-DD/ (created when it does not exist)")
     g.add_argument("--notes", metavar="TEXT", type=notes_arg, help="a note about the test (goes into the log)")
 
     g = p.add_argument_group("scheduling and information")
@@ -328,6 +412,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "without touching the cluster")
     g.add_argument("--list-nodes", action="store_true",
                    help="list the cluster's nodes (role, state) and exit")
+    g.add_argument("--list-gpus", action="store_true",
+                   help="scan every node for graphics cards (short read-only pods) and show which have a usable "
+                        "dedicated NVIDIA GPU, then exit")
 
     g = p.add_argument_group("other")
     g.add_argument("-h", "--help", action="help", help="show this help and exit")
@@ -353,14 +440,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--log-file", default=None, help=argparse.SUPPRESS)      # internal (subprocess)
     p.add_argument("--concurrent", type=int, default=1, help=argparse.SUPPRESS)  # internal
+    p.add_argument("--log-flat", action="store_true", help=argparse.SUPPRESS)    # internal: --log-dir exactly, no day folder
+    p.add_argument("--start-gate", default="", help=argparse.SUPPRESS)           # internal (subprocess)
+    p.add_argument("--no-gate-wait", action="store_true", help=argparse.SUPPRESS)  # internal: rolling start
     return p
 
 
 # --- questions ------------------------------------------------------------------
 def ask(prompt: str, default: Optional[str] = None) -> str:
-    suffix = f" [{default}]" if default is not None else ""
     try:
-        answer = input(f"{prompt}{suffix}: ").strip()
+        answer = input(ui.prompt(prompt, default)).strip()
     except EOFError:
         raise SystemExit("\nInput ended.")
     return answer or (default or "")
@@ -372,7 +461,7 @@ def ask_int(prompt: str, default: int) -> int:
         try:
             return int(raw)
         except ValueError:
-            print("  Enter a whole number.")
+            ui.warn("Enter a whole number.")
 
 
 def ask_duration(prompt: str, default: str) -> int:
@@ -381,9 +470,9 @@ def ask_duration(prompt: str, default: str) -> int:
         try:
             seconds = parse_duration(raw)
         except ValueError as exc:
-            print(f"  {exc}")
+            ui.warn(str(exc))
             continue
-        print(f"  -> {describe_duration(seconds)}")
+        ui.info(describe_duration(seconds))
         return seconds
 
 
@@ -394,32 +483,32 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 def ask_scope() -> str:
     """What to test: one node, all workers, or the whole cluster."""
-    print("What to test?")
-    print("  [1] one node")
-    print("  [2] all workers (without the master)")
-    print(f"  [3] the whole cluster (workers, the master last with a CPU cap of {MASTER_CPU_CAP} %)")
+    ui.show_choices("WHAT TO TEST", [
+        ("1", "one node", ""),
+        ("2", "all workers", "without the master"),
+        ("3", "whole cluster", f"workers, the master last with a CPU cap of {MASTER_CPU_CAP} %")])
     while True:
         raw = ask("Choose", "1")
         if raw in ("1", "2", "3"):
             return {"1": "single", "2": "workers", "3": "cluster"}[raw]
-        print("  Invalid choice.")
+        ui.warn("Invalid choice.")
 
 
 def ask_profile() -> str:
     """Test type: classic, stepped, spike or disk."""
-    print("Test type:")
-    print("  [1] classic (one load for the given time)")
-    print(f"  [2] stepped ({describe_steps(STEPS_DEFAULT)} % in stages, always logged)")
-    print(f"  [3] spike (repeating on/off jump: {SPIKE_LOW_PCT} % <-> target %, "
-          f"always logged)")
-    print("  [4] disk (fio benchmark: MB/s, IOPS, latency; always logged)")
-    print("  [5] network (iperf3 + ping to another node: MB/s, latency, MTU; always logged)")
+    ui.show_choices("TEST TYPE", [
+        ("1", "classic", "one load for the given time"),
+        ("2", "stepped", f"{describe_steps(STEPS_DEFAULT)} % in stages, always logged"),
+        ("3", "spike", f"repeating jump {SPIKE_LOW_PCT} % <-> target %, always logged"),
+        ("4", "disk", "fio benchmark: MB/s, IOPS, latency; always logged"),
+        ("5", "network", "iperf3 + ping to another node: MB/s, latency, MTU; always logged"),
+        ("6", "gpu", "NVIDIA GPU burn (gpu-burn): temperature, clocks, throttling; always logged")])
     while True:
         raw = ask("Choose", "1")
-        if raw in ("1", "2", "3", "4", "5"):
+        if raw in ("1", "2", "3", "4", "5", "6"):
             return {"1": PROFILE_CLASSIC, "2": PROFILE_STEPPED, "3": PROFILE_SPIKE,
-                    "4": PROFILE_DISK, "5": PROFILE_NET}[raw]
-        print("  Invalid choice.")
+                    "4": PROFILE_DISK, "5": PROFILE_NET, "6": PROFILE_GPU}[raw]
+        ui.warn("Invalid choice.")
 
 
 SPIKE_TARGET_CHOICES = {"1": 25, "2": 50, "3": 75, "4": 100}
@@ -427,15 +516,14 @@ SPIKE_TARGET_CHOICES = {"1": 25, "2": 50, "3": 75, "4": 100}
 
 def ask_spike_target() -> int:
     """Spike test: target CPU load after the jump (1/4, 2/4, 3/4, 4/4)."""
-    print("Spike test - target load after the jump:")
-    for key, pct in SPIKE_TARGET_CHOICES.items():
-        note = " (default)" if pct == SPIKE_TARGETS[-1] else ""
-        print(f"  [{key}] {key}/4  ({pct} %){note}")
+    ui.show_choices("SPIKE TARGET", [
+        (key, f"{key}/4", f"{pct} %" + (" (default)" if pct == SPIKE_TARGETS[-1] else ""))
+        for key, pct in SPIKE_TARGET_CHOICES.items()])
     while True:
         raw = ask("Choose", "4")
         if raw in SPIKE_TARGET_CHOICES:
             return SPIKE_TARGET_CHOICES[raw]
-        print("  Invalid choice.")
+        ui.warn("Invalid choice.")
 
 
 COOLDOWN_CHOICES = {"1": 60, "2": 180, "3": 300, "4": COOLDOWN_MAX}
@@ -443,43 +531,42 @@ COOLDOWN_CHOICES = {"1": 60, "2": 180, "3": 300, "4": COOLDOWN_MAX}
 
 def ask_net_mode() -> str:
     """Network test: the nodes' real network, or the pod network."""
-    print("Network to test:")
-    print("  [1] nodes' network (the real NICs and cables)  (default)")
-    print("  [2] pod network (what workloads really use: flannel / CNI)")
+    ui.show_choices("NETWORK TO TEST", [
+        ("1", "nodes' network", "the real NICs and cables (default)"),
+        ("2", "pod network", "what workloads really use: flannel / CNI")])
     while True:
         raw = ask("Choose", "1")
         if raw in ("1", "2"):
             return "host" if raw == "1" else "pod"
-        print("  Invalid choice.")
+        ui.warn("Invalid choice.")
 
 
 def ask_net_extra() -> str:
     """Network test: optional extra jobs."""
-    print("Extra network jobs (comma separated, Enter = none):")
-    print("  dns       CoreDNS + external name lookups")
-    print("  internet  ping 1.1.1.1 + a bounded download")
-    print("  mtr       path, loss and latency to the peer")
-    print("  service   TCP through a Kubernetes Service (pod network only)")
-    print("  all       everything above")
+    ui.show_choices("EXTRA NETWORK JOBS (comma separated, Enter = none)", [
+        ("·", "dns", "CoreDNS + external name lookups"),
+        ("·", "internet", "ping 1.1.1.1 + a bounded download"),
+        ("·", "mtr", "path, loss and latency to the peer"),
+        ("·", "service", "TCP through a Kubernetes Service (pod network only)"),
+        ("·", "no-udp", "leave the UDP test out (when the firewall lets in only TCP)"),
+        ("·", "all", "dns + internet + mtr + service")])
     while True:
         raw = ask("Extras", "").replace(" ", "")
         try:
             normalize_extras(x for x in raw.split(",") if x)
         except ValueError as exc:
-            print(f"  {exc}")
+            ui.warn(str(exc))
             continue
         return raw
 
 
 def ask_cooldown() -> int:
     """Cooldown after the test: preset, custom duration, or off (0)."""
-    print("Cooldown after the test (measuring CPU temperature and clock):")
-    for key, seconds in COOLDOWN_CHOICES.items():
-        note = (" (default)" if seconds == COOLDOWN_DEFAULT
-                else " (max)" if seconds == COOLDOWN_MAX else "")
-        print(f"  [{key}] {describe_duration(seconds)}{note}")
-    print("  [5] custom duration")
-    print("  [0] off")
+    ui.show_choices("COOLDOWN (measuring CPU temperature and clock)", [
+        *((key, describe_duration(seconds),
+           " (default)" if seconds == COOLDOWN_DEFAULT else " (max)" if seconds == COOLDOWN_MAX else "")
+          for key, seconds in COOLDOWN_CHOICES.items()),
+        ("5", "custom duration", "")], back="off")
     default = next((k for k, v in COOLDOWN_CHOICES.items() if v == COOLDOWN_DEFAULT), "1")
     while True:
         raw = ask("Choose", default)
@@ -489,28 +576,32 @@ def ask_cooldown() -> int:
             return COOLDOWN_CHOICES[raw]
         if raw == "5":
             break
-        print("  Invalid choice.")
+        ui.warn("Invalid choice.")
     while True:
         seconds = ask_duration(f"Cooldown duration (e.g. 90, 2m; max "
                                f"{describe_duration(COOLDOWN_MAX)})", "2m")
         if seconds <= COOLDOWN_MAX:
             return seconds
-        print(f"  The maximum is {describe_duration(COOLDOWN_MAX)}.")
+        ui.warn(f"The maximum is {describe_duration(COOLDOWN_MAX)}.")
 
 
 def choose_node(kube: Kubectl) -> str:
     names = kube.list_node_names()
     if not names:
         raise SystemExit("❌ No nodes were found in the cluster.")
-    for i, name in enumerate(names, 1):
-        print(f"[{i}] {name}")
+    if ui.adaptive():
+        for line in ui.grid([f"[{i}] {name}" for i, name in enumerate(names, 1)]):
+            ui.emit(line)
+    else:
+        for i, name in enumerate(names, 1):
+            ui.emit(f"[{i}] {name}")
     while True:
         raw = ask("Pick a node number or type the name")
         if raw.isdigit() and 1 <= int(raw) <= len(names):
             return names[int(raw) - 1]
         if raw in names:
             return raw
-        print("  Invalid choice.")
+        ui.warn("Invalid choice.")
 
 
 # --- building the configuration -----------------------------------------------------
@@ -530,6 +621,11 @@ def build_config(args: argparse.Namespace, node_name: str,
     spike = profile == PROFILE_SPIKE
     disk = profile == PROFILE_DISK
     net = profile == PROFILE_NET
+    gpu = profile == PROFILE_GPU
+    if not gpu and (args.gpu_max_temp is not None or args.gpu_mem_pct is not None or args.gpu_double
+                    or args.gpu_image or args.gpu_prepull):
+        ui.emit("ℹ️  The --gpu-* options only apply to --profile gpu, they are ignored here.")
+    gpu_max_temp = GPU_MAX_TEMP_DEFAULT if args.gpu_max_temp is None else args.gpu_max_temp
     net_time = NET_TIME_DEFAULT
     net_extra: tuple = ()
     disk_size = DISK_SIZE_DEFAULT
@@ -546,7 +642,7 @@ def build_config(args: argparse.Namespace, node_name: str,
                          STEP_TIME_DEFAULT)
         duration = len(steps) * step_time
         if args.duration is not None:
-            print("ℹ️  For the stepped test the time is set with --step-time, --time is ignored.")
+            ui.emit("ℹ️  For the stepped test the time is set with --step-time, --time is ignored.")
     elif net:
         net_mode = pick(args.net_mode, ask_net_mode, "host")
         args.net_mode = net_mode
@@ -558,7 +654,12 @@ def build_config(args: argparse.Namespace, node_name: str,
         net_extra = normalize_extras(x for x in (args.net_extra or "").replace(" ", "").split(",") if x)
         duration = net_duration(net_time, net_extra, args.net_mode or "host")
         if args.duration is not None:
-            print("ℹ️  For the network test the time is set with --net-time, --time is ignored.")
+            ui.emit("ℹ️  For the network test the time is set with --net-time, --time is ignored.")
+    elif gpu:
+        gpu_max_temp = pick(args.gpu_max_temp, lambda: ask_int("GPU temperature for automatic stop (50-95 °C)", GPU_MAX_TEMP_DEFAULT),
+                            GPU_MAX_TEMP_DEFAULT)
+        duration = pick(args.duration,
+                        lambda: ask_duration(f"GPU test duration ({MIN_GPU_TIME}-{MAX_GPU_TIME} s, e.g. 60, 5m)", "2m"), 120)
     elif disk:
         disk_size = pick(args.disk_size,
                          lambda: ask_int(f"Test file size in MiB ({MIN_DISK_SIZE}-{MAX_DISK_SIZE})",
@@ -569,7 +670,7 @@ def build_config(args: argparse.Namespace, node_name: str,
                                                   str(DISK_JOB_TIME_DEFAULT)), DISK_JOB_TIME_DEFAULT)
         duration = len(disk_jobs()) * disk_job_time
         if args.duration is not None:
-            print("ℹ️  For the disk test the time is set with --disk-job-time, --time is ignored.")
+            ui.emit("ℹ️  For the disk test the time is set with --disk-job-time, --time is ignored.")
     elif spike:
         spike_target = pick(args.spike_target, ask_spike_target, SPIKE_TARGETS[-1])
         spike_low_time = pick(
@@ -589,29 +690,33 @@ def build_config(args: argparse.Namespace, node_name: str,
         spike_cycles = max(1, round(wanted / phase))
         duration = spike_cycles * phase
         if duration != wanted:
-            print(f"ℹ️  Rounded to a whole number of cycles: {describe_duration(duration)} "
+            ui.emit(f"ℹ️  Rounded to a whole number of cycles: {describe_duration(duration)} "
                  f"({spike_cycles}x {describe_duration(phase)}) instead of "
                  f"{describe_duration(wanted)}.")
     else:
         duration = pick(args.duration,
                         lambda: ask_duration(
                             "Test duration (e.g. 90, 30s, 5m, 1h, 1h30m)", "1m"), 60)
-    max_temp = pick(args.max_temp,
-                    lambda: ask_int(
-                        f"CPU temperature for automatic stop "
-                        f"({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C)", DEFAULT_MAX_TEMP),
-                    DEFAULT_MAX_TEMP)
-    cooldown = pick(args.cooldown, ask_cooldown, COOLDOWN_DEFAULT)
-    cpu_load = 100 if (stepped or spike or disk or net) else pick(args.cpu_load,
+    if net or disk or gpu:        # these tests do not load the CPU: no question, the default CPU guard stays (--max-temp changes it)
+        max_temp = DEFAULT_MAX_TEMP if args.max_temp is None else args.max_temp
+    else:
+        max_temp = pick(args.max_temp,
+                        lambda: ask_int(
+                            f"CPU temperature for automatic stop "
+                            f"({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C)", DEFAULT_MAX_TEMP),
+                        DEFAULT_MAX_TEMP)
+    # the network / disk tests do not heat the CPU: no cooldown unless it was asked for explicitly
+    cooldown = (args.cooldown or 0) if (net or disk) else pick(args.cooldown, ask_cooldown, COOLDOWN_DEFAULT)
+    cpu_load = 100 if (stepped or spike or disk or net or gpu) else pick(args.cpu_load,
                                                      lambda: ask_int("CPU load in %", 100), 100)
 
     ram_pct = args.ram_pct
     hdd = args.hdd
-    if stepped or spike or disk or net:   # these tests load only the CPU (or only the disk / network)
+    if stepped or spike or disk or net or gpu:   # these tests load only the CPU (or only the disk / network)
         if ram_pct is not None or hdd:
-            kind = "stepped" if stepped else "spike" if spike else "disk" if disk else "network"
+            kind = "stepped" if stepped else "spike" if spike else "disk" if disk else "GPU" if gpu else "network"
             only = "CPU" if (stepped or spike) else kind
-            print(f"ℹ️  The {kind} test loads only the {only}, RAM and disk are ignored.")
+            ui.emit(f"ℹ️  The {kind} test loads only the {only}, RAM and disk are ignored.")
         ram_pct, hdd = None, False
     elif not master_mode:   # on the master RAM and disk are not used anyway
         if ram_pct is None and interactive:
@@ -626,13 +731,13 @@ def build_config(args: argparse.Namespace, node_name: str,
                              "logging turns on by itself)") if interactive else False)
 
     why = [w for w, on in (("background test", run_bg), ("stepped test", stepped),
-                           ("spike test", spike), ("disk test", disk), ("network test", net), ("multi-node test", series)) if on]
+                           ("spike test", spike), ("disk test", disk), ("network test", net), ("GPU test", gpu), ("multi-node test", series)) if on]
     if why:
         reason = ", ".join(why)
         if args.log is False:
-            print(f"ℹ️  --no-log is ignored: {reason} is always logged.")
+            ui.emit(f"ℹ️  --no-log is ignored: {reason} is always logged.")
         else:
-            print(f"ℹ️  Logging turned on automatically ({reason}).")
+            ui.emit(f"ℹ️  Logging turned on automatically ({reason}).")
         log = True
     else:
         log = pick(args.log, lambda: ask_yes_no("Save metrics to a file?"), False)
@@ -652,7 +757,10 @@ def build_config(args: argparse.Namespace, node_name: str,
                         spike_cycles=spike_cycles, disk_size=disk_size,
                         disk_job_time=disk_job_time, net_time=net_time, net_extra=net_extra,
                         net_watch=args.net_watch or "", net_peer=args.net_peer or "", net_mode=args.net_mode or "host",
-                        net_rate=args.net_rate or 0)
+                        net_rate=args.net_rate or 0,
+                        gpu_max_temp=gpu_max_temp,
+                        gpu_mem_pct=GPU_MEM_PCT_DEFAULT if args.gpu_mem_pct is None else args.gpu_mem_pct,
+                        gpu_double=args.gpu_double, gpu_image=args.gpu_image or "")
 
 
 def confirm_workload(kube: Kubectl, node, args: argparse.Namespace,
@@ -665,46 +773,69 @@ def confirm_workload(kube: Kubectl, node, args: argparse.Namespace,
     try:
         work = kube.list_node_workload(node.name)
     except KubectlError as exc:
-        print(f"⚠️  Could not find out what is running on the node ({exc}). Continuing.")
+        ui.emit(f"⚠️  Could not find out what is running on the node ({exc}). Continuing.")
         log.warning("list_node_workload failed: %s", exc)
         return True
     log.info("Node workload: %s", work)
     if not work.user_pods:
         if work.system_count:
-            print(f"ℹ️  Only system pods are running on the node ({work.system_count}× kube-system).")
+            ui.emit(f"ℹ️  Only system pods are running on the node ({work.system_count}× kube-system).")
         return True
-    print(f"⚠️  Node {node.name} runs these services (the test loads them, "
+    ui.emit(f"⚠️  Node {node.name} runs these services (the test loads them, "
           f"they may slow down or be interrupted):")
     for line in format_workload(work):
-        print(f"    {line}")
+        ui.emit(f"    {line}")
     if work.system_count:
-        print(f"    (+ {work.system_count} system pods in kube-system)")
+        ui.emit(f"    (+ {work.system_count} system pods in kube-system)")
     if already_confirmed or args.yes:
         return True
     if args.non_interactive:
-        print("Test refused: services are running on the node, confirm with --yes.")
+        ui.emit("Test refused: services are running on the node, confirm with --yes.")
         return False
     return ask_yes_no("Continue with the test?")
 
 
 def _out(line: str) -> None:
     """Prints to the screen and at the same time writes to the hidden debug log."""
-    print(line)
+    ui.emit(line)
     log.info("OUT %s", line)
 
 
 def cmd_status() -> int:
-    print(background.format_running(background.list_running()))
+    ui.emit(background.format_running(background.list_running()))
     if shutil.which(os.environ.get("KUBECTL", "kubectl")):
         try:
             pods = Kubectl().list_tool_pods()
         except KubectlError as exc:
-            print(f"(could not find out the pods in the cluster: {exc})")
+            ui.emit(f"(could not find out the pods in the cluster: {exc})")
         else:
-            print("\nThe tool's pods in the cluster:" if pods else "\nNo pods of the tool in the cluster.")
-            for pod in pods:
-                print(f"  {pod.name:<28} node {pod.node or '?':<18} {pod.phase}")
+            ui.emit("\nThe tool's pods in the cluster:" if pods else "\nNo pods of the tool in the cluster.")
+            if ui.adaptive() and pods:
+                for line in ui.table([("pod", 0, "<"), ("node", 1, "<"), ("state", 0, "<")],
+                                     [[pod.name, pod.node or "?", pod.phase] for pod in pods], lead="  "):
+                    ui.emit(line)
+            elif pods:
+                for pod in pods:
+                    ui.emit(f"  {pod.name:<28} node {pod.node or '?':<18} {pod.phase}")
     return 0
+
+
+def _maybe_prepull(args: argparse.Namespace, kube: Kubectl, cfg: StressConfig, names: list) -> None:
+    """--gpu-prepull: warms the CUDA image on the nodes of a GPU test before anything starts."""
+    if cfg.gpu and args.gpu_prepull and names:
+        from . import gpu as gpumod, gpuscan
+        gpuscan.prepull(kube, names, cfg.gpu_image or gpumod.GPU_IMAGE_DEFAULT)
+
+
+def cmd_list_gpus() -> int:
+    from . import gpuscan
+    try:
+        scans = gpuscan.scan_nodes(Kubectl())
+    except KubectlError as exc:
+        ui.emit(f"❌ {exc}")
+        return EXIT_ERROR
+    print("\n".join(gpuscan.table_lines(scans, ui.color_enabled())))
+    return 0 if gpuscan.candidates(scans) else EXIT_ERROR
 
 
 def cmd_list_nodes() -> int:
@@ -712,20 +843,25 @@ def cmd_list_nodes() -> int:
     try:
         names = kube.list_node_names()
     except KubectlError as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         return EXIT_ERROR
     if not names:
-        print("No nodes were found in the cluster.")
+        ui.emit("No nodes were found in the cluster.")
         return 0
+    rows = []
     for name in names:
         try:
             node = kube.get_node(name)
         except KubectlError as exc:
-            print(f"  {name:<38} ? ({exc})")
+            rows.append((name, "?", f"({exc})"))
             continue
-        role = "master" if node.is_control_plane else "worker"
-        state = "Ready" if node.ready else "NotReady"
-        print(f"  {name:<38} {role:<7} {state}")
+        rows.append((name, "master" if node.is_control_plane else "worker", "Ready" if node.ready else "NotReady"))
+    if ui.adaptive():
+        for line in ui.table([("node", 0, "<"), ("role", 0, "<"), ("state", 0, "<")], [list(r) for r in rows], lead="  "):
+            ui.emit(line)
+    else:
+        for name, role, state in rows:
+            ui.emit(f"  {name:<38} ? {state}" if role == "?" else f"  {name:<38} {role:<7} {state}")
     return 0
 
 
@@ -737,31 +873,31 @@ def _wait_until(target: Optional[float]) -> None:
     if remaining <= 0:
         return
     until = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target))
-    print(f"⏳ Waiting until {until} ({describe_duration(int(remaining))})…")
+    ui.emit(f"⏳ Waiting until {until} ({describe_duration(int(remaining))})…")
     log.info("Waiting for the scheduled start until %s (%.0f s)", until, remaining)
     time.sleep(remaining)
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
-    log_dir = user_log_dir(args.log_dir)
+    log_dir = user_log_root(args.log_dir)
     try:
         first, second = compare.resolve_logs(args.compare, log_dir)
-        lines = compare.compare_files(first, second)
+        lines = compare.compare_files(first, second, width=ui.avail(130) if ui.adaptive() else None)
     except compare.CompareError as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         log.error("Comparison failed: %s", exc)
         return EXIT_ERROR
     for line in lines:
-        print(line)
+        ui.emit(line)
     log.info("Comparison of logs %s and %s done", first, second)
     return 0
 
 
 def cmd_export_log(args: argparse.Namespace) -> int:
-    log_dir = user_log_dir(args.log_dir)
+    log_dir = user_log_root(args.log_dir)
     formats = args.export or "both"
     if formats == "none":
-        print("❌ --export none does not export anything.")
+        ui.emit("❌ --export none does not export anything.")
         return EXIT_ERROR
     code = 0
     for value in args.export_log:
@@ -769,25 +905,25 @@ def cmd_export_log(args: argparse.Namespace) -> int:
             path = baseline.resolve_log(value, log_dir)
             written = write_exports(read_log(path), str(path), formats)
         except (compare.CompareError, OSError, ValueError) as exc:
-            print(f"❌ {value}: {exc}")
+            ui.emit(f"❌ {value}: {exc}")
             code = EXIT_ERROR
             continue
         for item in written:
-            print(f"📄 {item}")
+            ui.emit(f"📄 {item}")
     return code
 
 
 def cmd_set_baseline(args: argparse.Namespace) -> int:
-    log_dir = user_log_dir(args.log_dir)
+    log_dir = user_log_root(args.log_dir)
     try:
         path = baseline.resolve_log(args.set_baseline, log_dir)
         run = read_log(path)
         saved = baseline.save_baseline(run, log_dir)
     except (compare.CompareError, OSError, ValueError) as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         log.error("Setting the baseline failed: %s", exc)
         return EXIT_ERROR
-    print(f"✅ Baseline of {run.node} set from {path.name}\n   saved to {saved}")
+    ui.emit(f"✅ Baseline of {run.node} set from {path.name}\n   saved to {saved}")
     log.info("Baseline of %s set from %s", run.node, path)
     return 0
 
@@ -801,57 +937,67 @@ def cmd_net_matrix(args: argparse.Namespace) -> int:
         nodes = [kube.get_node(n) for n in wanted]
         busy = [p for p in kube.list_tool_pods() if p.phase not in ("Succeeded", "Failed")]
     except KubectlError as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         return EXIT_ERROR
     nodes = [n for n in nodes if n.ready and n.internal_ip]
     if len(nodes) < 2:
-        print("❌ The network matrix needs at least two Ready nodes with an InternalIP.")
+        ui.emit("❌ The network matrix needs at least two Ready nodes with an InternalIP.")
         return EXIT_ERROR
     if busy:
-        print(f"❌ A test of this tool is running right now ({', '.join(p.name for p in busy)}); "
+        ui.emit(f"❌ A test of this tool is running right now ({', '.join(p.name for p in busy)}); "
               f"wait for it, the results would be skewed.")
         return EXIT_ERROR
     net_time = args.net_time or 5
     if not MIN_NET_TIME <= net_time <= MAX_NET_TIME:
-        print(f"❌ --net-time must be {MIN_NET_TIME}-{MAX_NET_TIME} s.")
+        ui.emit(f"❌ --net-time must be {MIN_NET_TIME}-{MAX_NET_TIME} s.")
         return EXIT_ERROR
     pairs = len(nodes) * (len(nodes) - 1)
     estimate = pairs * (net_time + 8) + 90
-    print(f"Network matrix: {len(nodes)} nodes, {pairs} pairs x ({net_time} s iperf3 + ping), "
+    ui.emit(f"Network matrix: {len(nodes)} nodes, {pairs} pairs x ({net_time} s iperf3 + ping), "
           f"about {describe_duration(estimate)} + installing iperf3.")
-    print("  " + ", ".join(n.name + (" (master, capped at 300 Mbit/s)" if n.is_control_plane else "") for n in nodes))
+    ui.emit("  " + ", ".join(n.name + (" (master, capped at 300 Mbit/s)" if n.is_control_plane else "") for n in nodes))
     if not args.yes:
         if args.non_interactive or not ask_yes_no("Load the network of these nodes now?"):
-            print("Cancelled (--yes confirms without asking).")
+            ui.emit("Cancelled (--yes confirms without asking).")
             return EXIT_ERROR
+    screen = ui.MatrixScreen([n.name for n in nodes], net_time) if ui.MatrixScreen.wanted() else None
     try:
-        result = netmatrix.run_matrix(kube, nodes, net_time, out=print,
-                                      rate_mbit=args.net_rate or 0)
+        if screen:
+            screen.draw(force=True)
+            screen.start_ticker()
+        result = netmatrix.run_matrix(kube, nodes, net_time, out=screen.event if screen else ui.emit,
+                                      rate_mbit=args.net_rate or 0, screen=screen)
     except KeyboardInterrupt:
-        print("\n🛑 Interrupted, the helper pods were deleted.")
+        if screen:
+            screen.close()
+        ui.emit("\n🛑 Interrupted, the helper pods were deleted.")
         return EXIT_INTERRUPTED
     except KubectlError as exc:
-        print(f"❌ {exc}")
+        if screen:
+            screen.close()
+        ui.emit(f"❌ {exc}")
         return EXIT_ERROR
-    print()
-    for line in netmatrix.format_matrix(result):
-        print(line)
-    log_path, json_path = netmatrix.write_matrix(result, user_log_dir(args.log_dir), open_private)
-    print(f"\n📁 Saved: {log_path}\n📄 {json_path}")
+    if screen:
+        screen.close()
+    ui.emit()
+    for line in netmatrix.format_matrix(result, width=ui.avail(130) if ui.adaptive() else None):
+        ui.emit(line)
+    log_path, json_path = netmatrix.write_matrix(result, user_log_dir(args.log_dir, args.log_flat), open_private)
+    ui.emit(f"\n📁 Saved: {log_path}\n📄 {json_path}")
     return 0
 
 
 def cmd_stop(target: str) -> int:
     ok, message = background.stop(target)
-    print(("✅ " if ok else "❌ ") + message)
+    ui.emit(("✅ " if ok else "❌ ") + message)
     return 0 if ok else EXIT_ERROR
 
 
 def _print_background_info(node_label: str, duration_text: str, run_id: str, pid: int,
                            log_path: str, console_path: str) -> None:
-    print("=" * 52)
-    print("🚀 TEST RUNNING IN THE BACKGROUND (detached from the terminal, survives closing the window)")
-    print("=" * 52)
+    ui.emit("=" * 52)
+    ui.emit("🚀 TEST RUNNING IN THE BACKGROUND (detached from the terminal, survives closing the window)")
+    ui.emit("=" * 52)
     rows = [
         ("Node", node_label),
         ("Test duration", duration_text),
@@ -861,9 +1007,9 @@ def _print_background_info(node_label: str, duration_text: str, run_id: str, pid
         ("Status", "python3 -m stress_test --status   (or ./stress.sh --status)"),
         ("Stop", f"python3 -m stress_test --stop {run_id}"),
     ]
-    for key, value in rows:
-        print(f"  {key + ':':<15}{value}")
-    print("\nIf the test does not start (missing sensor, cannot pull the image...), "
+    for line in ui.kv_block(rows, label_w=15):
+        ui.emit(line)
+    ui.emit("\nIf the test does not start (missing sensor, cannot pull the image...), "
           "the cause will be in the live output.")
 
 
@@ -894,7 +1040,7 @@ def _keep_master(args: argparse.Namespace, template: StressConfig) -> bool:
         return True
     if args.non_interactive:
         kind = "stepped" if template.stepped else "spike"
-        print(f"ℹ️  Master left out of the {kind} test (no confirmation; add --include-master "
+        ui.emit(f"ℹ️  Master left out of the {kind} test (no confirmation; add --include-master "
               "or --yes).")
         return False
     if template.stepped:
@@ -913,7 +1059,7 @@ def _choose_parallel(args: argparse.Namespace, nodes) -> bool:
         return False
     if len(workers) < 2:
         if args.parallel:
-            print("ℹ️  Running in parallel makes sense from two workers, testing one after another.")
+            ui.emit("ℹ️  Running in parallel makes sense from two workers, testing one after another.")
         return False
     if args.parallel is True:
         return True
@@ -928,17 +1074,19 @@ def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
              if scope == "nodes" else None)
     nodes, skipped = series.select_nodes(kube, scope, names, include_master=args.include_master)
     for name, reason in skipped:
-        print(f"⚠️  Node {name} skipped: {reason}.")
+        ui.emit(f"⚠️  Node {name} skipped: {reason}.")
     template = build_config(args, "*", master_mode=False, series=True)
     template.validate()
     if any(n.is_control_plane for n in nodes) and not _keep_master(args, template):
         nodes = [n for n in nodes if not n.is_control_plane]
-        print("ℹ️  The master is left out of the test.")
+        ui.emit("ℹ️  The master is left out of the test.")
     if not nodes:
-        print("❌ Nothing to test (no node is Ready).")
+        ui.emit("❌ Nothing to test (no node is Ready).")
         return EXIT_ERROR
     if args.api_limit <= 0:
         raise ValueError("--api-limit must be greater than 0.")
+    if args.ready_timeout < 30:
+        raise ValueError("--ready-timeout must be at least 30 s.")
     run_parallel = _choose_parallel(args, nodes)
 
     workloads = {}
@@ -947,32 +1095,39 @@ def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
             workloads[node.name] = kube.list_node_workload(node.name)
         except KubectlError as exc:
             log.warning("Could not find out the workload of node %s: %s", node.name, exc)
-    print("-" * 52)
+    ui.emit("-" * 52)
     for line in series.plan_lines(template, nodes, workloads, parallel=run_parallel):
-        print(line)
+        ui.emit(line)
     if run_parallel:
-        print(f"API guard: kubectl response slower than {args.api_limit:g} s (or a failure) "
+        ui.emit(f"API guard: kubectl response slower than {args.api_limit:g} s (or a failure) "
               f"twice in a row stops all tests.")
+        if args.start_mode == "sync":
+            ui.emit(f"🚦 Synchronised start: the load starts on all nodes together, as soon as every one "
+                    f"is ready (wait at most {describe_duration(args.ready_timeout)}).")
+        else:
+            ui.emit("🟢 Rolling start: every node starts its load as soon as it is ready and runs the full "
+                    "time from its own start.")
     if args.schedule:
-        print(f"🕒 Scheduled for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(args.schedule))}.")
-    print("-" * 52)
+        ui.emit(f"🕒 Scheduled for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(args.schedule))}.")
+    ui.emit("-" * 52)
     if args.dry_run:
-        print("🔎 Dry run, nothing is being started.")
+        ui.emit("🔎 Dry run, nothing is being started.")
         return 0
     if not (args.yes or args.quick):
         if args.non_interactive:
-            print("Test refused: confirm with --yes.")
-            print("Exiting.")
+            ui.emit("Test refused: confirm with --yes.")
+            ui.emit("Exiting.")
             return 0
         if not ask_yes_no("Start the test?"):
-            print("Exiting.")
+            ui.emit("Exiting.")
             return 0
     if template.background and not background.supported():
-        print("❌ Running in the background is not supported on this system (no fork).")
+        ui.emit("❌ Running in the background is not supported on this system (no fork).")
         return EXIT_ERROR
+    _maybe_prepull(args, kube, template, [n.name for n in nodes])
     series.preflight(kube, nodes)
 
-    directory = make_private_dir(user_log_dir(args.log_dir))
+    directory = make_private_dir(user_log_dir(args.log_dir, args.log_flat))
     log_path = series.new_series_log_path(directory)
     options = series.SeriesOptions(
         log_dir=directory, out=_out, interval=args.interval,
@@ -982,7 +1137,9 @@ def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
         hw_privileged=args.hw_privileged, skip_hw=args.no_hw)
     if run_parallel:
         runner = parallel.ParallelSeriesRunner(kube, template, nodes, skipped, options,
-                                               log_path, api_limit=args.api_limit)
+                                               log_path, api_limit=args.api_limit,
+                                               sync_start=(args.start_mode == "sync"),
+                                               ready_timeout=args.ready_timeout)
     else:
         runner = series.SeriesRunner(kube, template, nodes, skipped, options, log_path)
     if not template.background:
@@ -1032,6 +1189,8 @@ def quick_summary(cfg: StressConfig) -> str:
         parts.append("stepped " + describe_steps(cfg.steps) + " %")
     elif cfg.spike:
         parts.append(f"spike {SPIKE_LOW_PCT}<->{cfg.spike_target} % ({cfg.spike_cycles}x)")
+    elif cfg.gpu:
+        parts.append(f"GPU burn {cfg.gpu_mem_pct} %")
     elif cfg.disk:
         parts.append(f"disk fio {cfg.disk_size} MiB")
     elif cfg.net:
@@ -1051,8 +1210,16 @@ def quick_summary(cfg: StressConfig) -> str:
     return " · ".join(parts)
 
 
+def cmd_migrate_logs() -> int:
+    counts = migrate_to_daily()
+    ui.emit(f"✅ Moved into day folders: results {counts['logs']}, debug logs {counts['debug']}, pytest runs {counts['tests']}.")
+    return 0
+
+
 def _main(args: argparse.Namespace) -> int:
     apply_quick(args)
+    if args.migrate_logs:
+        return cmd_migrate_logs()
     if args.status:
         return cmd_status()
     if args.stop:
@@ -1065,20 +1232,28 @@ def _main(args: argparse.Namespace) -> int:
         return cmd_set_baseline(args)
     if args.list_nodes:
         return cmd_list_nodes()
+    if args.list_gpus:
+        return cmd_list_gpus()
+    if args.self_test:
+        if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
+            ui.emit("❌ Error: 'kubectl' was not found.")
+            return EXIT_ERROR
+        from . import selftest
+        return selftest.run(args)
     if args.net_matrix:
         if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
-            print("❌ Error: 'kubectl' was not found.")
+            ui.emit("❌ Error: 'kubectl' was not found.")
             return EXIT_ERROR
         return cmd_net_matrix(args)
     if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
-        print("❌ Error: 'kubectl' was not found.")
+        ui.emit("❌ Error: 'kubectl' was not found.")
         log.error("kubectl was not found in PATH")
         return EXIT_ERROR
 
     kube = Kubectl()
-    print("=" * 52)
-    print("   KUBERNETES STRESS TEST (Python)")
-    print("=" * 52)
+    ui.emit("=" * 52)
+    ui.emit("K3S STRESS TEST")
+    ui.emit("=" * 52)
     try:
         scope = _choose_scope(args)
         if scope != "single":
@@ -1086,13 +1261,13 @@ def _main(args: argparse.Namespace) -> int:
         node_name = args.node
         if not node_name:
             if args.non_interactive:
-                print("❌ In --non-interactive mode --node must be given.")
+                ui.emit("❌ In --non-interactive mode --node must be given.")
                 return EXIT_ERROR
             node_name = choose_node(kube)
         node = kube.get_node(node_name)
         log.info("Node: %s", node)
         if not node.ready:
-            print(f"❌ Node '{node.name}' is not Ready!")
+            ui.emit(f"❌ Node '{node.name}' is not Ready!")
             log.error("Node %s is not Ready", node.name)
             return EXIT_ERROR
 
@@ -1103,35 +1278,35 @@ def _main(args: argparse.Namespace) -> int:
                  node.is_control_plane, force, master_mode)
         if node.is_control_plane and force:
             why = "--force" if args.force else "the FORCE=1 environment variable"
-            print(f"⚠️  MASTER PROTECTION BYPASSED by {why}: no CPU cap, no lower temperature limit, "
+            ui.emit(f"⚠️  MASTER PROTECTION BYPASSED by {why}: no CPU cap, no lower temperature limit, "
                   f"no confirmation. The API of the cluster may slow down.")
         if master_mode:
-            print(f"⚠️  '{node.name}' is the MASTER (control-plane). The load may slow down "
+            ui.emit(f"⚠️  '{node.name}' is the MASTER (control-plane). The load may slow down "
                   f"the API and services.\n    CPU will be limited to at most {MASTER_CPU_CAP} %, "
                   f"RAM and disk are not tested (bypass: --force or FORCE=1).")
             if not args.yes and (args.non_interactive or not ask_yes_no("Continue?")):
-                print("Exiting.")
+                ui.emit("Exiting.")
                 log.info("The user did not confirm the test on the master")
                 return 0
 
         if not confirm_workload(kube, node, args, already_confirmed=master_mode):
-            print("Exiting.")
+            ui.emit("Exiting.")
             log.info("The user did not confirm the test on a node with services")
             return 0
 
         cfg = build_config(args, node.name, master_mode)
         if master_mode:
             for msg in cfg.apply_master_limits():
-                print(f"⚠️  {msg}")
+                ui.emit(f"⚠️  {msg}")
                 log.info("master limit: %s", msg)
         cfg.validate()
         if args.quick:
-            print(f"⚡ Quick test: {quick_summary(cfg)}")
+            ui.emit(f"⚡ Quick test: {quick_summary(cfg)}")
         if args.schedule:
-            print(f"🕒 Scheduled for "
+            ui.emit(f"🕒 Scheduled for "
                   f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(args.schedule))}.")
         if args.dry_run:
-            print(f"🔎 Dry run, nothing is being started: {quick_summary(cfg)}")
+            ui.emit(f"🔎 Dry run, nothing is being started: {quick_summary(cfg)}")
             return 0
 
         if args.log_file:                         # subprocess of the parallel test: fixed path to the log
@@ -1141,16 +1316,17 @@ def _main(args: argparse.Namespace) -> int:
             make_private_dir(Path(args.log_file).parent)
             log_path = args.log_file
         elif cfg.log:
-            directory = make_private_dir(user_log_dir(args.log_dir))
+            directory = make_private_dir(user_log_dir(args.log_dir, args.log_flat))
             stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
             log_path = str(directory / f"{node.name}-{cfg.duration}s-{stamp}.log")
         if log_path:                              # fail now, not after the pods are up and hardware is detected
             open_private(log_path, "a").close()
 
         if cfg.background and not background.supported():
-            print("❌ Running in the background is not supported on this system (no fork).")
+            ui.emit("❌ Running in the background is not supported on this system (no fork).")
             return EXIT_ERROR
 
+        _maybe_prepull(args, kube, cfg, [node.name])
         runner = StressRunner(
             kube, node, cfg, log_path=log_path,
             interval=args.interval, remaining_every=max(args.remaining_every, 0),
@@ -1158,6 +1334,8 @@ def _main(args: argparse.Namespace) -> int:
             allow_no_sensor=args.allow_no_sensor,
             max_busy_pct=args.max_busy_pct, allow_busy_node=args.allow_busy_node,
             skip_capacity_check=args.no_capacity_check,
+            start_gate=args.start_gate, gate_timeout=args.ready_timeout,
+            gate_wait=not args.no_gate_wait,
             confirm_no_sensor=(None if (args.non_interactive or cfg.background) else
                                lambda: ask_yes_no("Continue without temperature protection?")),
             out=_out)
@@ -1188,19 +1366,19 @@ def _main(args: argparse.Namespace) -> int:
         finally:
             background.unregister(runner.names.run_id)
     except RunnerError as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         log.error("Pre-start check failed: %s", exc)
         return EXIT_ERROR
     except ValueError as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         log.error("Invalid settings: %s", exc)
         return EXIT_ERROR
     except KubectlError as exc:
-        print(f"❌ {exc}")
+        ui.emit(f"❌ {exc}")
         log.error("KubectlError: %s", exc)
         return EXIT_ERROR
     except OSError as exc:
-        print(f"❌ Cannot create the log folder '{args.log_dir}': {exc}")
+        ui.emit(f"❌ Cannot create the log folder '{args.log_dir}': {exc}")
         log.exception("OSError while working with the log folder")
         return EXIT_ERROR
 
@@ -1221,13 +1399,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         raise
     except Exception as exc:                    # unexpected error -> traceback to the log
         log.exception("Unexpected error")
-        print(f"❌ Unexpected error: {exc}")
+        ui.emit(f"❌ Unexpected error: {exc}")
         code = EXIT_ERROR
         return code
     finally:
         log.info("===== END, exit code %s =====", code)
         if code == EXIT_ERROR and debug_path is not None:
-            print(f"ℹ️  Technical details for debugging: {debug_path}")
+            ui.emit(f"ℹ️  Technical details for debugging: {debug_path}")
         debuglog.shutdown()
 
 

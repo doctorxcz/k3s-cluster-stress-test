@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import time
 from typing import Callable, Optional
 
 from . import baseline
+from . import ui
 from .export import write_exports
 from .kube import Kubectl, KubectlError
 from .logparse import read_log
 from .disk import jobs as disk_jobs, parse_fio_json
 from . import net as netmod
+from . import gpu as gpumod
 from .smart import parse_smart_output
-from .manifests import (FAILED_MARKER, net_service, PROBE_SCRIPT, STARTED_MARKER,
+from .manifests import (FAILED_MARKER, GATE_FILE, READY_MARKER, net_service, PROBE_SCRIPT, STARTED_MARKER,
                         build_stress_command, hw_pod, probe_pod, stress_memory_limit_mib,
                         net_server_pod, smart_pod, stress_pod)
 from .models import (MAX_NODE_BUSY_PCT, SPIKE_LOW_PCT, WARN_TEMP, NodeInfo, PodNames,
@@ -22,9 +25,9 @@ from .models import (MAX_NODE_BUSY_PCT, SPIKE_LOW_PCT, WARN_TEMP, NodeInfo, PodN
 from .monitor import Monitor, OverheatGuard
 from .parsing import (STAGE_RE, calc_ram_target_mib, count_completed_runs,
                       describe_duration, describe_steps, format_duration,
-                      parse_pct, parse_probe_output, parse_stressng_outcome, parse_top,
+                      clean_block, clean_text, cpu_summary, parse_pct, parse_probe_output, parse_stressng_outcome, parse_top,
                       split_stage_lines)
-from .paths import open_private
+from .paths import log_root_of, open_private
 from .summary import (RunStats, StressMetric, build_summary, parse_stressng_metrics,
                       run_stats)
 
@@ -36,7 +39,20 @@ EXIT_OVERHEAT = 3
 EXIT_PREMATURE = 4      # the test ended earlier than it should (the pod disappeared/was terminated)
 EXIT_INTERRUPTED = 130
 
+# preparation of a node: (key, short label, typical seconds) - the bar creeps within a step by time
+PREP_STEPS = (("check", "checking", 5), ("probe", "probe pod", 15), ("smart", "SMART", 20),
+              ("hw", "hardware", 25), ("pod", "pod start", 20), ("install", "installing", 60),
+              ("ready", "waiting", 10))
+
+
+def prep_fraction(base: float, share: float, typical: float, spent: float) -> float:
+    """Progress of the preparation: finished steps + a part of the running one (by time, never 100 % of it)."""
+    return min(1.0, base + share * min(0.95, spent / typical if typical > 0 else 0.0))
+
+
+GATE_TIMEOUT = 900          # s how long a ready node waits for the others (synchronised start)
 POD_DEADLINE_MARGIN = 600   # s extra for pulling the image and apt install
+GPU_DEADLINE_EXTRA = 1200   # s more for the GPU test: first pull of the ~3 GB CUDA image + building gpu-burn
 
 
 class RunnerError(RuntimeError):
@@ -58,7 +74,13 @@ class StressRunner:
                  concurrent: int = 1,
                  max_busy_pct: int = MAX_NODE_BUSY_PCT,
                  allow_busy_node: bool = False,
-                 skip_capacity_check: bool = False) -> None:
+                 skip_capacity_check: bool = False,
+                 start_gate: str = "",
+                 gate_timeout: int = GATE_TIMEOUT,
+                 gate_wait: bool = True,
+                 gpu_board=None) -> None:
+        self.gpu_board = gpu_board                  # multi-node GPU test: the shared table (see gpuscan.GpuBoard)
+        self.gpu_summary = None                     # GpuSummary of the finished GPU test
         self.kube = kube
         self.node = node
         self.cfg = cfg
@@ -68,7 +90,8 @@ class StressRunner:
         self.remaining_every = remaining_every
         self.allow_no_sensor = allow_no_sensor
         self.confirm_no_sensor = confirm_no_sensor
-        self.out = out
+        self._raw_out = out
+        self._screen: Optional[ui.LiveScreen] = None   # live in-place view of the running test (terminal only)
         self.names = names or PodNames.new()      # unique pod names of this run
         self.hw_privileged = hw_privileged
         self.skip_hw = skip_hw
@@ -90,9 +113,89 @@ class StressRunner:
         self.net_port = netmod.PORT_BASE
         self.disk_results: list = []                # fio results of the disk benchmark
         self._smart_lines: list[str] = []           # disk health for the log header (--smart)
-        self.deadline = cfg.total_duration + POD_DEADLINE_MARGIN
+        self._prep_key = ""                         # the running preparation step
+        self._prep_at = time.monotonic()
+        self._deferred: list[str] = []              # long texts (hardware) printed after the live screen is closed
+        self.start_gate = start_gate                # parallel test: path prefix of the <gate>.ready / <gate>.go files
+        self.gate_timeout = gate_timeout
+        self.gate_wait = bool(start_gate) and gate_wait   # False = rolling start: the load starts as soon as this node is ready
+        self.deadline = (cfg.total_duration + POD_DEADLINE_MARGIN + (GPU_DEADLINE_EXTRA if cfg.gpu else 0)
+                         + (gate_timeout if self.gate_wait else 0))
 
     # --- output and log -------------------------------------------------------
+    def out(self, line: str) -> None:
+        if self._screen:
+            log.info("OUT %s", line)
+            if line.count("\n") > 3:                 # a long text (hardware): shown after the screen is closed
+                self._deferred.append(line)
+                line = line.split("\n", 1)[0] + " (full text below after the test)"
+            self._screen.event(line)
+        else:
+            self._raw_out(line)
+
+    def _prep_steps(self) -> list:
+        return [st for st in PREP_STEPS
+                if (st[0] != "smart" or self.cfg.smart) and (st[0] != "ready" or self.gate_wait)]
+
+    def _prep_state(self) -> tuple:
+        """(fraction, label, 'k/N') of the running preparation step."""
+        steps = self._prep_steps()
+        total = sum(w for _k, _l, w in steps)
+        done = 0.0
+        for index, (key, label, weight) in enumerate(steps, 1):
+            if key == self._prep_key:
+                fraction = prep_fraction(done / total, weight / total, weight, time.monotonic() - self._prep_at)
+                return fraction, label, f"{index}/{len(steps)}"
+            done += weight
+        return (0.0 if not self._prep_key else 1.0), "starting", f"{'0' if not self._prep_key else len(steps)}/{len(steps)}"
+
+    def _step(self, key: str) -> None:
+        """A new preparation step: for the bar of the screen and (parallel test) for the parent's table."""
+        self._prep_key, self._prep_at = key, time.monotonic()
+        if not self.start_gate:
+            return
+        steps = self._prep_steps()
+        total = sum(w for _k, _l, w in steps)
+        done = 0.0
+        for _index, (k, label, weight) in enumerate(steps, 1):
+            if k == key:
+                try:
+                    with open_private(self.start_gate + ".prep", "w") as fh:
+                        fh.write(f"{done / total:.4f} {weight / total:.4f} {weight} {time.time():.1f} {label}\n")
+                except OSError:
+                    pass
+                return
+            done += weight
+
+    def _mark_started(self) -> None:
+        """Parallel test: the moment this node's own load started (the parent draws the node's bar from it)."""
+        if self.start_gate:
+            try:
+                with open_private(self.start_gate + ".started", "w") as fh:
+                    fh.write(f"{time.time():.1f}\n")
+            except OSError:
+                pass
+
+    def _open_screen(self) -> None:
+        if self.concurrent <= 1 and ui.LiveScreen.wanted():
+            if self.cfg.gpu:
+                self._screen = ui.GpuScreen(self.node.name, total=self.cfg.total_duration,
+                                            limit=self.cfg.gpu_max_temp, warn=self.cfg.gpu_max_temp - gpumod.GPU_WARN_MARGIN,
+                                            board=self.gpu_board)
+            else:
+                self._screen = ui.LiveScreen(f"{self.node.name} · {describe_duration(self.cfg.duration)} test",
+                                             total=self.cfg.total_duration)
+            self._screen.begin_prep(self._prep_state)
+            self._screen.start_ticker()
+
+    def _close_screen(self) -> None:
+        if self._screen:
+            screen, self._screen = self._screen, None
+            screen.close()
+            for text in self._deferred:
+                self._raw_out(text)
+            self._deferred.clear()
+
     def _log(self, text: str) -> None:
         if self.log_path:
             with open_private(self.log_path, "a") as fh:      # permissions 0600
@@ -100,11 +203,17 @@ class StressRunner:
 
     def _emit_measurement(self, line: str) -> None:
         prefix = "❄️  " if self._phase == "cooldown" else "⏳ "
-        self.out(prefix + line)
+        if self._screen:
+            self._screen.reading(line, self._phase == "cooldown")
+        else:
+            self.out(prefix + line)
         self._log(("[cooldown] " if self._phase == "cooldown" else "") + line)
 
     def _emit_info(self, line: str) -> None:
-        self.out(line)
+        if self._screen and "⏱️" in line:
+            self._screen.status(line)
+        else:
+            self.out(line)
         self._log(line)
 
     # --- steps ---------------------------------------------------------------
@@ -121,7 +230,7 @@ class StressRunner:
             if phase in ("Succeeded", "Failed"):
                 break
             time.sleep(2)
-        info = (self.kube.logs(self.names.hw).strip() if phase == "Succeeded"
+        info = (clean_block(self.kube.logs(self.names.hw)).strip() if phase == "Succeeded"
                 else f"Hardware detection failed (pod phase: {phase or 'unknown'}).")
         self.kube.delete_pods(self.names.hw)
         return info
@@ -165,6 +274,33 @@ class StressRunner:
                               f"use --allow-bad-disk to test anyway.")
         self.out("✅ Disk health OK (SMART).")
 
+    def _check_gpu(self, hardware: str) -> None:
+        """GPU test preflight: the node must offer nvidia.com/gpu (driver, toolkit, runtime and device plugin)."""
+        state, message = gpumod.gpu_state(hardware, self.node.gpu_count, hw_skipped=self.skip_hw)
+        if state != "ok":
+            raise RunnerError(message)
+        busy = self.kube.gpu_in_use(self.node.name)
+        if busy and busy >= self.node.gpu_count:
+            raise RunnerError(f"The GPU of {self.node.name} is already used by another pod ({busy}x nvidia.com/gpu).")
+        self.out(f"🎮 GPU available: {self.node.gpu_count}x nvidia.com/gpu. Stop at {self.cfg.gpu_max_temp} °C, "
+                 f"warning from {self.cfg.gpu_max_temp - gpumod.GPU_WARN_MARGIN} °C.")
+
+    def _gpu_info(self) -> None:
+        """Static data of the card (model, driver, memory, limits) - shown and written to the log before the load."""
+        try:
+            lines = gpumod.parse_gpu_info(self.kube.exec(self.names.stress, gpumod.INFO_QUERY, timeout=gpumod.SMI_TIMEOUT))
+        except KubectlError as exc:
+            log.warning("GPU info could not be read: %s", exc)
+            return
+        if not lines:
+            return
+        if isinstance(self._screen, ui.GpuScreen):
+            self._screen.set_card(lines)
+        self.out(f"{ui.ICON_GPU} GPU INFO:\n" + "\n".join(f"  {ln}" for ln in lines))
+        self._log("=== GPU ===")
+        for ln in lines:
+            self._log(f"GPU {ln}" if not ln.startswith("GPU:") else ln.replace("GPU:", "GPU model:", 1))
+
     def _write_log_header(self, hardware: str) -> None:
         n, c = self.node, self.cfg
         self._log("=== KUBERNETES STRESS-NG LOG ===")
@@ -178,6 +314,11 @@ class StressRunner:
         elif c.net:
             self._log(f"Profile: network - iperf3 + ping, {c.net_mode} network, {c.net_time} s per test")
             self._log("CPU load: none (network test)")
+        elif c.gpu:
+            self._log(f"Profile: gpu - gpu-burn {c.gpu_mem_pct} % of the GPU memory"
+                      f"{', double precision' if c.gpu_double else ''}, image {c.gpu_image or gpumod.GPU_IMAGE_DEFAULT}")
+            self._log(f"GPU temperature limit: {c.gpu_max_temp}°C (2 readings in a row), warning from {c.gpu_max_temp - gpumod.GPU_WARN_MARGIN}°C")
+            self._log("CPU load: none (GPU test)")
         elif c.disk:
             self._log(f"Profile: disk - fio benchmark, {len(disk_jobs(c.disk_read_only))} jobs of "
                       f"{describe_duration(c.disk_job_time)}, {c.disk_size} MiB file"
@@ -231,6 +372,12 @@ class StressRunner:
                 ("Peer", c.net_peer or "chosen automatically"),
                 ("Test duration", f"{describe_duration(c.duration)} in total (+ installing iperf3)"),
             ]
+        elif c.gpu:
+            load_rows = [
+                ("Profile", f"GPU test (gpu-burn), {c.gpu_mem_pct} % of the GPU memory"
+                           f"{', double precision' if c.gpu_double else ''}"),
+                ("Test duration", f"{describe_duration(c.duration)} in total (+ preparing gpu-burn)"),
+            ]
         elif c.disk:
             load_rows = [
                 ("Profile", f"disk benchmark (fio) - {len(disk_jobs(c.disk_read_only))} jobs of "
@@ -255,14 +402,15 @@ class StressRunner:
         rows = [
             ("Node", n.name + (" (master)" if n.is_control_plane else "")),
             *load_rows,
-            ("Stop at", f"{c.max_temp} °C (2 readings in a row)"),
+            ("Stop at", (f"GPU {c.gpu_max_temp} °C (warning from {c.gpu_max_temp - gpumod.GPU_WARN_MARGIN} °C) · "
+                         f"CPU {c.max_temp} °C" if c.gpu else f"{c.max_temp} °C") + " (2 readings in a row)"),
             ("Cooldown after test", f"{c.cooldown} s of measuring" if c.cooldown else "off"),
             ("Log", self.log_path or "no"),
         ]
         self.out("-" * 52)
         self.out("TEST SETTINGS")
-        for key, value in rows:
-            self.out(f"  {key + ':':<21}{value}")
+        for line in ui.kv_block(rows, label_w=21):       # the classic rows; two columns / wrapped for the terminal width
+            self.out(line)
         self.out("  (preparing the pods before the load starts takes about 1–3 min extra)")
         self.out("-" * 52)
 
@@ -316,8 +464,12 @@ class StressRunner:
         self.out("    Automatic stop on overheating will NOT work.")
         if self.allow_no_sensor:
             return data
-        if self.confirm_no_sensor and self.confirm_no_sensor():
-            return data
+        if self.confirm_no_sensor:
+            self._close_screen()                       # the question needs the plain terminal
+            confirmed = self.confirm_no_sensor()
+            self._open_screen()
+            if confirmed:
+                return data
         raise RunnerError("The test without temperature protection was not confirmed "
                           "(use --allow-no-sensor if you want it).")
 
@@ -402,25 +554,66 @@ class StressRunner:
             self._start_net_server()
         cmd = build_stress_command(self.cfg, self.ram_target_mib, self.net_target, self.net_port,
                                    self._service_ip)
-        limit = stress_memory_limit_mib(self.ram_target_mib)
+        limit = gpumod.GPU_LIMIT_MIB if self.cfg.gpu else stress_memory_limit_mib(self.ram_target_mib)
         log.info("stress-ng command: %s | memory limit %s MiB", cmd, limit)
         disk = self.cfg.disk
+        gpu = self.cfg.gpu
         self.kube.apply(stress_pod(self.node.name, self.names, self.deadline, cmd, limit,
-                                   package="fio" if disk else netmod.packages(self.cfg.net_extra) if self.cfg.net else "stress-ng",
+                                   package="git make g++" if gpu else "fio" if disk else netmod.packages(self.cfg.net_extra) if self.cfg.net else "stress-ng",
+                                   image=(self.cfg.gpu_image or gpumod.GPU_IMAGE_DEFAULT) if gpu else "",
+                                   gpu=gpu, setup=gpumod.build_gpu_setup(self.cfg.gpu_mem_pct) if gpu else "",
                                    scratch_mib=self.cfg.disk_size + 256 if disk else 0,
-                                   host_network=self.cfg.net and self.cfg.net_mode == "host"))
+                                   host_network=self.cfg.net and self.cfg.net_mode == "host",
+                                   gate_seconds=(self.gate_timeout + POD_DEADLINE_MARGIN + (GPU_DEADLINE_EXTRA if self.cfg.gpu else 0))
+                                   if self.gate_wait else 0))
         self.out("⏳ Waiting for the pod to start...")
-        if not self.kube.wait_ready(self.names.stress, 120):
-            raise RunnerError("The stress-test pod timed out while starting.")
-        self.out(f"⏳ Waiting for {'fio' if self.cfg.disk else 'iperf3' if self.cfg.net else 'stress-ng'} to be installed and started...")
-        for _ in range(90):
+        if self.cfg.gpu:
+            self.out("⏳ Pulling the CUDA image can take several minutes the first time (about 3 GB)...")
+        if not self.kube.wait_ready(self.names.stress, 900 if self.cfg.gpu else 120):
+            raise RunnerError("The stress-test pod timed out while starting." + (
+                " Is the GPU free (nvidia.com/gpu), is the image pullable, does runtime 'nvidia' exist? "
+                f"Check: kubectl describe pod {self.names.stress}" if self.cfg.gpu else ""))
+        self.out(f"⏳ Waiting for {'gpu-burn to be built' if self.cfg.gpu else 'fio to be installed' if self.cfg.disk else 'iperf3 to be installed' if self.cfg.net else 'stress-ng to be installed'} and started...")
+        self._step("install")
+        tool = 'gpu-burn' if self.cfg.gpu else 'fio' if self.cfg.disk else 'iperf3' if self.cfg.net else 'stress-ng'
+        ready_marker = READY_MARKER if self.gate_wait else STARTED_MARKER
+        for _ in range(420 if self.cfg.gpu else 90):
+            logs = self.kube.logs(self.names.stress)
+            if ready_marker in logs or STARTED_MARKER in logs:
+                break
+            if FAILED_MARKER in logs:
+                raise RunnerError(f"{tool} could not be started.")
+            time.sleep(2)
+        else:
+            raise RunnerError(f"{tool} could not be started.")
+        if not self.gate_wait:
+            return
+        self._wait_for_gate()
+        for _ in range(60):                                   # the load starts right after /tmp/go appears
             logs = self.kube.logs(self.names.stress)
             if STARTED_MARKER in logs:
                 return
             if FAILED_MARKER in logs:
                 break
-            time.sleep(2)
-        raise RunnerError(f"{'fio' if self.cfg.disk else 'iperf3' if self.cfg.net else 'stress-ng'} could not be started.")
+            time.sleep(0.5)
+        raise RunnerError(f"{tool} could not be started.")
+
+    def _wait_for_gate(self) -> None:
+        """Synchronised start: says READY to the parent and waits for its GO (all nodes start together)."""
+        self._step("ready")
+        ready, go = self.start_gate + ".ready", self.start_gate + ".go"
+        with open_private(ready, "w") as fh:
+            fh.write(time.strftime("%H:%M:%S") + "\n")
+        self.out("🚦 READY - waiting for the other nodes, the load starts together.")
+        self._log(f"[{time.strftime('%H:%M:%S')}] READY, waiting for the start of all nodes")
+        end = time.monotonic() + self.gate_timeout
+        while not os.path.exists(go):
+            if time.monotonic() >= end:
+                raise RunnerError("The other nodes did not become ready in time, the test was not started.")
+            time.sleep(0.1)
+        self.kube.exec(self.names.stress, f"touch {GATE_FILE}", timeout=30)
+        self.out("🟢 GO - the load is starting on all nodes.")
+        self._log(f"[{time.strftime('%H:%M:%S')}] GO")
 
     @staticmethod
     def _elapsed(started_at: Optional[float]) -> str:
@@ -434,6 +627,10 @@ class StressRunner:
             if any(line.startswith("NET-FAILED") for line in lines):
                 return "failed"
             return "ok" if "NET-DONE" in lines else "unknown"
+        if self.cfg.gpu:
+            if any(line.startswith("GPU-FAILED") for line in lines):
+                return "failed"
+            return "ok" if "GPU-DONE" in lines else "unknown"
         if self.cfg.disk:
             if any(line.startswith("DISK-FAILED") for line in lines):
                 return "failed"
@@ -470,6 +667,11 @@ class StressRunner:
                         self.net_results.append(errors)
                         self._log(errors.log_line())
                         msg += f"\n[{stamp}] 🌐 {errors.line()}"
+        elif kind == "NET-SKIPPED":
+            name, _, reason = rest.partition(" ")
+            why = "no answer" if not reason.strip() else reason.strip()[:90]
+            msg = (f"[{stamp}] ⚠️  {name} skipped: {why} - UDP is probably blocked by a firewall "
+                   f"(allow UDP 30000-32767 or use --net-extra no-udp), the test continues")
         elif kind == "NET-FAILED":
             msg = f"[{stamp}] ❌ network job {rest} failed (is the peer reachable? firewall?)"
         else:
@@ -477,6 +679,27 @@ class StressRunner:
         self.out(msg)
         if kind != "NET-RESULT":
             self._log(msg)
+
+    def _on_gpu_line(self, monitor: Monitor, line: str) -> None:
+        """Markers of the gpu-burn script: its final lines, the end or a failure."""
+        kind, _, rest = line.partition(" ")
+        stamp = time.strftime("%H:%M:%S")
+        if kind == "GPU-PERF":
+            found = re.search(r"\((\d+) Gflop/s\).*?errors:\s*(\d+)", rest)
+            if not found:
+                return
+            text = f"{found.group(1)} Gflop/s · errors {found.group(2)}"
+            if isinstance(self._screen, ui.GpuScreen):
+                self._screen.set_perf(text)
+            msg = f"[{stamp}] 🚀 gpu-burn performance: {text}"
+        elif kind == "GPU-INFO":
+            msg = f"[{stamp}] 🎮 {clean_text(rest, 200)}"
+        elif kind == "GPU-FAILED":
+            msg = f"[{stamp}] ❌ gpu-burn: {clean_text(rest, 200) or 'failed'}"
+        else:
+            return
+        self.out(msg)
+        self._log(msg)
 
     def _on_disk_line(self, monitor: Monitor, line: str) -> None:
         """Markers of the fio loop: a new job, a job result (JSON), the end or a failure."""
@@ -525,6 +748,8 @@ class StressRunner:
             return
         monitor.phase = "cooldown"
         self._phase = "cooldown"
+        if self._screen:
+            self._screen.begin_cooldown(seconds)
         self.out(f"❄️  The load has ended. For another {seconds} s I keep measuring the CPU clock and temperature "
                  f"(cooldown, Ctrl+C = skip).")
         self._log(f"[{time.strftime('%H:%M:%S')}] Cooldown: measuring for another {seconds} s")
@@ -545,6 +770,7 @@ class StressRunner:
             return
         monitor.stop()
         monitor.join(timeout=10)                   # let the measurement in progress finish
+        self._close_screen()
         if monitor.phase == "cooldown":
             monitor.final_sample()                 # the last value exactly at the end of the cooldown
         metrics = parse_stressng_metrics(stress_lines)
@@ -559,24 +785,60 @@ class StressRunner:
         stage_metrics = ({i: parse_stressng_metrics(part)
                           for i, part in split_stage_lines(stress_lines).items()}
                          if stage_targets else None)
-        lines = build_summary(
-            monitor.samples, self._baseline, metrics, warn_temp=WARN_TEMP,
-            cooldown_requested=self.cfg.cooldown, stage_targets=stage_targets,
-            stage_metrics=stage_metrics)
+        if self.cfg.net or self.cfg.disk or self.cfg.gpu:          # no CPU load here: only the node's state as information
+            lines = self._light_summary(monitor.samples)
+        else:
+            lines = build_summary(
+                monitor.samples, self._baseline, metrics, warn_temp=WARN_TEMP,
+                cooldown_requested=self.cfg.cooldown, stage_targets=stage_targets,
+                stage_metrics=stage_metrics)
+        shown = list(lines)                        # what the terminal gets: the same, laid out for its width
         if self.net_results:
-            lines += ["NETWORK TEST (iperf3 + ping)", *[f"  {r.line()}" for r in self.net_results]]
             notes = netmod.findings(self.net_results)
-            lines += [f"  ⚠️  {n}" for n in notes] or ["  ✅ Nothing suspicious in the network results."]
+            tail = [f"  ⚠️  {n}" for n in notes] or ["  ✅ Nothing suspicious in the network results."]
+            lines += ["NETWORK TEST (iperf3 + ping)", *[f"  {r.line()}" for r in self.net_results], *tail]
+            shown += ["NETWORK TEST (iperf3 + ping)", *ui.label_rows([f"  {r.line()}" for r in self.net_results], label_w=13), *tail]
+        if self.cfg.gpu:
+            self.gpu_summary = gpumod.summarize(monitor.samples)
+            gpu_lines = gpumod.summary_lines(monitor.samples)
+            lines += ["GPU TEST (gpu-burn + nvidia-smi)", *gpu_lines]
+            shown += ["GPU TEST (gpu-burn + nvidia-smi)", *ui.label_rows(gpu_lines, label_w=26)]
         if self.disk_results:
             lines += ["DISK BENCHMARK (fio, direct I/O)", *[f"  {r.line()}" for r in self.disk_results]]
+            shown += ["DISK BENCHMARK (fio, direct I/O)", *ui.label_rows([f"  {r.line()}" for r in self.disk_results], label_w=11)]
         self.metrics = metrics
         self.stats = run_stats(monitor.samples,
                                self._baseline.cpu_temp if self._baseline else None,
                                WARN_TEMP, stage_targets, stage_metrics)
+        if ui.adaptive():
+            self.out("\n".join(shown))                # one block: a wide terminal puts the short rows in two columns
+        else:
+            for line in shown:
+                self.out(line)
         for line in lines:
-            self.out(line)
             self._log(line)
         log.info("Test summary (%d samples):\n%s", len(monitor.samples), "\n".join(lines))
+
+    def _light_summary(self, samples: list) -> list[str]:
+        """Header of the network / disk test summary: what the node did meanwhile (information only)."""
+        test = [s for s in samples if s.phase == "test"]
+        title = ("NETWORK TEST SUMMARY" if self.cfg.net else "GPU TEST SUMMARY" if self.cfg.gpu
+                 else "DISK BENCHMARK SUMMARY")
+        lines = ["=" * 52, title, "=" * 52]
+        if not test:
+            return lines + ["No measurement could be obtained during the test."]
+        cpu = [s.cpu_pct for s in test if s.cpu_pct is not None]
+        ram = [s for s in test if s.mem_used_mib is not None]
+        temps = [s.cpu_temp for s in test if s.cpu_temp is not None]
+        if cpu:
+            lines.append(f"Node CPU load (info):     avg {sum(cpu) / len(cpu):.0f} % | max {max(cpu):.0f} %")
+        if ram:
+            top = max(ram, key=lambda s: s.mem_used_mib)
+            lines.append(f"Node RAM (info):          max {top.mem_used_mib} MiB ({top.mem_used_pct:.0f} %)")
+        if temps:
+            base = f"   (idle before test {self._baseline.cpu_temp} °C)" if self._baseline and self._baseline.cpu_temp is not None else ""
+            lines.append(f"CPU temperature (info):   max {max(temps)} °C{base}")
+        return lines
 
     def preflight(self) -> None:
         """Checks whose failure you want to see right away in the terminal (before detaching)."""
@@ -650,7 +912,7 @@ class StressRunner:
                 return
             check = None
             if self.cfg.baseline_check:
-                check = baseline.check_run(run, os.path.dirname(os.path.abspath(self.log_path)))
+                check = baseline.check_run(run, log_root_of(os.path.abspath(self.log_path)))
             if check is not None:
                 for line in baseline.baseline_report(check):
                     self.out(line)
@@ -674,31 +936,53 @@ class StressRunner:
         self._print_summary()
         log.info("Pod names of this run: %s", self.names)
         try:
+            self._open_screen()
+            self._step("check")
             self._check_other_tests()
             self._check_capacity()
             self.kube.delete_finished_tool_pods()   # leftovers (only finished ones, not running)
             # temperature is checked before detecting the hardware, so that an overheated
             # node does not needlessly wait on apt/dmidecode (fail fast)
+            self._step("probe")
             self._start_probe()
             probe_data = self._check_sensor()
             self._baseline = probe_data
+            if self.cfg.smart:
+                self._step("smart")
             self._check_smart()
+            self._step("hw")
             hardware = self._collect_hardware()
             log.info("Node hardware detected:\n%s", hardware)
             self.out(f"🖥️  NODE HARDWARE {self.node.name}:\n{hardware}")
+            cpu_line = cpu_summary(hardware)
+            if cpu_line and self._screen and not self.cfg.gpu:
+                self._screen.set_subtitle(f"{ui.ICON_CPU} {cpu_line}")
+
+            if self.cfg.gpu:
+                self._check_gpu(hardware)
             if self.log_path:
                 self._write_log_header(hardware)
                 self.out(f"📊 Metrics are being saved to: {os.path.abspath(self.log_path)}")
             self.ram_target_mib = self._resolve_ram_target(probe_data)
+            self._step("pod")
             self._start_stress()
+            if self.cfg.gpu:
+                self._gpu_info()
             log.info("stress-ng is running, the monitor is starting")
             started_at = time.monotonic()
+            self._mark_started()
             ends = time.strftime("%H:%M:%S",
                                  time.localtime(time.time() + self.cfg.duration))
             self.out(f"🔥 Test running {describe_duration(self.cfg.duration)}, "
                      f"ends around {ends} "
-                     f"(automatic stop at {self.cfg.max_temp}°C)")
+                     f"(automatic stop at {self.cfg.max_temp}°C"
+                     f"{f', GPU {self.cfg.gpu_max_temp}°C' if self.cfg.gpu else ''})")
             self.out("-" * 52)
+            if self._screen:
+                self._screen.begin_test()
+            if self.cfg.gpu:
+                self.out(f"[{time.strftime('%H:%M:%S')}] ▶ gpu-burn started ({self.cfg.gpu_mem_pct} % of the GPU memory, "
+                         f"{'double' if self.cfg.gpu_double else 'single'} precision)")
 
             monitor = Monitor(
                 self.kube, self.node.name, OverheatGuard(self.cfg.max_temp),
@@ -710,7 +994,9 @@ class StressRunner:
                 total_seconds=self.cfg.total_duration,
                 remaining_every=self.remaining_every,
                 emit_info=self._emit_info,
-                ping_target=self._watch_ip)
+                ping_target=self._watch_ip,
+                gpu_pod=self.names.stress if self.cfg.gpu else "",
+                gpu_guard=gpumod.GpuGuard(self.cfg.gpu_max_temp) if self.cfg.gpu else None)
             monitor.start()
 
             logs_proc = self.kube.stream_logs(self.names.stress)
@@ -719,6 +1005,11 @@ class StressRunner:
                 stress_lines.append(line)              # kept in full for outcome/metrics parsing
                 if self.cfg.net and line.startswith("NET-"):
                     self._on_net_line(monitor, line)
+                    continue
+                if self.cfg.gpu and line.startswith("GPU-"):
+                    self._on_gpu_line(monitor, line)
+                    if line.startswith(("GPU-DONE", "GPU-FAILED")):
+                        break                        # the pod idles on (the cooldown reads the GPU through it)
                     continue
                 if self.cfg.disk and line.startswith("DISK-"):
                     self._on_disk_line(monitor, line)
@@ -734,21 +1025,27 @@ class StressRunner:
                 if line.startswith("stress-ng:") or line in (STARTED_MARKER, FAILED_MARKER):
                     continue
                 self.out(line)
+            if self.cfg.gpu and logs_proc.poll() is None:
+                logs_proc.terminate()
             logs_proc.wait()
             elapsed = time.monotonic() - started_at
             outcome = self._outcome(stress_lines)
             log.info("Log stream ended after %.1f s, stress-ng result: %s", elapsed, outcome)
 
             if monitor.aborted:
-                msg = (f"Test stopped because of overheating "
-                       f"({monitor.abort_temp}°C ≥ {self.cfg.max_temp}°C) "
+                limit = self.cfg.gpu_max_temp if monitor.abort_kind == "GPU" else self.cfg.max_temp
+                what = ("a GPU failure (nvidia-smi did not respond repeatedly, the GPU cannot be watched)"
+                        if monitor.abort_temp is None else
+                        f"overheating ({monitor.abort_kind} {monitor.abort_temp}°C ≥ {limit}°C)")
+                msg = (f"Test stopped because of {what} "
                        f"after {self._elapsed(started_at)} of {format_duration(self.cfg.duration)}.")
                 self.out(f"🛑 {msg}")
                 self._log(f"[{time.strftime('%H:%M:%S')}] 🛑 {msg}")
                 code = EXIT_OVERHEAT
                 log.error("Test terminated by overheating: %s", msg)
             elif outcome == "failed":
-                msg = "stress-ng ended with an error (see the output above)."
+                msg = (f"{'The network test' if self.cfg.net else 'The disk benchmark' if self.cfg.disk else 'The GPU test' if self.cfg.gpu else 'stress-ng'} "
+                       f"ended with an error (see the output above).")
                 self.out(f"❌ {msg}")
                 self._log(f"[{time.strftime('%H:%M:%S')}] ❌ {msg}")
                 code = EXIT_ERROR
@@ -796,6 +1093,7 @@ class StressRunner:
                 monitor.stop()
             if logs_proc is not None and logs_proc.poll() is None:
                 logs_proc.terminate()
+            self._close_screen()
             self._cleanup()
             self._export_results()
             if self.log_path:

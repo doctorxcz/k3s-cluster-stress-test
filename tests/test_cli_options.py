@@ -36,7 +36,7 @@ def test_dry_run_does_not_start_pod(tmp_path):
     res = run_tool(tmp_path, "--time", "5", "--dry-run", env_extra={"FAKE_RUN": "3"})
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Dry run" in res.stdout
-    assert not list((tmp_path / "logs").glob("*.log"))
+    assert not list((tmp_path / "logs").rglob("*.log"))
 
 
 # --- --list-nodes (integration) -----------------------------------------------------------
@@ -58,3 +58,35 @@ def test_schedule_waits_before_running(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     assert "Scheduled for" in res.stdout
     assert "Test completed" in res.stdout
+
+
+def _asked_prompts(monkeypatch, argv, answers):
+    """Runs build_config interactively and returns the questions that were asked."""
+    from stress_test import cli
+    asked, given = [], iter(answers)
+
+    def fake_input(prompt=""):
+        asked.append(prompt)
+        return next(given, "")
+    monkeypatch.setattr("builtins.input", fake_input)
+    args = cli.build_parser().parse_args(["--node", "n", "--no-background", "--notes", "", "--no-log", *argv])
+    return asked, cli.build_config(args, "n", master_mode=False)
+
+
+@pytest.mark.parametrize("argv", [["--profile", "gpu"], ["--profile", "disk"], ["--profile", "net"]])
+def test_no_cpu_temperature_question_for_tests_without_cpu_load(monkeypatch, argv):
+    asked, cfg = _asked_prompts(monkeypatch, argv, [])
+    assert not any("CPU temperature" in p for p in asked)
+    assert cfg.max_temp == 85
+    if argv[1] == "gpu":
+        assert any("GPU temperature" in p for p in asked)            # the GPU limit is still asked
+
+
+def test_cpu_temperature_is_still_asked_for_cpu_tests(monkeypatch):
+    asked, _ = _asked_prompts(monkeypatch, ["--profile", "classic"], [])
+    assert any("CPU temperature" in p for p in asked)
+
+
+def test_explicit_max_temp_still_applies_to_gpu_test(monkeypatch):
+    _, cfg = _asked_prompts(monkeypatch, ["--profile", "gpu", "--max-temp", "75"], [])
+    assert cfg.max_temp == 75

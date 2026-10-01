@@ -18,7 +18,7 @@ _MAX_LOGGED = 2000
 
 
 # values of keys that look like credentials are hidden in the debug log (also inside JSON that is escaped in a JSON string)
-_SECRET_RE = re.compile(r'(\\?"\w*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY)\w*\\?"\s*:\s*\\?")[^"\\]*',
+_SECRET_RE = re.compile(r'(\\?"[\w-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY|CLIENT[-_]KEY[-_]DATA)[\w-]*\\?"\s*:\s*\\?")[^"\\]*',
                         re.IGNORECASE)
 
 
@@ -87,6 +87,23 @@ class Kubectl:
         """Pods currently running on the node (excluding this tool and kube-system)."""
         return workload_from_json(
             self.get_json("pods", "-A", "--field-selector", f"spec.nodeName={node}"))
+
+    def gpu_in_use(self, node: str) -> int:
+        """How many nvidia.com/gpu are requested by live pods on the node (0 if it cannot be found out)."""
+        try:
+            items = self.get_json("pods", "-A", "--field-selector", f"spec.nodeName={node}").get("items", [])
+        except (KubectlError, ValueError):
+            return 0
+        total = 0
+        for pod in items:
+            if pod.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+                continue
+            for c in pod.get("spec", {}).get("containers", []):
+                try:
+                    total += int(c.get("resources", {}).get("limits", {}).get("nvidia.com/gpu", 0))
+                except (TypeError, ValueError):
+                    pass
+        return total
 
     def delete_finished_tool_pods(self) -> None:
         """Deletes only finished/failed pods of the tool (leftovers), leaves running ones."""

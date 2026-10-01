@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from .disk import build_disk_command
+from .gpu import build_gpu_command
 from .net import NET_SERVER_SCRIPT, build_net_command
 from .models import SPIKE_LOW_PCT, TOOL_LABEL, PodNames, StressConfig
 
@@ -19,6 +20,8 @@ HW_LIMIT_MIB = 768
 
 STARTED_MARKER = "STRESS-NG STARTED"
 FAILED_MARKER = "STRESS-NG FAILED"
+READY_MARKER = "STRESS-NG READY"          # synchronised start: the tool is installed, the pod waits for /tmp/go
+GATE_FILE = "/tmp/go"
 
 # Reads temperatures (hwmon) and the average CPU clock. Output: `temp ...` and `freq ...` lines.
 PROBE_SCRIPT = r"""
@@ -65,11 +68,12 @@ exit 0
 HW_SCRIPT = r"""
 echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
 echo "Threads: $(nproc)"
+echo "Cores: $(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
 echo "System: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
 echo "Motherboard: $(cat /sys/class/dmi/id/board_name 2>/dev/null)"
 echo "RAM total: $(free -m | awk '/Mem:/{print $2}') MB"
 
-apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq dmidecode >/dev/null 2>&1
+apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq dmidecode pciutils >/dev/null 2>&1
 dmidecode -t memory 2>/dev/null | awk -F': ' -v priv="$HW_PRIVILEGED" '
     function flush() {
         if (inrec && size != "" && size !~ /No Module/) {
@@ -90,6 +94,9 @@ dmidecode -t memory 2>/dev/null | awk -F': ' -v priv="$HW_PRIVILEGED" '
         else if (priv == "1") print "RAM modules: cannot be determined (dmidecode returned no data)"
         else print "RAM modules: cannot be determined without privileged mode (run with --hw-privileged)"
     }'
+gpu=$(lspci 2>/dev/null | grep -iE 'vga compatible|3d controller|display controller' | sed 's/^[^ ]* [^:]*: //' | paste -sd ';' - | sed 's/;/; /g')
+echo "GPU: ${gpu:-none detected (or pciutils could not be installed)}"
+lsblk -dn -o NAME,SIZE,ROTA,MODEL 2>/dev/null | awk '$1 !~ /^(loop|ram|zram|sr)/ {kind=($3=="1")?"HDD":"SSD/NVMe"; m=""; for(i=4;i<=NF;i++) m=m" "$i; printf "Disk %s: %s | %s |%s\n", $1, $2, kind, m}'
 """
 
 
@@ -158,6 +165,8 @@ def build_stress_command(cfg: StressConfig, ram_target_mib: Optional[int],
                                  cfg.net_extra, net_service_ip)
     if cfg.disk:
         return build_disk_command(cfg.disk_size, cfg.disk_job_time, cfg.disk_read_only)
+    if cfg.gpu:
+        return build_gpu_command(cfg.duration, cfg.gpu_mem_pct, cfg.gpu_double)
     if cfg.spike:
         return build_spike_command(cfg.spike_target, cfg.spike_cycles, cfg.spike_low_time,
                                    cfg.spike_high_time)
@@ -228,6 +237,35 @@ def smart_pod(node: str, names: PodNames, deadline: int = 300) -> dict:
     return pod
 
 
+def gpu_scan_pod(node: str, names: PodNames, deadline: int = 240) -> dict:
+    """Read-only pod listing the graphics cards of a node (lspci). Unprivileged, no hostPath."""
+    from .gpuscan import SCAN_SCRIPT
+    pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
+    pod["spec"]["containers"] = [{
+        "name": "gpu-scan",
+        "image": IMAGE_UBUNTU,
+        "securityContext": {"allowPrivilegeEscalation": False},
+        "command": ["bash", "-c", SCAN_SCRIPT],
+        "resources": {"requests": {"memory": "64Mi"},
+                      "limits": {"memory": f"{HW_LIMIT_MIB}Mi"}},
+    }]
+    return pod
+
+
+def image_pull_pod(node: str, names: PodNames, image: str, deadline: int = 1800) -> dict:
+    """Pod that only pulls `image` on the node (it starts, sleeps a second and ends) - warms the image cache."""
+    pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
+    pod["spec"]["containers"] = [{
+        "name": "image-pull",
+        "image": image,
+        "imagePullPolicy": "IfNotPresent",
+        "securityContext": {"allowPrivilegeEscalation": False},
+        "command": ["sleep", "1"],
+        "resources": {"requests": {"memory": "16Mi"}, "limits": {"memory": "64Mi"}},
+    }]
+    return pod
+
+
 def net_server_pod(node: str, names: PodNames, deadline: int, port: int, host_network: bool) -> dict:
     """iperf3 server of the network test on the peer node (reuses the name of the hw pod, which is finished by then)."""
     pod = _base_pod(names.hw, node, deadline, names.run_id, "net-server")
@@ -270,18 +308,23 @@ def probe_pod(node: str, names: PodNames, deadline: int) -> dict:
 
 def stress_pod(node: str, names: PodNames, deadline: int, stress_cmd: str,
                memory_limit_mib: int = STRESS_BASE_LIMIT_MIB, package: str = "stress-ng",
-               scratch_mib: int = 0, host_network: bool = False) -> dict:
+               scratch_mib: int = 0, host_network: bool = False, gate_seconds: int = 0,
+               image: str = "", gpu: bool = False, setup: str = "") -> dict:
+    # gate_seconds > 0: after the installation the pod says READY and waits (at most that long) until
+    # the file /tmp/go appears, so that all the pods of a parallel test can start the load together
+    gate = (f"echo '{READY_MARKER}'; while [ ! -f {GATE_FILE} ] && [ $SECONDS -lt {gate_seconds} ]; do sleep 0.2; done; "
+            f"if [ ! -f {GATE_FILE} ]; then echo '{FAILED_MARKER}'; exit 1; fi; ") if gate_seconds > 0 else ""
     script = (
         "export DEBIAN_FRONTEND=noninteractive; "
         "if apt-get update -qq >/dev/null 2>&1 && "
-        f"apt-get install -y -qq {package} >/dev/null 2>&1; then "
-        f"echo '{STARTED_MARKER}'; {stress_cmd}; "
+        f"apt-get install -y -qq {package} >/dev/null 2>&1{f' && {setup}' if setup else ''}; then "
+        f"{gate}echo '{STARTED_MARKER}'; {stress_cmd}; "
         f"else echo '{FAILED_MARKER}'; fi"
     )
     pod = _base_pod(names.stress, node, deadline, names.run_id, "stress")
     pod["spec"]["containers"] = [{
         "name": "stress-test",
-        "image": IMAGE_UBUNTU,
+        "image": image or IMAGE_UBUNTU,
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["/bin/bash", "-c", script],
         # small request + fixed limit: when memory runs short the kernel kills this pod first
@@ -289,6 +332,11 @@ def stress_pod(node: str, names: PodNames, deadline: int, stress_cmd: str,
         "resources": {"requests": {"memory": "64Mi"},
                       "limits": {"memory": f"{memory_limit_mib}Mi"}},
     }]
+    if gpu:               # GPU test: the NVIDIA runtime + one GPU from the device plugin (no privileged, no hostPath)
+        pod["spec"]["runtimeClassName"] = "nvidia"
+        container = pod["spec"]["containers"][0]
+        container["resources"]["limits"]["nvidia.com/gpu"] = 1
+        container["env"] = [{"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "utility,compute"}]
     if host_network:      # network test: the pod uses the node's own network
         pod["spec"]["hostNetwork"] = True
         pod["spec"]["dnsPolicy"] = "ClusterFirstWithHostNet"

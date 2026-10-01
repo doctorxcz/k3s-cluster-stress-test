@@ -84,10 +84,10 @@ def test_cluster_line_survives_a_broken_cluster():
     (("4", "2"), ["--net-matrix"]),
     (("5", "w"), ["--quick", "--net-watch"]),
     (("7", "1", "n1 n2"), ["--compare", "n1", "n2"]),
-    (("7", "1", "dell-9020"), ["--compare", "dell-9020"]),
-    (("7", "2", "dell-9020"), ["--set-baseline", "dell-9020"]),
+    (("7", "1", "worker-1"), ["--compare", "worker-1"]),
+    (("7", "2", "worker-1"), ["--set-baseline", "worker-1"]),
     (("7", "3", "some.log"), ["--export-log", "some.log"]),
-    (("8", "1"), ["--status"]),
+    (("8", "1"), ["--status", "--live"]),
     (("8", "2", "abc123"), ["--stop", "abc123"]),
     (("8", "3"), ["--list-nodes"]),
 ])
@@ -128,7 +128,7 @@ def test_loop_runs_actions_and_returns_to_the_menu(capsys):
 
 def test_loop_reports_exit_code_and_survives_errors(capsys):
     def run(options):
-        if options == ["--status"]:
+        if options == ["--status", "--live"]:
             return 3
         raise SystemExit(2)
     ask = scripted("8", "1", "", "8", "3", "", "0")
@@ -137,7 +137,7 @@ def test_loop_reports_exit_code_and_survives_errors(capsys):
 
 
 def test_loop_invalid_choice_and_end_of_input(capsys):
-    ask = scripted("9", "")                                    # invalid, then the input ends
+    ask = scripted("a", "")                                    # invalid, then the input ends
     assert menu.run_menu(ask=ask, run=lambda o: 0, cluster=lambda: "c") == 0
     assert "Invalid choice." in capsys.readouterr().out
 

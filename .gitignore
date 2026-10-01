@@ -6,3 +6,9 @@ logs/*
 !logs/.gitkeep
 .logs/*
 !.logs/README.txt
+# saved screens and graph data (dashboard keys e / t / s): the folders stay, the content is not committed
+scr/*
+!scr/.gitkeep
+!scr/graphs/
+scr/graphs/*
+!scr/graphs/.gitkeep

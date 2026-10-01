@@ -56,6 +56,66 @@ def safe_cells(text: str) -> str:
     return text.replace("\ufe0f", "")
 
 
+def strip_ansi(text: str) -> str:
+    return _ANSI.sub("", text)
+
+
+def screen_dir() -> "Path":
+    """The folder for saved screens: <program folder>/scr (STRESS_TEST_SCREEN_DIR changes it - tests)."""
+    from pathlib import Path
+    forced = os.environ.get("STRESS_TEST_SCREEN_DIR", "").strip()
+    return Path(forced).expanduser() if forced else Path(__file__).resolve().parent.parent / "scr"
+
+
+def save_files(name: str, files: dict, subdir: str = "") -> list:
+    """Writes `files` ({".csv": text, ".json": text}) to the screen folder (or its sub-folder `subdir`, e.g. "graphs") as
+    `<name>-<date>_<time><ext>`; returns the paths ([] on failure)."""
+    from .paths import make_private_dir, open_private
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:60] or "data"
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    safe_sub = re.sub(r"[^A-Za-z0-9._-]", "_", subdir).lstrip(".")[:30]                # never "..": the folder stays inside scr/
+    folder = screen_dir() / safe_sub if safe_sub else screen_dir()
+    written = []
+    try:
+        make_private_dir(folder)
+        for suffix, text in files.items():
+            path, n = folder / f"{base}-{stamp}{suffix}", 1
+            while path.exists():
+                n += 1
+                path = folder / f"{base}-{stamp}-{n}{suffix}"
+            with open_private(path, "w") as fh:
+                fh.write(text)
+            written.append(path)
+    except OSError:
+        return []
+    return written
+
+
+def save_screen(lines: list, name: str, columns: int = 0, rows: int = 0) -> list:
+    """Saves the screen exactly as it is drawn, as plain text: `<name>-<date>_<time>-<columns>x<rows>.txt` (no colour codes, so it
+    reads the same everywhere). Returns the written paths ([] on a failed write, never raises)."""
+    from .paths import make_private_dir, open_private
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    size = f"-{columns}x{rows}" if columns and rows else ""
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40] or "screen"
+    folder = screen_dir()
+    written = []
+    try:
+        make_private_dir(folder)
+        for suffix, text in ((".txt", "\n".join(strip_ansi(line) for line in lines)),):
+            path = folder / f"{base}-{stamp}{size}{suffix}"
+            n = 1
+            while path.exists():                                   # two saves in one second
+                n += 1
+                path = folder / f"{base}-{stamp}{size}-{n}{suffix}"
+            with open_private(path, "w") as fh:
+                fh.write(text + "\n")
+            written.append(path)
+    except OSError:
+        return []
+    return written
+
+
 def visible_len(text: str) -> int:
     """Width in terminal cells (colour codes take none, emoji take two)."""
     return sum(w for _, w in _cells(_ANSI.sub("", text)))
@@ -162,6 +222,34 @@ def term_cols(stream=None) -> Optional[int]:
     except (OSError, ValueError, AttributeError):
         pass
     return None
+
+
+# --- terminal HEIGHT: the second axis of the layout (2026-10-01). The width decides the shape, the height how much is shown:
+# a tall window opens more of the screen (all cards, more events, the cluster totals) instead of scrolling.
+TALL_FROM = 40
+SHORT_BELOW = 24
+
+
+def term_rows(stream=None) -> Optional[int]:
+    """Lines of the terminal, read NOW. STRESS_TEST_LINES overrides it (tests); None = no terminal."""
+    raw = os.environ.get("STRESS_TEST_LINES", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    stream = stream or sys.stdout
+    try:
+        if stream.isatty():
+            rows = os.get_terminal_size(stream.fileno()).lines
+            return rows if rows > 0 else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def height_mode(rows: Optional[int]) -> str:
+    """'short' (< 24 lines), 'normal' or 'tall' (>= 40 lines: everything that fits is opened)."""
+    if rows is None:
+        return "normal"
+    return "short" if rows < SHORT_BELOW else "tall" if rows >= TALL_FROM else "normal"
 
 
 def adaptive() -> bool:
@@ -412,8 +500,29 @@ def panel(title: str, entries: list, on: bool, back: Optional[str] = None, width
     return lines
 
 
+def key_rows(keys: list, on: bool, room: int, compact: bool = False) -> list:
+    """The row(s) of the menu keys: `🔁 R ▸ repeat` (icon, key, name); entries are packed into as many rows as the width
+    needs, compact = only icon + key. `keys` are (key, name) or (key, name, icon)."""
+    parts = []
+    for item in keys:
+        key, name = item[0], item[1]
+        icon = f"{item[2]} " if len(item) > 2 and item[2] else ""
+        tail = "" if compact else f" {paint('▸', GREY, on)} {paint(name, BOLD, on)}"
+        parts.append(f"{icon}{paint(key, BOLD + ';' + YELLOW, on)}{tail}")
+    sep = "  " if compact else "   "
+    rows, current = [], ""
+    for part in parts:
+        trial = (current + sep + part) if current else part
+        if current and visible_len(safe_cells(trial)) > room:
+            rows.append(current)
+            current = part
+        else:
+            current = trial
+    return rows + ([current] if current else [])
+
+
 def menu_box(version: str, status: list, sections: list, keys: list, on: bool, width: int = WIDTH,
-             title: str = "K3S·STRESS", compact: bool = False) -> list:
+             title: str = "K3S·STRESS", compact: bool = False, extra: Optional[list] = None) -> list:
     """The main menu as one frame: header with the repo address above the version, status rows, sections of
     (key, icon, name, hint) items and a row of keys. Everything is cut to the terminal width."""
     room = width - 4
@@ -428,17 +537,20 @@ def menu_box(version: str, status: list, sections: list, keys: list, on: bool, w
              row(head + " " * max(1, room - visible_len(head) - visible_len(ver)) + ver)]
     lines += [row(item) for item in status]
     name_w = max((len(n) for _l, items in sections for _k, _i, n, _h in items), default=4)
+    key_w = max((len(k) for _l, items in sections for k, _i, _n, _h in items), default=1)
     for label, items in sections:
         lines.append(_rule("┣", "┫", on, width=width))
         lines.append(row(paint(label, GREY, on)))
         for key, icon, name, hint in items:
             hot = RED if name == "FULL" else BOLD
             tail = "" if compact else f"  {paint(hint, GREY, on)}"
-            lines.append(row(f"{paint(key, BOLD + ';' + YELLOW, on)} {paint('▸', GREY, on)} {icon} "
+            lines.append(row(f"{paint(key.rjust(key_w), BOLD + ';' + YELLOW, on)} {paint('▸', GREY, on)} {icon} "
                              f"{paint(name.ljust(name_w), hot, on)}{tail}"))
+    if extra:                                              # a tall window: tips, nodes ... under the items
+        lines.append(_rule("┣", "┫", on, width=width))
+        lines += [row(r) for r in extra]
     lines.append(_rule("┣", "┫", on, width=width))
-    lines.append(row("   ".join(f"{paint(k, BOLD + ';' + YELLOW, on)} {paint('▸', GREY, on)} {paint(n, BOLD, on)}"
-                                for k, n in keys)))
+    lines += [row(r) for r in key_rows(keys, on, room, compact)]
     lines.append(_rule("┗", "┛", on, width=width))
     return lines
 
@@ -680,8 +792,7 @@ def menu_box_wide(version: str, status: list, left: list, right: list, keys: lis
         b = fit(right[i], col) if i < len(right) else ""
         lines.append(row(a + " " * max(0, col - visible_len(a)) + sep + b))
     lines.append(_rule("┣", "┫", on, width=width))
-    lines.append(row("   ".join(f"{paint(k, BOLD + ';' + YELLOW, on)} {paint('▸', GREY, on)} {paint(n, BOLD, on)}"
-                                for k, n in keys)))
+    lines += [row(r) for r in key_rows(keys, on, room)]
     lines.append(_rule("┗", "┛", on, width=width))
     return lines
 
@@ -768,6 +879,7 @@ class LiveScreen:
     latest measurement, last events. Phases: the load (green bar) and the cooldown (snowflakes)."""
 
     EVENTS = 8
+    EVENTS_TALL = 60                            # a tall window (>= 40 lines) shows as many as fit
 
     def __init__(self, title: str, total: float = 0, stream=None) -> None:
         self.title = title
@@ -801,7 +913,7 @@ class LiveScreen:
             for part in line.split("\n"):
                 if part.strip("-= "):
                     self.events.append(part)
-            del self.events[:-self.EVENTS]
+            del self.events[:-self.EVENTS_TALL]
             if "▶" in line:
                 self.stage = line.split("]", 1)[-1].strip().lstrip("▶ ").strip()
         self.draw()
@@ -900,11 +1012,10 @@ class LiveScreen:
 
     def _event_rows(self) -> int:
         """How many event rows fit: the frame (13 rows without events) must stay lower than the terminal height."""
-        try:
-            rows = os.get_terminal_size(self.stream.fileno()).lines
-        except (OSError, ValueError, AttributeError):
+        rows = term_rows(self.stream)
+        if rows is None:
             return self.EVENTS
-        return max(2, min(self.EVENTS, rows - 16))
+        return max(2, min(self.EVENTS_TALL if height_mode(rows) == "tall" else self.EVENTS, rows - 16))
 
     def _lines(self) -> list:
         on, width = self.on, term_width(self.stream, 100)
@@ -1078,11 +1189,10 @@ class GpuScreen(LiveScreen):
         return "   ".join(out)
 
     def _event_rows(self) -> int:
-        try:
-            rows = os.get_terminal_size(self.stream.fileno()).lines
-        except (OSError, ValueError, AttributeError):
+        rows = term_rows(self.stream)
+        if rows is None:
             return self.EVENTS
-        return max(2, min(self.EVENTS, rows - 22))
+        return max(2, min(self.EVENTS_TALL if height_mode(rows) == "tall" else self.EVENTS, rows - 22))
 
     def _lines(self) -> list:
         on, width = self.on, term_width(self.stream, 100)
@@ -1107,6 +1217,7 @@ class MatrixScreen:
     """Live frame of the network matrix (--net-matrix): bar of the pairs, the grid fills in as the pairs finish."""
 
     EVENTS = 4
+    EVENTS_TALL = 40                            # a tall window (>= 40 lines) shows as many as fit
 
     def __init__(self, names: list, net_time: int, stream=None) -> None:
         self.names = list(names)
@@ -1135,7 +1246,7 @@ class MatrixScreen:
             for part in line.split("\n"):
                 if part.strip():
                     self.events.append(part)
-            del self.events[:-self.EVENTS]
+            del self.events[:-max(self.EVENTS, self.EVENTS_TALL)]
         self.draw()
 
     def prep(self, ready: int, total: int, text: str) -> None:
@@ -1214,8 +1325,10 @@ class MatrixScreen:
             grid.append(f"{ICON_NODE} {paint(f'[{i + 1}]', GREY, on)} " + paint(fit(name, label) + " " * max(0, label - len(name)), BOLD, on)
                         + "".join(self._cell(i, j, top) for j in range(len(self.names))))
         grid.append(paint("Mbit/s · row = client, column = server · * = capped on purpose", GREY, on))
-        shown = self.events[-self.EVENTS:]
-        events = [style_line(line) for line in shown] + [""] * (self.EVENTS - len(shown))
+        rows = term_rows(self.stream)
+        keep = self.EVENTS if rows is None or height_mode(rows) != "tall" else max(self.EVENTS, min(self.EVENTS_TALL, rows - (len(self.names) + 14)))
+        shown = self.events[-keep:]
+        events = [style_line(line) for line in shown] + [""] * (keep - len(shown))
         return box(f"{ICON_PING} NETWORK MATRIX · {len(self.names)} nodes · {self.net_time} s per pair",
                    [status, grid, events], on, width)
 

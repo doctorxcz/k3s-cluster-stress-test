@@ -84,8 +84,8 @@ def test_describe_state_variants():
 
 def test_format_row():
     info = LiveInfo(cpu=74.4, temp=71, freq=3591, stage=(3, 4, 75), has_sample=True)
-    row = format_row("dell-9020-sff-i7", info, None, 400)
-    assert row.startswith("dell-9020-sff-i7") and "▶ Stage 3/4 (75 %)" in row
+    row = format_row("worker-1", info, None, 400)
+    assert row.startswith("worker-1") and "▶ Stage 3/4 (75 %)" in row
     assert "CPU   74 %" in row and "71 °C" in row and "3591 MHz" in row and "left ~6 min 40 s" in row
     done = format_row("g2", LiveInfo(), 0, 100)
     assert "done: OK" in done and "left" not in done and "CPU      -" in done

@@ -8,6 +8,7 @@ into one report (text log + JSON + a framed verdict on the screen).
 from __future__ import annotations
 
 import argparse
+import os
 import dataclasses
 import json
 import logging
@@ -581,6 +582,38 @@ def choose_level(args: argparse.Namespace, ask: Callable) -> str:
         ui.warn("Invalid choice.")
 
 
+def _plan_run(args: argparse.Namespace, cli, level: str, chosen: list, subset: bool, with_master: bool,
+              directory: Path, phases: list) -> Optional[int]:
+    """--schedule for the self-test: a systemd timer (--persistent) or a detached waiting process. Returns the exit code
+    of the planning step, or None in the detached child, which goes on to run the self-test at the start time."""
+    import secrets
+    from . import background, schedule
+    names = ",".join(n.name for n in chosen)
+    title = f"FULL self-test ({level}) · {len(chosen)} node(s)"
+    if args.persistent:
+        argv = ["--self-test", "--self-test-level", level, "--self-test-ack", "--yes", "--non-interactive"]
+        argv += ["--nodes", names] if subset else (["--include-master"] if with_master else [])
+        if args.log_dir:
+            argv += ["--log-dir", str(args.log_dir)]
+        return cli._persist_plan(args, argv, title, names)
+    if not background.supported():
+        ui.emit("❌ Running in the background is not supported on this system (no fork).")
+        return cli.EXIT_ERROR
+    run_id = secrets.token_hex(3)
+    console = str(directory / "selftest-console.txt")
+    total = sum(p.seconds for p in phases)
+    pid = background.detach(console)
+    if pid:                                              # PARENT: prints the info and ends
+        cli._print_background_info(names, f"about {human(total)} in total", run_id, pid, str(directory), console, args.schedule)
+        sys.stdout.flush()
+        os._exit(0)
+    schedule.wait_registered(args.schedule, run_id, "cluster", total, str(directory), console, title,
+                             extra={"kind": "background", "profile": "selftest", "nodes": [n.name for n in chosen],
+                                    "log_dir": str(directory), "phase": "starting"})
+    args._selftest_run_id = run_id                          # the child goes on: its record already exists
+    return None
+
+
 def run(args: argparse.Namespace, kube: Optional[Kubectl] = None, ask: Optional[Callable] = None,
         runner: Callable[[list], int] = run_phase, waiter: Optional[Callable] = None) -> int:
     """--self-test: asks, confirms twice, runs all phases and writes the report. Returns an exit code."""
@@ -628,7 +661,20 @@ def run(args: argparse.Namespace, kube: Optional[Kubectl] = None, ask: Optional[
     if not confirm(args, ask, phases, level, chosen):
         ui.emit("Cancelled, nothing was started.")
         return 0
+    if getattr(args, "schedule", None):                 # planned: the confirmations were given now, the run starts later
+        planned = _plan_run(args, cli, level, chosen, subset, with_master, directory, phases)
+        if planned is not None:
+            return planned
     started = time.time()
+    run_id = getattr(args, "_selftest_run_id", "")
+    if not run_id:                                           # in the foreground: the status screen of another terminal can see it
+        import secrets
+        from . import background as _bg
+        run_id = secrets.token_hex(3)
+        _bg.register(run_id, "cluster", sum(p.seconds for p in phases), str(directory), "",
+                     title=f"FULL self-test ({level}) · {len(chosen)} node(s)",
+                     extra={"kind": "foreground", "profile": "selftest", "nodes": [n.name for n in chosen],
+                            "log_dir": str(directory), "phase": "starting"})
     waiter = waiter or (lambda idle: cool_wait(kube, chosen, idle, ui.emit))
     idle: dict = {}
     try:
@@ -640,11 +686,15 @@ def run(args: argparse.Namespace, kube: Optional[Kubectl] = None, ask: Optional[
     try:
         for index, phase in enumerate(phases, 1):
             ui.emit(f"\n{ui.ICON_STAGE} PHASE {index}/{len(phases)}: {phase.title}")
+            from . import background as _bg
+            _bg.update(run_id, phase=f"{index}/{len(phases)} {phase.title}", phase_no=index, phases=len(phases),
+                       phase_key=phase.key, phase_started=time.time())
             codes[phase.key] = runner(phase.argv)
             if codes[phase.key] == cli.EXIT_INTERRUPTED:
                 ui.emit("🛑 Interrupted - the report is built from what has finished.")
                 break
             if index < len(phases):
+                _bg.update(run_id, phase=f"cooling pause after phase {index}/{len(phases)}")
                 why = waiter(idle)
                 ui.emit(f"{ui.ICON_COOL} Cooling pause finished ({why}).")
     except KeyboardInterrupt:
@@ -665,4 +715,6 @@ def run(args: argparse.Namespace, kube: Optional[Kubectl] = None, ask: Optional[
                    "nodes": {n: {**r.__dict__, "verdict": r.verdict} for n, r in reports.items()}}, fh, indent=1, default=str)
     print("\n" + "\n".join(framed_verdict(reports, lines, ui.color_enabled())))
     ui.emit(f"\n📁 Report: {log_path}\n📄 {json_path}")
+    from . import background as _bg
+    _bg.unregister(run_id)
     return 0 if all(r.verdict != "FAIL" for r in reports.values()) else cli.EXIT_ERROR

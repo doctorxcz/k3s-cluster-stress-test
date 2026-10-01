@@ -14,7 +14,7 @@ NET_UDP_MBIT = 100                       # Mbit/s of the UDP test (jitter / loss
 PING_COUNT, PING_INTERVAL = 50, 0.2      # 10 s
 MTU_JOB_SECONDS = 2
 # The nodes' firewalls (ufw) let in only the Kubernetes NodePort range from other machines - on the live cluster
-# dell-9020 and hp-g2-celeron drop every other port - so iperf3 uses a port from the top of 30000-32767.
+# some nodes drop every other port - so iperf3 uses a port from the top of 30000-32767.
 PORT_BASE = 32000
 PORT_SPAN = 700
 NET_DIR_NOTE = "iperf3 server listening"

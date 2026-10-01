@@ -182,9 +182,9 @@ def test_node_names_are_validated(name):
 
 
 def test_good_node_names_still_work():
-    p = cli.build_parser().parse_args(["--node", "hp-prodesk-400-g6-master", "--net-peer", "dell-9020-sff-i7",
+    p = cli.build_parser().parse_args(["--node", "control-plane-node-00001", "--net-peer", "worker-1",
                                        "--net-watch", "node.example.com", "--nodes", "a,b-1,c.d"])
-    assert p.node == "hp-prodesk-400-g6-master" and p.net_watch == "node.example.com"
+    assert p.node == "control-plane-node-00001" and p.net_watch == "node.example.com"
     assert cli.build_parser().parse_args(["--net-watch"]).net_watch == "auto"
 
 
@@ -444,7 +444,7 @@ def test_baseline_from_a_forged_log_cannot_write_outside_the_baseline_folder(tmp
 def test_baseline_path_refuses_bad_node_names(tmp_path):
     with pytest.raises(ValueError):
         baseline.baseline_path(tmp_path, "../x")
-    assert baseline.baseline_path(tmp_path, "hp-705-g4-a10").name == "hp-705-g4-a10.json"
+    assert baseline.baseline_path(tmp_path, "worker-4").name == "worker-4.json"
     assert baseline.load_baseline(tmp_path, "../x") is None
 
 

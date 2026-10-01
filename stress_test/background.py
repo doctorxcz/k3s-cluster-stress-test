@@ -57,18 +57,34 @@ def _record_path(run_id: str) -> Path:
 
 
 def register(run_id: str, node: str, duration: int, log_path: Optional[str],
-             console_path: str) -> None:
-    """Writes a record about a running test (called from the detached process)."""
+             console_path: str, scheduled_at: Optional[float] = None, title: str = "", extra: Optional[dict] = None) -> None:
+    """Writes a record about a running test (every test: detached, in the foreground, a series, the FULL self-test).
+    `extra` adds what the live status screen needs: kind (background / foreground), profile, nodes, log_dir, phase."""
     try:
         make_private_dir(running_dir())
+        record = {
+            "run_id": run_id, "pid": os.getpid(), "node": node,
+            "duration": duration, "started": time.time(),
+            "log": log_path, "console": console_path,
+            "scheduled_at": scheduled_at, "title": title,     # a plan that still waits for its start time
+        }
+        record.update(extra or {})
         with open_private(_record_path(run_id), "w") as fh:
-            fh.write(json.dumps({
-                "run_id": run_id, "pid": os.getpid(), "node": node,
-                "duration": duration, "started": time.time(),
-                "log": log_path, "console": console_path,
-            }))
+            fh.write(json.dumps(record))
     except OSError:
         log.warning("Could not write the record of the running test", exc_info=True)
+
+
+def update(run_id: str, **fields) -> None:
+    """Changes fields of an existing record (e.g. the phase of the FULL self-test)."""
+    try:
+        path = _record_path(run_id)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.update(fields)
+        with open_private(path, "w") as fh:
+            fh.write(json.dumps(record))
+    except (OSError, ValueError):
+        pass
 
 
 def unregister(run_id: str) -> None:
@@ -132,9 +148,16 @@ def format_running(records: list[dict], now: Optional[float] = None) -> str:
     now = time.time() if now is None else now
     lines = ["Background tests:"]
     for r in records:
+        if r.get("scheduled_at") and r["scheduled_at"] > now:
+            lines.append(f"  {r['run_id']}  node {r['node']}  PID {r['pid']}  PLANNED for "
+                         f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(r['scheduled_at']))}"
+                         f" (in {format_duration(int(r['scheduled_at'] - now))})"
+                         + (f"  {r['title']}" if r.get("title") else ""))
+            lines.append(f"      cancel:  ./stress.sh --stop {r['run_id']}")
+            continue
         elapsed = max(int(now - r["started"]), 0)
         lines.append(
-            f"  {r['run_id']}  node {r['node']}  PID {r['pid']}  "
+            f"  {r['run_id']}  node {r['node']}  PID {r['pid']}  {'(foreground) ' if r.get('kind') == 'foreground' else ''}"
             f"running {format_duration(elapsed)} of {format_duration(r['duration'])} "
             f"(+ preparation)")
         if r.get("log"):

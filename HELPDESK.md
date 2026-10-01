@@ -106,8 +106,8 @@ the machine.
 >
 > Example with `ufw` (run on each node that has a firewall, replace the subnet with yours):
 > ```bash
-> sudo ufw allow from 192.168.1.0/24 to any port 30000:32767 proto tcp
-> sudo ufw allow from 192.168.1.0/24 to any port 30000:32767 proto udp
+> sudo ufw allow from 10.0.0.0/24 to any port 30000:32767 proto tcp
+> sudo ufw allow from 10.0.0.0/24 to any port 30000:32767 proto udp
 > sudo ufw status
 > ```
 > That range is normally already open on a k3s/Kubernetes node (NodePort Services need it), so on many
@@ -156,6 +156,43 @@ master/control-plane nodes are protected automatically.
 ---
 
 ## Common issues
+
+### Cluster dashboard (key `D` in the menu, `--dashboard`)
+- **"needs a terminal"**: the dashboard reads keys without Enter, run it in a real terminal (not in a pipe or a script).
+- **A node shows `probe did not start`**: its probe pod did not become Ready in 90 s (image pull, node busy or down); the node is still listed from the
+  Kubernetes API, only the live values (CPU, temperature, ...) are missing. The probes are `busybox` pods with `/sys` mounted read-only.
+- **GPU column shows `?` or `GPU ?`**: the `nvidia-smi` probe needs the NVIDIA runtime (the same setup as for the GPU test, see the GPU section).
+- **Probe pods remain after a crash**: they end by themselves after an hour; remove them with `kubectl delete pod -l app=stress-test-dashboard`.
+- **Fast refresh (0.5 s / 1 s) feels slow or jumpy**: a round (one probe per node) takes a few tenths of a second, so the real rate is limited by it; the interval is
+  start to start. The probes are read-only and light, but every round starts `kubectl exec` per node - use 2 s or more on a slow link.
+- **`n/a (no metrics-server)` in the big dashboard**: the cluster has no metrics-server, only the measured values (CPU %, RAM) are shown, `kubectl top` ones are missing.
+- **The table is cut / has few columns**: it adapts to the window width - widen the window (91-160 columns and over 160 show more). A tall window (40 lines or more)
+  opens more blocks under the table instead of scrolling. `v` changes the view (temperatures, network, disks, GPU) with other columns, `?` lists every key.
+- **I cannot find a node**: `/` filters by a part of the name, `f` shows only problems / workers / GPU nodes, `c` clears it all; `o` sorts by temperature, CPU, RAM, pods or GPU.
+- **The log of a pod is empty (`l` ▸ Enter)**: the pod has not started or has no output yet; it is read with `kubectl logs --tail=200` every 2 s, read only.
+- **The graph is empty or short**: the history is kept only while the dashboard runs (up to an hour at 1 s). `[` `]` change the window, `b` switches blocks / Braille dots.
+  If the Braille dots show as boxes, stay with the blocks (the default). `x` draws all quantities over each other, each in the scale of its own range.
+- **Where did `e`, `t` and `s` save?** In the `scr/` folder of the program (`scr/graphs/` for graphs): `e` = the screen as text, `t` = all the graphs as a text report,
+  `s` = the data as CSV and JSON. Open them on a server: `less file.txt` or `batcat file.txt`; CSV: `column -s, -t < file.csv | less -S`, or `sudo apt install csvkit` and
+  `csvlook file.csv | less -S`, or `sudo apt install visidata` and `vd file.csv`; JSON: `jq . file.json | less` (`sudo apt install jq`) or `python3 -m json.tool file.json`.
+  The folder is created on the first save; `STRESS_TEST_SCREEN_DIR` moves it.
+
+### Live status (key `W`, `--status --live`)
+- **"needs a terminal"**: it reads keys without Enter - run it in a real terminal; in a pipe `--status --live` prints the plain list.
+- **A test I started in another terminal is missing**: tests are listed from the registry `.logs/running/` of the project folder the test was started from; a test of a
+  parallel subprocess is shown by its series. A finished test disappears at once.
+- **A narrow window shows cards instead of a table**: under 60 columns every test is a card (scroll with `j` `k`); widen the window for the table, or make it taller
+  to open all the cards.
+- **`x` did not stop the test**: it asks first (`y`) and sends the same graceful stop as `--stop`; a test that is still cleaning its pod says so, check again with `--status`.
+
+### Planned tests (`9 SCHEDULE`, `--schedule`)
+- **The plan is gone after a restart:** a plain plan is a waiting process and does not survive a restart of the computer. Plan with *"survive a restart"*
+  (menu `T` asks when systemd is available) or `--schedule … --persistent`: it becomes a systemd **user** timer (`~/.config/systemd/user/stress-test-<id>.timer`).
+- **A persistent test did not start while I was logged out:** run once `sudo loginctl enable-linger $USER` (the tool warns when linger is off).
+  Check: `systemctl --user list-timers | grep stress-test`, the output of a run: `journalctl --user -u stress-test-<id>.service`.
+- **Cancel a plan:** `9 SCHEDULE` ▸ cancel, or `./stress.sh --stop <id>` (works for both kinds); list: `./stress.sh --scheduled`.
+- **The test was refused at the start:** the tool computer must reach the cluster, and a node with another test of the tool refuses a second one - see the
+  log of the planned test (`logs/<day>/`, or `journalctl --user -u …` for a timer).
 
 ### GPU test (`--profile gpu`, menu `2 GPU`)
 

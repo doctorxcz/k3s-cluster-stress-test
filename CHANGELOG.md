@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.17.0 - 2026-10-01
+- **Dashboard (`D`, `--dashboard`):** a live overview of every node in three widths (up to 90 / 91-160 / over 160 columns), refresh 0.5 - 30 s, read-only probe pods that
+  exist only while it is open. New keys: `o` sort, `/` filter, `f` show (problems / workers / gpu), `v` views (temperatures, network, disks, GPU), `l` pods and the end of a pod log
+  (names checked, control characters removed), `?` help, `Tab` in every width; the CPU line says `4 cores / 8 threads (hyper-threading)` (physical cores counted apart from threads).
+- **Fine graphs (`g` in the dashboard):** blocks by default, Braille dots with `b`; axes, the 80 °C limit (red above it), min-max bands, windows 1 min - all, moving in time, a cursor
+  that reads the values of one moment, a combined graph (`x`), `now / min / max / avg` above every graph in the colour of the line. `t` saves all the graphs as a text report
+  (`cat` / `less` / `batcat`), `s` saves the data as CSV and JSON, `e` saves the screen as text - everything in `scr/` (`scr/graphs/` for graphs), files private.
+- **Live status (`W`, `--status --live`):** every running and planned test refreshed every second, with the details of its kind (GPU only GPU, CPU CPU / RAM / clock, disk and network
+  jobs and results, multi-node and FULL a table of nodes with the phase), `x` stops a test (asks first). Tests in the foreground and the FULL self-test are now registered too,
+  so they can be watched from a second terminal; `--status` marks them `(foreground)`.
+- **Height-aware layout:** a tall window (40 lines or more) opens everything that fits instead of scrolling (status cards, dashboard blocks, menu tips and nodes, up to 60 events of a
+  running test, a block per node under the parallel table); narrow windows get cards stacked downwards.
+- **Scheduling (`9 SCHEDULE`, key `T`, `--schedule`, `--persistent`):** any test can be planned - a waiting process or a systemd user timer that survives a restart.
+- **Numbered choices:** menu 7 (compare / baseline / export) shows the nodes with logs and the newest logs numbered (compare asks "First number" and "Second number"); stopping a test, the
+  default node and cancelling a plan also take numbers from a printed list.
+- **Fixes:** the network matrix could fail on an event line; the dashboard survived odd quantities (`10M`) from the cluster; a test of Ctrl+C no longer depends on how it was started.
+
 ## 1.16.0 - 2026-10-01
 - **GPU test (NVIDIA, 2026-10-01):** `--profile gpu` (main menu `2 GPU`) burns one NVIDIA GPU with gpu-burn in a pod with `runtimeClassName: nvidia`
   and `nvidia.com/gpu: 1` (not privileged, no hostPath) and reads `nvidia-smi` every interval: temperature, utilization, SM clock, power

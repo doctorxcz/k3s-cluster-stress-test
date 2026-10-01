@@ -6,7 +6,7 @@ from stress_test.compare import (CompareError, compare_files, compare_runs,
 from stress_test.logparse import parse_log, read_log
 
 
-def make_log(temps_test, temps_cool, node="dell-9020-sff-i7", started="2026-09-20 20:10:48",
+def make_log(temps_test, temps_cool, node="worker-1", started="2026-09-20 20:10:48",
              duration="5 min (300 s)", baseline=41, ops=(2646.7, 11155.6), freq=3591,
              clock=(20, 15, 0), step=5, notes="", summary=True, old_format=False):
     """Text of a result log in the English format (or an old one, test phase only)."""
@@ -51,7 +51,7 @@ COOL_COOL = [52, 51, 50, 49, 48, 48, 47, 47, 46, 46, 45, 45]
 
 def test_parse_log_reads_header_samples_baseline_and_metrics():
     run = parse_log(make_log(HOT, HOT_COOL, notes="before cleaning"), "a.log")
-    assert run.node == "dell-9020-sff-i7" and run.started == "2026-09-20 20:10:48"
+    assert run.node == "worker-1" and run.started == "2026-09-20 20:10:48"
     assert run.duration_text == "5 min (300 s)" and run.notes == "before cleaning"
     assert run.baseline_temp == 41
     assert [(m.name, m.ops_per_s) for m in run.metrics] == [("cpu", 2646.7), ("matrix", 11155.6)]
@@ -90,7 +90,7 @@ def test_parse_log_rejects_foreign_text():
 def test_read_log_from_file(tmp_path):
     f = tmp_path / "a.log"
     f.write_text(make_log(HOT, HOT_COOL), encoding="utf-8")
-    assert read_log(f).node == "dell-9020-sff-i7"
+    assert read_log(f).node == "worker-1"
 
 
 # ---------------- comparison -------------------------------------------------------------------
@@ -136,7 +136,7 @@ def test_compare_small_changes_are_not_rated():
 
 
 def test_compare_warns_about_incomparable_runs():
-    a, b = _runs(node="hp-g2-celeron", baseline=30, temps_cool=[], ops=(600.0, 1400.0))
+    a, b = _runs(node="worker-3", baseline=30, temps_cool=[], ops=(600.0, 1400.0))
     text = "\n".join(compare_runs(a, b, warn_temp=80))
     assert "Watch out when comparing:" in text
     assert "different nodes" in text and "The idle temperature differs" in text
@@ -170,14 +170,14 @@ def _touch(dirpath, *names):
 
 
 def test_latest_logs_for_node_sorted_by_timestamp(tmp_path):
-    _touch(tmp_path, "dell-9020-sff-i7-300s-2026-09-20_20-10-48.log",
-           "dell-9020-sff-i7-60s-2026-09-19_10-00-00.log",
-           "dell-9020-sff-i7-300s-2026-09-21_18-00-00.log",
-           "hp-g2-celeron-120s-2026-09-22_10-00-00.log",
-           "dell-9020-sff-i7-extra-300s-2026-09-23_10-00-00.log")
-    found = latest_logs_for_node("dell-9020-sff-i7", tmp_path)
-    assert [f.name for f in found] == ["dell-9020-sff-i7-300s-2026-09-20_20-10-48.log",
-                                       "dell-9020-sff-i7-300s-2026-09-21_18-00-00.log"]
+    _touch(tmp_path, "worker-1-300s-2026-09-20_20-10-48.log",
+           "worker-1-60s-2026-09-19_10-00-00.log",
+           "worker-1-300s-2026-09-21_18-00-00.log",
+           "worker-3-120s-2026-09-22_10-00-00.log",
+           "worker-1-extra-300s-2026-09-23_10-00-00.log")
+    found = latest_logs_for_node("worker-1", tmp_path)
+    assert [f.name for f in found] == ["worker-1-300s-2026-09-20_20-10-48.log",
+                                       "worker-1-300s-2026-09-21_18-00-00.log"]
 
 
 def test_resolve_logs_by_node_by_names_and_errors(tmp_path):
@@ -199,7 +199,7 @@ def test_resolve_logs_by_node_by_names_and_errors(tmp_path):
 # ---------------- real log of the dell from version 1.4.0 --------------------------------------------------
 
 REAL_DELL_LOG = """=== KUBERNETES STRESS-NG LOG ===
-Node: dell-9020-sff-i7
+Node: worker-1
 Started: 2026-09-20 20:10:48
 Test duration: 5 min (300 s)
 Notes: test
@@ -230,7 +230,7 @@ Cooldown (61 s):          82 → 55 °C (-27 °C, 26.5 °C/min)
 def test_real_dell_log_from_1_4_0_is_readable_and_gives_both_cooling_metrics():
     from stress_test.summary import cooldown_phases
     run = parse_log(REAL_DELL_LOG, "dell.log")
-    assert run.node == "dell-9020-sff-i7" and run.baseline_temp == 41
+    assert run.node == "worker-1" and run.baseline_temp == 41
     assert [(m.name, m.ops_per_s) for m in run.metrics] == [("cpu", 2646.7), ("matrix", 11155.6)]
     test = [s for s in run.samples if s.phase == "test"]
     cool = [s for s in run.samples if s.phase == "cooldown"]

@@ -27,12 +27,16 @@ MENU_ITEMS = [
     ("6", "FULL", "self-test of the whole cluster · one report"),
     ("7", "DATA", "compare · baseline · export"),
     ("8", "ADMIN", "what runs · stop · nodes"),
+    ("9", "SCHEDULE", "planned tests · plan · cancel"),
 ]
-ICONS = {"1": "⚡", "3": "💾", "4": "📡", "5": "🚀", "7": "📊", "8": "🔧", "6": "🧪", "2": "🎮"}
-SECTIONS = (("TESTS", "12345"), ("CLUSTER", "678"))      # the order on the screen (keys of MENU_ITEMS)
-KEYS = [("R", "repeat"), ("S", "settings"), ("?", "help"), ("Q", "quit")]      # 0 quits as well
-KEYS_COMPACT = [("R", "rep"), ("S", "set"), ("?", "help"), ("Q", "quit")]
-KEYS_WIDE = [("R", "repeat the last action"), ("S", "settings"), ("?", "help and docs"), ("Q", "quit (0 works too)")]
+ICONS = {"1": "⚡", "3": "💾", "4": "📡", "5": "🚀", "7": "📊", "8": "🔧", "6": "🧪", "2": "🎮", "9": "🕒"}
+SECTIONS = (("TESTS", ("1", "2", "3", "4", "5")), ("CLUSTER", ("6", "7", "8", "9")))      # the order on the screen (keys of MENU_ITEMS)
+# the keys row: (key, name, icon) - the icon tells at a glance what a key does (all of them are emoji of a safe width)
+KEYS = [("R", "repeat", "🔁"), ("S", "settings", "🧰"), ("T", "start time", "⏰"), ("D", "dashboard", "📺"),
+        ("W", "watch", "🔭"), ("?", "help", "❓"), ("Q", "quit", "🚪")]                                                                   # 0 quits as well
+KEYS_COMPACT = KEYS
+KEYS_WIDE = [("R", "repeat the last action", "🔁"), ("S", "settings", "🧰"), ("T", "start time", "⏰"),
+             ("D", "dashboard", "📺"), ("W", "watch tests", "🔭"), ("?", "help and docs", "❓"), ("Q", "quit (0 works too)", "🚪")]
 WIDE_HINTS = {
     "1": "classic · stepped 25/50/75/100 % · spike: temperatures, clock, throttling",
     "3": "fio benchmark (MB/s, IOPS, latency) · SMART health of the disks",
@@ -41,6 +45,7 @@ WIDE_HINTS = {
     "7": "compare two tests · set a baseline · export a log to JSON / CSV",
     "8": "what is running · stop a test · list nodes (role, state)",
     "2": "NVIDIA GPU burn (gpu-burn): GPU temperature, clocks, throttling · stop limit selectable",
+    "9": "planned tests: list what waits for its start, plan a test for later (in 2 h / at 22:30 / on a date), cancel a plan",
     "6": "whole cluster: network → disks → CPU → RAM, cooling pauses, one report (~35 min)",
 }
 COMPACT_BELOW, WIDE_FROM, WIDE_MAX = 60, 100, 200      # terminal columns: compact < 60 <= normal < 100 <= wide (menu up to 200)
@@ -183,6 +188,87 @@ def gpu_dialog(ask: Callable, scanner: Optional[Callable] = None) -> Optional[li
     return options
 
 
+def start_time_dialog(ask: Callable, now: Optional[float] = None) -> Optional[dict]:
+    """T: when does the next test start? Returns {"epoch", "persistent"}, {} = start immediately (plan cleared), None = back."""
+    from . import schedule
+    prompts = (("Start in (e.g. 30m, 2h, 1h30m)", "1h"), ("Start at a clock time (e.g. 22:30; today, or tomorrow when passed)", "22:30"),
+               ("Start on a date and time (e.g. 2026-10-03 02:00, 3.10. 02:00)", ""))
+    i = _choose(ask, "Start time", [("in…", "a time from now"), ("at…", "a clock time"), ("on a date…", "a day and a time"),
+                                    ("now", "no plan - the next test starts at once")])
+    if i is None:
+        return None
+    if i == 3:
+        ui.emit("✅ The next test starts immediately.")
+        return {}
+    question, default = prompts[i]
+    while True:
+        raw = ask(question, default).strip()
+        try:
+            epoch = schedule.parse_start(raw, now)
+            break
+        except ValueError as exc:
+            ui.warn(str(exc))
+    persistent = False
+    if schedule.systemd_available():
+        persistent = ask("Should the plan survive a restart of this computer? (y/n - kept as a systemd timer; n = a waiting "
+                         "process)", "n").strip().lower() in ("y", "yes")
+    ui.emit(f"🕒 The next test starts {schedule.describe_when(epoch, now)}" + (" (systemd timer)" if persistent else "") + ".")
+    return {"epoch": epoch, "persistent": persistent}
+
+
+def schedule_options(pending: dict) -> list:
+    """Options that turn an ordinary action into a planned one."""
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pending["epoch"]))
+    return ["--schedule", when, "--persistent" if pending.get("persistent") else "--background"]
+
+
+PLANNABLE = ("1", "2", "3", "4", "5", "6")           # CPU, GPU, DISK, NET, QUICK, FULL
+
+
+def planner(ask: Callable, run: Callable, pending_box: dict) -> None:
+    """9 SCHEDULE: the list of planned tests with 'plan a test' and 'cancel a plan'."""
+    from . import schedule
+    while True:
+        plans = schedule.list_plans()
+        on = ui.color_enabled()
+        rows = ([ui.paint("Nothing is scheduled.", ui.GREY, on)] if not plans else
+                [f"{ui.paint(str(n).rjust(2), ui.BOLD + ';' + ui.YELLOW, on)}  {p['id']}  {schedule.describe_when(p['start_at'])}  {p['title']}"
+                 + ("  🔁 systemd" if p["kind"] == "systemd" else "") + ("  ▶ running" if p["state"] == "running" else "")
+                 for n, p in enumerate(plans, 1)])
+        print("\n" + "\n".join(ui.box(f"{ICONS['9']} SCHEDULE", [rows], on, ui.panel_width())))
+        entries = [("Plan a test", "set the start time, then choose the test")]
+        if plans:
+            entries.append(("Cancel a plan", "by its number or id"))
+        i = _choose(ask, "Planner", entries)
+        if i is None:
+            return
+        if i == 1:
+            from . import catalog
+            target = catalog.pick(ask("Plan number or id to cancel (0 = back)", ""), [p["id"] for p in plans])
+            if target and target != BACK:
+                ok, message = schedule.cancel(target)
+                ui.emit(("✅ " if ok else "❌ ") + message)
+            continue
+        when = start_time_dialog(ask)
+        if not when:
+            continue
+        j = _choose(ask, "Which test?", [("CPU", "classic · stepped · spike"), ("GPU", "NVIDIA burn"), ("DISK", "fio · SMART"),
+                                         ("NET", "one node · matrix"), ("QUICK", "10 min"), ("FULL", "self-test of the cluster")])
+        if j is None:
+            continue
+        options = build_action(PLANNABLE[j], ask)
+        if options is None:
+            continue
+        options = apply_settings(options, {"node": "", "max_temp": 0}) + schedule_options(when)
+        ui.emit(f"\n▶ {command_text(options)}   (the rest is asked below)\n")
+        try:
+            run(options)
+        except SystemExit:
+            pass
+        except KeyboardInterrupt:
+            print("\n🛑 Interrupted.")
+
+
 def _words(text: str) -> list:
     return [w for w in text.replace(",", " ").split() if w]
 
@@ -222,12 +308,24 @@ def build_action(choice: str, ask: Callable) -> Optional[list]:
             ("export a log to JSON/CSV", "a log, or a node = its newest test")])
         if i is None:
             return None
+        from . import catalog
+        entries = catalog.show(user_log_root())                  # nodes with logs + the numbered newest logs to choose from
         if i == 0:
-            words = _words(ask("Two logs (older newer), or one node name", ""))
-            return ["--compare", *words] if words else None
-        word = ask("Log file or node name", "").strip()
+            first = ask("First number (from the list), a log file, or a node name (= its two newest tests)", "").strip()
+            if not first:
+                return None
+            if len(_words(first)) > 1:                                      # both typed at once (the old way): "n1 n2", "3 1"
+                return ["--compare", *catalog.order_pair(_words(first), entries)]
+            if not first.isdigit() and not catalog.looks_like_log(first):   # a node name: its two newest tests, no second question
+                return ["--compare", first]
+            second = ask("Second number (from the list) or a log file", "").strip()
+            if not second:
+                return None
+            return ["--compare", *catalog.order_pair([first, second], entries)]
+        word = ask("Number from the list, log file or node name", "").strip()
         if not word:
             return None
+        word = catalog.resolve([word], entries)[0]
         return ["--set-baseline", word] if i == 1 else ["--export-log", word]
     if choice == "6":
         return ["--self-test"]
@@ -239,9 +337,12 @@ def build_action(choice: str, ask: Callable) -> Optional[list]:
         if i is None:
             return None
         if i == 0:
-            return ["--status"]
+            return ["--status", "--live"]
         if i == 1:
-            target = ask("Run id, node or PID", "").strip()
+            from . import catalog
+            recs = catalog.running_entries()
+            print("\n" + "\n".join(catalog.running_lines(recs, ui.color_enabled(), ui.panel_width())))
+            target = catalog.pick(ask("Number from the list, run id, node or PID", ""), [r["run_id"] for r in recs])
             return ["--stop", target] if target else None
         return ["--list-nodes"]
     return None
@@ -324,7 +425,7 @@ def status_rows(state: dict, kube=None, on: bool = False) -> list:
         from .kube import Kubectl
         busy = [p for p in (kube or Kubectl()).list_tool_pods() if p.phase not in ("Succeeded", "Failed")]
         if busy:
-            rows.append(ui.paint(f"🟡 a test is running now ({len(busy)} pods of the tool) - 6 ▸ ADMIN shows it", ui.YELLOW, on))
+            rows.append(ui.paint(f"🟡 a test is running now ({len(busy)} pods of the tool) - 8 ▸ ADMIN shows it", ui.YELLOW, on))
     except Exception:                                    # noqa: BLE001
         pass
     try:
@@ -346,10 +447,13 @@ def status_rows(state: dict, kube=None, on: bool = False) -> list:
 # an entry is a text, or (label, text): the text is wrapped under the label
 HELP_PAGES = [
     ("KEYS", [
-        "1-8: open the entry. It only builds the usual command line (printed as ▶ ./stress.sh ...) and runs the "
+        "1-9: open the entry. It only builds the usual command line (printed as ▶ ./stress.sh ...) and runs the "
         "normal program, which asks the rest.",
         ("R", "repeat the last action exactly as it ran."),
         ("S", "settings: default node, temperature limit, live frames."),
+        ("T", "start time of the NEXT test (in 2 h, at 22:30, on a date); the test you choose afterwards is planned."),
+        ("D", "the live cluster dashboard (every node at a glance, three widths)."),
+        ("W", "watch the running tests: a live screen (every second) with the details of each kind - GPU, CPU, disk, network, FULL; x stops one."),
         ("?", "this help.     Q = quit (0 works too).     Ctrl+C stops a running test safely (its pods are deleted)."),
         "Everything the menu does can also be typed as options: ./stress.sh --help",
     ]),
@@ -389,6 +493,22 @@ HELP_PAGES = [
         ("levels", "quick ~15 min, standard ~35 min, thorough ~70 min (for a few nodes)."),
         ("warning", "everything runs at full power: the cluster is NOT usable meanwhile, the power draw and "
                     "the room temperature rise. Two confirmations are asked. The master is optional (default: no)."),
+    ]),
+    ("📺 D DASHBOARD", [
+        "Key D: a live overview of every node (a small k9s): CPU, temperature, clock, RAM, power, GPU, network, ping between nodes, pods, "
+        "events, the running and planned tests. Three widths - up to 90 columns a compact table, 91-160 more columns and a detail block "
+        "of the selected node, wider the whole screen with history graphs and panels; resizing the window redraws it.",
+        ("keys", "↑↓ select · Tab detail (overview / pods / events) · Enter detail page · +/- refresh interval · p pause · r refresh · q back."),
+        ("read-only", "one tiny unprivileged probe pod per node (and one for nvidia-smi on a GPU node) exists only while the dashboard "
+                      "is open and is removed when you leave; nothing is loaded."),
+    ]),
+    ("🕒 9 SCHEDULE", [
+        "Planned tests. Press T first (or use 9 ▸ 1) to set WHEN the next test starts: in a given time (30m, 2h), at a clock time "
+        "(22:30 = today, or tomorrow when it has passed) or on a date (2026-10-03 02:00, 3.10. 02:00). Then choose any test "
+        "(1-6) and answer its questions as usual - it is planned instead of started.",
+        ("how it waits", "by default a detached process waits for the start (closing the terminal does not matter, a restart of "
+                         "this computer does). With systemd you can choose 'survive a restart': the plan becomes a systemd user timer."),
+        ("cancel", "9 ▸ 2 and the plan id (or ./stress.sh --stop ID). ./stress.sh --scheduled lists the plans."),
     ]),
     ("📊 7 DATA", [
         ("compare", "two test logs side by side (or a node name = its two newest tests)."),
@@ -488,7 +608,12 @@ def settings_screen(ask: Callable, state: dict) -> None:
         if raw in (BACK, ""):
             return
         if raw == "1":
-            cfg["node"] = ask("Default node name (Enter = ask every time)", cfg["node"]).strip()
+            from . import catalog
+            names = [n for n, _m, _r in _NODES_CACHE]
+            shown = catalog.nodes_lines(list(_NODES_CACHE), None, on, ui.panel_width())
+            if shown:
+                print("\n" + "\n".join(shown))
+            cfg["node"] = catalog.pick(ask("Default node: number from the list or a name (Enter = ask every time)", cfg["node"]), names)
         elif raw == "2":
             value = ask("Temperature limit in °C (40-95, 0 = default)", str(cfg["max_temp"])).strip()
             cfg["max_temp"] = int(value) if value.isdigit() and (value == "0" or 40 <= int(value) <= 95) else cfg["max_temp"]
@@ -521,15 +646,16 @@ def menu_mode(cols: int) -> str:
 
 def _wide_columns(names: dict, on: bool, temps: Optional[dict], col: int = 66) -> tuple:
     """The two columns of the wide menu: TESTS + tips | CLUSTER + nodes. Long hints are wrapped under the name."""
-    indent = 14                                          # cells of "7 ▸ 🧪 FULL   " (the emoji takes two)
+    name_w = max(6, max(len(v[0]) for v in names.values()))
+    indent = 9 + name_w                                  # cells of " 7 ▸ 🧪 FULL   " (the emoji takes two)
 
     def items(keys) -> list:
         out = []
         for k in keys:
             hot = ui.RED if names[k][0] == "FULL" else ui.BOLD
             parts = textwrap.wrap(WIDE_HINTS[k], max(20, col - indent)) or [""]
-            out.append(f"{ui.paint(k, ui.BOLD + ';' + ui.YELLOW, on)} {ui.paint('▸', ui.GREY, on)} {ICONS[k]} "
-                       f"{ui.paint(names[k][0].ljust(6), hot, on)} {ui.paint(parts[0], ui.GREY, on)}")
+            out.append(f"{ui.paint(k.rjust(2), ui.BOLD + ';' + ui.YELLOW, on)} {ui.paint('▸', ui.GREY, on)} {ICONS[k]} "
+                       f"{ui.paint(names[k][0].ljust(name_w), hot, on)} {ui.paint(parts[0], ui.GREY, on)}")
             out += [" " * indent + ui.paint(part, ui.GREY, on) for part in parts[1:]]
         return out
 
@@ -554,22 +680,46 @@ def _wide_columns(names: dict, on: bool, temps: Optional[dict], col: int = 66) -
     return left, right
 
 
+def _tall_extra(on: bool, temps: Optional[dict], room: int, rows: int) -> list:
+    """What a tall window (>= 40 lines) adds under the menu items: the tips and the nodes with their temperatures."""
+    out = [ui.paint("TIPS", ui.GREY, on)]
+    for tip in ("R repeats the last action exactly as it ran.", "S saves a default node and a temperature limit.",
+                "T / 9 plan a test for later (a detached process or a systemd timer).",
+                "D live cluster dashboard · W live status of the running tests.",
+                "? opens the help: every entry explained, links to README and HELPDESK."):
+        out += [ui.paint(("· " if i == 0 else "  ") + part, ui.GREY, on) for i, part in enumerate(textwrap.wrap(tip, max(16, room - 2)))]
+    if _NODES_CACHE:
+        out += ["", ui.paint("NODES", ui.GREY, on)]
+        temps = temps or {}
+        for name, master, ready in _NODES_CACHE[:max(3, rows - 48)]:
+            temp = temps.get(name)
+            tail = f"  🔥 {ui.paint(f'{temp} °C', ui.temp_code(temp), on)}" if temp is not None else ""
+            out.append(f"{ui.ICON_NODE} {name[:max(10, room - 24)]}  {ui.paint('master' if master else 'worker', ui.GREY, on)}  "
+                       + (ui.paint("Ready", ui.GREEN, on) if ready else ui.paint("NOT Ready", ui.RED, on)) + tail)
+    return out
+
+
 def menu_lines(cluster: str, status: list, on: bool, width: Optional[int] = None, cols: Optional[int] = None,
-               temps: Optional[dict] = None) -> list:
+               temps: Optional[dict] = None, rows: Optional[int] = None) -> list:
     """The menu as lines. The look follows the width of the terminal: compact / normal / wide (two columns)."""
     names = {key: (name, hint) for key, name, hint in MENU_ITEMS}
     if not cols:                                        # without a terminal (pipe, tests) the normal width is used
         cols = ui.cols()
     mode = menu_mode(cols)
-    rows = [ui.paint("› ", ui.GREEN, on) + ui.paint(cluster, ui.GREY, on), *status]
+    status_rows_ = [ui.paint("› ", ui.GREEN, on) + ui.paint(cluster, ui.GREY, on), *status]
     if mode == "wide":
         width = width or min(cols - 1, WIDE_MAX)
         left, right = _wide_columns(names, on, temps, ((width - 4) - 3) // 2)
-        return ui.menu_box_wide(__version__, rows, left, right, KEYS_WIDE, on, width)
+        return ui.menu_box_wide(__version__, status_rows_, left, right, KEYS_WIDE, on, width)
     sections = [(label, [(k, ICONS[k], names[k][0], names[k][1]) for k in keys]) for label, keys in SECTIONS]
+    height = ui.term_rows() if rows is None else rows
+    tall = height is not None and ui.height_mode(height) == "tall"
     if mode == "compact":
-        return ui.menu_box(__version__, rows[:2], sections, KEYS_COMPACT, on, width or max(cols - 1, 30), compact=True)
-    return ui.menu_box(__version__, rows, sections, KEYS, on, width or min(cols - 1, ui.WIDTH))
+        w = width or max(cols - 1, 30)
+        return ui.menu_box(__version__, status_rows_[:2], sections, KEYS_COMPACT, on, w, compact=True,
+                           extra=_tall_extra(on, temps, w - 4, height) if tall else None)
+    w = width or min(cols - 1, ui.WIDTH)
+    return ui.menu_box(__version__, status_rows_, sections, KEYS, on, w, extra=_tall_extra(on, temps, w - 4, height) if tall else None)
 
 
 def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
@@ -583,9 +733,15 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
     cluster = cluster or cluster_line
     state = load_state()
     _apply_live(settings_of(state))
+    pending: dict = {}                                    # {"epoch", "persistent"}: the start time of the NEXT test (key T)
     while True:
         on = ui.color_enabled()
         extra = status(state) if status else ([] if injected else status_rows(state, on=on))
+        if pending:
+            from . import schedule
+            extra = [ui.paint(f"🕒 next test starts: {schedule.describe_when(pending['epoch'])}"
+                              + (" · systemd timer" if pending.get("persistent") else "") + "  (T changes it)", ui.YELLOW, on),
+                     *extra]
         print()
         cols = ui.cols()
         temps = None
@@ -604,6 +760,30 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
                 continue
             if choice in ("s", "S"):
                 settings_screen(ask, state)
+                continue
+            if choice in ("t", "T"):
+                answer = start_time_dialog(ask)
+                if answer is not None:
+                    pending = answer
+                continue
+            if choice == "9":
+                planner(ask, run, pending)
+                continue
+            if choice in ("w", "W"):
+                options = ["--status", "--live"]
+                ui.emit(f"\n▶ {command_text(options)}\n")
+                try:
+                    run(options)
+                except (SystemExit, KeyboardInterrupt):
+                    pass
+                continue
+            if choice in ("d", "D"):
+                options = ["--dashboard"]
+                ui.emit(f"\n▶ {command_text(options)}\n")
+                try:
+                    run(options)
+                except (SystemExit, KeyboardInterrupt):
+                    pass
                 continue
             if choice in ("r", "R"):
                 last = (state.get("last") or {}).get("options")
@@ -625,6 +805,9 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
         state["last"] = {"options": options, "when": time.strftime("%Y-%m-%d %H:%M")}
         if persist:
             save_state(state)
+        if pending and (choice in PLANNABLE or choice in ("r", "R")):
+            options = options + schedule_options(pending)    # the chosen test is planned for the time set with T
+            pending = {}
         ui.emit(f"\n▶ {command_text(options)}   (the rest is asked below)\n")
         try:
             code = run(options)

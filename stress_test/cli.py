@@ -17,7 +17,7 @@ from . import background, baseline, compare, debuglog, parallel, series
 from .kube import Kubectl, KubectlError
 from .disk import (DISK_JOB_TIME_DEFAULT, DISK_SIZE_DEFAULT, MAX_DISK_JOB_TIME, MAX_DISK_SIZE,
                    MIN_DISK_JOB_TIME, MIN_DISK_SIZE, jobs as disk_jobs)
-from . import menu, netmatrix, ui
+from . import menu, netmatrix, schedule, ui
 from .gpu import GPU_MAX_TEMP_DEFAULT, GPU_MEM_PCT_DEFAULT, MAX_GPU_TIME, MIN_GPU_TIME
 from .net import (MAX_NET_TIME, MIN_NET_TIME, NET_MODES, NET_TIME_DEFAULT, net_duration,
                   normalize_extras)
@@ -91,28 +91,12 @@ def cooldown_arg(text: str) -> int:
 
 
 def schedule_arg(text: str) -> float:
-    """When to start the test: 'HH:MM' (the nearest occurrence, today/tomorrow) or a duration from now (30m, 2h)."""
-    text = text.strip()
-    now = time.time()
-    if ":" in text:
-        hh_txt, _, mm_txt = text.partition(":")
-        try:
-            hh, mm = int(hh_txt), int(mm_txt)
-        except ValueError:
-            raise argparse.ArgumentTypeError("Enter the time as HH:MM (e.g. 22:30) or a duration "
-                                             "from now (e.g. 30m, 2h).")
-        if not (0 <= hh < 24 and 0 <= mm < 60):
-            raise argparse.ArgumentTypeError("Invalid time, use HH:MM (0-23:0-59).")
-        t = time.localtime(now)
-        target = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hh, mm, 0, 0, 0, -1))
-        if target <= now:
-            target += 86400                        # already passed today -> tomorrow
-        return target
+    """When to start the test: 'HH:MM' (the nearest occurrence, today/tomorrow), a duration from now (30m, 2h) or a date
+    and time ('2026-10-03 02:00', '3.10. 02:00')."""
     try:
-        delay = parse_duration(text)
+        return schedule.parse_start(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc))
-    return now + delay
 
 
 QUICK_DURATION = 600       # s, duration of the quick test (--quick)
@@ -122,30 +106,34 @@ examples:
   ./stress.sh --quick                          quick test: pick a node and it runs right away
   ./stress.sh --quick --workers                quick test of all workers one after another
   ./stress.sh                                  interactively: asks what and how to test
-  ./stress.sh --node dell-9020-sff-i7 --time 10m
+  ./stress.sh --node worker-1 --time 10m
                                                one node, 10 minutes, full CPU load
   ./stress.sh --workers --parallel --time 20m  all workers at once
   ./stress.sh --cluster --profile stepped      the whole cluster one after another, gradually 25-100 %
-  ./stress.sh --node hp-g2-celeron --time 1h -b
+  ./stress.sh --node worker-3 --time 1h -b
                                                in the background (survives closing the terminal)
   ./stress.sh --status                         what is running right now
-  ./stress.sh --stop hp-g2-celeron             stop a test running in the background
-  ./stress.sh --compare dell-9020-sff-i7       compare the two latest tests of a node
+  ./stress.sh --stop worker-3             stop a test running in the background
+  ./stress.sh --compare worker-1       compare the two latest tests of a node
   ./stress.sh --list-nodes                     list the cluster's nodes and exit
   ./stress.sh --list-gpus                      scan the nodes for GPUs: which have a usable NVIDIA card
-  ./stress.sh --profile gpu --node dell-9020-sff-i7 --time 2m
+  ./stress.sh --profile gpu --node worker-1 --time 2m
                                                GPU burn (gpu-burn) of one node; menu "2 GPU" scans and asks
   ./stress.sh --profile gpu --nodes a,b --gpu-prepull
                                                GPU test of several nodes one after another, image pulled first
-  ./stress.sh --self-test --nodes dell-9020-sff-i7
+  ./stress.sh --self-test --nodes worker-1
                                                FULL self-test limited to the given node(s)
-  ./stress.sh --set-baseline dell-9020-sff-i7  newest test of the node becomes its baseline
-  ./stress.sh --export-log dell-9020-sff-i7    JSON+CSV export of the node's newest log
-  ./stress.sh --node dell-9020-sff-i7 --time 10m --dry-run
+  ./stress.sh --set-baseline worker-1  newest test of the node becomes its baseline
+  ./stress.sh --export-log worker-1    JSON+CSV export of the node's newest log
+  ./stress.sh --node worker-1 --time 10m --dry-run
                                                show the test settings, start nothing
-  ./stress.sh --node dell-9020-sff-i7 --time 20m --schedule 22:30 -b
+  ./stress.sh --node worker-1 --time 20m --schedule 22:30 -b
                                                start today at 22:30, in the background
-  ./stress.sh --node dell-9020-sff-i7 --time 10m --allow-busy-node
+  ./stress.sh --node worker-1 --time 20m --schedule "2026-10-03 02:00" --persistent
+                                               on a date, as a systemd timer (survives a restart)
+  ./stress.sh --scheduled                      list the planned tests (cancel: --stop ID)
+  ./stress.sh --dashboard                      live overview of every node (menu key D; 3 widths, read-only)
+  ./stress.sh --node worker-1 --time 10m --allow-busy-node
                                                start even on a node the preflight finds busy
 
 preflight (checks before EVERY test, including --quick):
@@ -404,14 +392,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("scheduling and information")
     g.add_argument("--schedule", type=schedule_arg, metavar="TIME",
-                   help="start the test later: HH:MM (the nearest occurrence, today/tomorrow) or "
-                        "a duration from now (30m, 2h); can be combined with -b/--background "
-                        "(will keep running even after closing the terminal)")
+                   help="start the test later: HH:MM (the nearest occurrence, today/tomorrow), a duration from now "
+                        "(30m, 2h) or a date and time (2026-10-03 02:00, 3.10. 02:00); with -b/--background the "
+                        "waiting process keeps running after closing the terminal; --persistent keeps the plan as "
+                        "a systemd timer that survives a restart; planned tests: --scheduled, cancel: --stop ID")
+    g.add_argument("--persistent", action="store_true",
+                   help="with --schedule: keep the plan as a systemd USER timer (survives a restart of this computer; "
+                        "while you are logged out it needs `sudo loginctl enable-linger $USER`)")
+    g.add_argument("--scheduled", action="store_true",
+                   help="list the planned tests (waiting processes and systemd timers) and exit")
+    g.add_argument("--cancel-plan", metavar="ID", default=None, help=argparse.SUPPRESS)
     g.add_argument("--dry-run", action="store_true",
                    help="just show what would be started (node, test settings) and exit "
                         "without touching the cluster")
     g.add_argument("--list-nodes", action="store_true",
                    help="list the cluster's nodes (role, state) and exit")
+    g.add_argument("--live", action="store_true",
+                   help="with --status: the live screen (menu key W) - every running and planned test, refreshed every "
+                        "second, with the details of its kind (GPU, CPU, disk, network, FULL self-test); x stops a test")
+    g.add_argument("--dashboard", action="store_true",
+                   help="live cluster DASHBOARD (menu key D): every node at a glance - CPU, temperature, clock, RAM, power, GPU, "
+                        "network, pods, events; three widths (up to 90 / 91-160 / wider); read-only probes that exist only while "
+                        "it is open; --nodes A,B limits it to some nodes")
     g.add_argument("--list-gpus", action="store_true",
                    help="scan every node for graphics cards (short read-only pods) and show which have a usable "
                         "dedicated NVIDIA GPU, then exit")
@@ -987,25 +989,121 @@ def cmd_net_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scheduled() -> int:
+    for line in schedule.format_plans(schedule.list_plans()):
+        ui.emit(line)
+    return 0
+
+
 def cmd_stop(target: str) -> int:
-    ok, message = background.stop(target)
+    ok, message = schedule.cancel(target)
     ui.emit(("✅ " if ok else "❌ ") + message)
     return 0 if ok else EXIT_ERROR
 
 
-def _print_background_info(node_label: str, duration_text: str, run_id: str, pid: int,
-                           log_path: str, console_path: str) -> None:
+def _plan_title(cfg: StressConfig, label: str) -> str:
+    kind = ("GPU" if cfg.gpu else "disk" if cfg.disk else "network" if cfg.net else "stepped CPU" if cfg.stepped
+            else "spike CPU" if cfg.spike else "CPU")
+    return f"{kind} {describe_duration(cfg.total_duration)} · {label}"
+
+
+def _profile_name(cfg: StressConfig) -> str:
+    return ("gpu" if cfg.gpu else "disk" if cfg.disk else "net" if cfg.net else "stepped" if cfg.stepped
+            else "spike" if cfg.spike else "classic")
+
+
+def _run_extra(cfg: StressConfig, kind: str, nodes: list, log_dir: str = "") -> dict:
+    """What the live status screen (menu W) needs to know about a registered test."""
+    return {"kind": kind, "profile": _profile_name(cfg), "nodes": list(nodes), "log_dir": log_dir,
+            "ram": bool(cfg.ram_pct), "hdd": bool(cfg.hdd), "max_temp": cfg.max_temp,
+            "gpu_max_temp": cfg.gpu_max_temp if cfg.gpu else None, "cooldown": cfg.cooldown}
+
+
+def _run_registered(runner, run_id: str, node: str, duration: int, log_path, title: str, extra: dict, enabled: bool = True) -> int:
+    """Runs a test in the foreground and keeps its record in the registry, so that the status screen of another
+    terminal sees it (a parallel subprocess does not register: its series does)."""
+    if not enabled:
+        return runner.run()
+    background.register(run_id, node, duration, log_path, "", title=title, extra=extra)
+    try:
+        return runner.run()
+    finally:
+        background.unregister(run_id)
+
+
+def _persist_plan(args: argparse.Namespace, argv: list, title: str, nodes: str) -> int:
+    """--persistent: the plan becomes a systemd user timer (the test runs without questions at the start time)."""
+    if not schedule.systemd_available():
+        ui.emit("❌ systemd user timers are not available here - plan without --persistent (a waiting process, "
+                "it does not survive a restart).")
+        return EXIT_ERROR
+    plan_id = secrets.token_hex(3)
+    try:
+        schedule.install_timer(plan_id, argv, args.schedule, title, nodes)
+    except (OSError, RuntimeError) as exc:
+        ui.emit(f"❌ The timer could not be set up: {exc}")
+        return EXIT_ERROR
     ui.emit("=" * 52)
-    ui.emit("🚀 TEST RUNNING IN THE BACKGROUND (detached from the terminal, survives closing the window)")
+    ui.emit("🕒 TEST PLANNED as a systemd timer (survives a restart of this computer)")
+    ui.emit("=" * 52)
+    for line in ui.kv_block([("Test", title), ("Starts", schedule.describe_when(args.schedule)), ("Plan id", plan_id),
+                             ("Cancel", f"./stress.sh --stop {plan_id}"), ("Planned tests", "./stress.sh --scheduled")],
+                            label_w=15):
+        ui.emit(line)
+    if schedule.linger_enabled() is False:
+        ui.emit("⚠️  Your user session stops when you log out - for the test to start while you are logged out run once:\n"
+                "    sudo loginctl enable-linger $USER")
+    return 0
+
+
+def _single_replay(args: argparse.Namespace, cfg: StressConfig, log_path: str) -> list:
+    """The full command line (no questions) of a single-node test, for a systemd timer."""
+    options = series.SeriesOptions(
+        log_dir=Path(log_path).parent, interval=args.interval, remaining_every=max(args.remaining_every, 0),
+        allow_no_sensor=args.allow_no_sensor, hw_privileged=args.hw_privileged, skip_hw=args.no_hw,
+        max_busy_pct=args.max_busy_pct, allow_busy_node=args.allow_busy_node, skip_capacity_check=args.no_capacity_check)
+    return parallel.child_args(cfg, options, log_path, 1)
+
+
+def _series_replay(args: argparse.Namespace, template: StressConfig, nodes: list, run_parallel: bool,
+                   directory: Path) -> list:
+    """The full command line (no questions) of a multi-node test, for a systemd timer."""
+    import dataclasses
+    options = series.SeriesOptions(
+        log_dir=directory, interval=args.interval, remaining_every=max(args.remaining_every, 0),
+        allow_no_sensor=args.allow_no_sensor, hw_privileged=args.hw_privileged, skip_hw=args.no_hw,
+        max_busy_pct=args.max_busy_pct, allow_busy_node=args.allow_busy_node, skip_capacity_check=args.no_capacity_check)
+    base = parallel.child_args(dataclasses.replace(template, node=nodes[0].name), options, "", 1)
+    out, skip = [], 0
+    for i, word in enumerate(base):
+        if skip:
+            skip -= 1
+        elif word in ("--node", "--log-file", "--concurrent"):
+            skip = 1
+        else:
+            out.append(word)
+    out += ["--nodes", ",".join(n.name for n in nodes), "--log-dir", str(directory),
+            *(["--parallel", "--start-mode", args.start_mode, "--ready-timeout", str(args.ready_timeout)]
+              if run_parallel else ["--no-parallel"])]
+    return out
+
+
+def _print_background_info(node_label: str, duration_text: str, run_id: str, pid: int,
+                           log_path: str, console_path: str, start_at: Optional[float] = None) -> None:
+    ui.emit("=" * 52)
+    ui.emit("🕒 TEST PLANNED (detached from the terminal, survives closing the window)" if start_at else
+            "🚀 TEST RUNNING IN THE BACKGROUND (detached from the terminal, survives closing the window)")
     ui.emit("=" * 52)
     rows = [
         ("Node", node_label),
+        *([("Starts", schedule.describe_when(start_at))] if start_at else []),
         ("Test duration", duration_text),
         ("Run id / PID", f"{run_id} / {pid}"),
         ("Results", log_path),
         ("Live output", f"tail -f {console_path}"),
         ("Status", "python3 -m stress_test --status   (or ./stress.sh --status)"),
-        ("Stop", f"python3 -m stress_test --stop {run_id}"),
+        ("Stop / cancel", f"python3 -m stress_test --stop {run_id}"),
+        *([("Planned tests", "python3 -m stress_test --scheduled   (menu 9 SCHEDULE)")] if start_at else []),
     ]
     for line in ui.kv_block(rows, label_w=15):
         ui.emit(line)
@@ -1142,9 +1240,15 @@ def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
                                                ready_timeout=args.ready_timeout)
     else:
         runner = series.SeriesRunner(kube, template, nodes, skipped, options, log_path)
+    if args.persistent and args.schedule:
+        label = ", ".join(n.name for n in nodes)
+        return _persist_plan(args, _series_replay(args, template, nodes, run_parallel, directory),
+                             _plan_title(template, label), label)
     if not template.background:
         _wait_until(args.schedule)
-        return runner.run()
+        return _run_registered(runner, secrets.token_hex(3), "cluster", series.estimate_total(template, nodes, run_parallel), log_path,
+                               _plan_title(template, f"{len(nodes)} nodes"),
+                               _run_extra(template, "foreground", [n.name for n in nodes], str(directory)))
 
     # --- in the background: the whole series runs in a detached process
     console_path = log_path[:-4] + ".console.txt"
@@ -1155,12 +1259,13 @@ def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
         log.info("Series moved to the background: run_id=%s, PID=%s", run_id, pid)
         _print_background_info(f"cluster ({len(nodes)} nodes: " + ", ".join(n.name for n in nodes)
                                + ")", f"about {describe_duration(total)} in total", run_id, pid,
-                               log_path, console_path)
+                               log_path, console_path, args.schedule)
         sys.stdout.flush()
         os._exit(0)
     log.info("Child detached from the terminal (PID %s)", os.getpid())
-    _wait_until(args.schedule)
-    background.register(run_id, "cluster", total, log_path, console_path)
+    schedule.wait_registered(args.schedule, run_id, "cluster", total, log_path, console_path,
+                             _plan_title(template, f"{len(nodes)} nodes"),
+                             extra=_run_extra(template, "background", [n.name for n in nodes], str(directory)))
     try:
         return runner.run()
     finally:
@@ -1221,9 +1326,16 @@ def _main(args: argparse.Namespace) -> int:
     if args.migrate_logs:
         return cmd_migrate_logs()
     if args.status:
+        if args.live:
+            from . import watch
+            return watch.run()
         return cmd_status()
     if args.stop:
         return cmd_stop(args.stop)
+    if args.cancel_plan:
+        return cmd_stop(args.cancel_plan)
+    if args.scheduled:
+        return cmd_scheduled()
     if args.compare:
         return cmd_compare(args)
     if args.export_log:
@@ -1234,6 +1346,9 @@ def _main(args: argparse.Namespace) -> int:
         return cmd_list_nodes()
     if args.list_gpus:
         return cmd_list_gpus()
+    if args.dashboard:
+        from . import dashboard
+        return dashboard.run([x.strip() for x in args.nodes.split(",") if x.strip()] if args.nodes else None)
     if args.self_test:
         if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
             ui.emit("❌ Error: 'kubectl' was not found.")
@@ -1309,7 +1424,7 @@ def _main(args: argparse.Namespace) -> int:
             ui.emit(f"🔎 Dry run, nothing is being started: {quick_summary(cfg)}")
             return 0
 
-        if args.log_file:                         # subprocess of the parallel test: fixed path to the log
+        if args.log_file or (args.persistent and args.schedule):      # a parallel subprocess / a planned test is always logged
             cfg.log = True
         log_path = None
         if args.log_file:
@@ -1340,9 +1455,13 @@ def _main(args: argparse.Namespace) -> int:
                                lambda: ask_yes_no("Continue without temperature protection?")),
             out=_out)
 
+        if args.persistent and args.schedule:                    # a systemd timer instead of a waiting process
+            return _persist_plan(args, _single_replay(args, cfg, log_path), _plan_title(cfg, node.name), node.name)
         if not cfg.background:
             _wait_until(args.schedule)
-            return runner.run()
+            return _run_registered(runner, runner.names.run_id, node.name, cfg.total_duration, log_path, _plan_title(cfg, node.name),
+                                   _run_extra(cfg, "foreground", [node.name], str(Path(log_path).parent) if log_path else ""),
+                                   enabled=args.concurrent <= 1)
 
         # --- in the background: quick checks first, we want to see errors right away in the terminal
         runner.preflight()
@@ -1353,14 +1472,14 @@ def _main(args: argparse.Namespace) -> int:
                      runner.names.run_id, pid, console_path)
             _print_background_info(
                 node.name, f"{describe_duration(cfg.total_duration)}  (+ 1–3 min preparation)",
-                runner.names.run_id, pid, log_path, console_path)
+                runner.names.run_id, pid, log_path, console_path, args.schedule)
             sys.stdout.flush()
             os._exit(0)                           # without cleanup: the child does that
         # CHILD: detached, stdout goes to console_path
         log.info("Child detached from the terminal (PID %s)", os.getpid())
-        _wait_until(args.schedule)
-        background.register(runner.names.run_id, node.name, cfg.total_duration,
-                            log_path, console_path)
+        schedule.wait_registered(args.schedule, runner.names.run_id, node.name, cfg.total_duration,
+                                 log_path, console_path, _plan_title(cfg, node.name),
+                                 extra=_run_extra(cfg, "background", [node.name], str(Path(log_path).parent) if log_path else ""))
         try:
             return runner.run()
         finally:

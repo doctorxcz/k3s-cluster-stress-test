@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from . import ui
 from .kube import Kubectl, KubectlError
 from .logparse import _STAGE_RE, _parse_sample_line, read_log
 from .models import WARN_TEMP, NodeInfo, StressConfig
-from .parsing import format_duration
+from .parsing import clean_text, format_duration
 from .paths import open_private
 from .runner import EXIT_ERROR, EXIT_INTERRUPTED, GATE_TIMEOUT, prep_fraction
 from .series import (PREP_SECONDS, _STATUS, NodeOutcome, SeriesOptions, SeriesRunner, estimate_seconds,
@@ -205,8 +206,47 @@ def read_prep(log_file: str, now: Optional[float] = None) -> Optional[tuple]:
         return None
 
 
-def build_frame(title: str, status: Sequence[str], rows: Sequence[str], width: int, on: bool) -> list[str]:
-    return ui.box(title, [list(status), list(rows)], on, width)
+def build_frame(title: str, status: Sequence[str], rows: Sequence[str], width: int, on: bool,
+                extra: Sequence[Sequence[str]] = ()) -> list[str]:
+    return ui.box(title, [list(status), list(rows), *[list(e) for e in extra]], on, width)
+
+
+_EVENT_LINE = re.compile(r"^\[\d\d:\d\d:\d\d\]")
+
+
+def tail_detail(path: str, events: int = 3) -> tuple:
+    """(cpu history, temperature history, the last event lines) from the end of a node log - for the tall window."""
+    cpu, temp, found = [], [], []
+    for raw in read_tail(path).splitlines():
+        line = raw.strip()
+        parsed = _parse_sample_line(line)
+        if parsed:
+            cpu.append(parsed[1].cpu_pct)
+            temp.append(parsed[1].cpu_temp)
+        elif _EVENT_LINE.match(line):
+            found.append(clean_text(line, 200))
+    return cpu, temp, found[-events:]
+
+
+def tall_sections(plans: dict, width: int, on: bool, budget: int) -> list:
+    """A tall window (>= 40 lines) opens, under the table, a block per node: the history of CPU and temperature and its latest
+    events. Blocks are added whole while they fit into `budget` lines (a block costs its rows + 1 for the rule)."""
+    from .dashboard import _spark
+    room = width - 4
+    out = []
+    for name, (_node, cfg, log_file, _console) in plans.items():
+        cpu, temp, found = tail_detail(log_file)
+        if not cpu and not found:
+            continue
+        spark = max(8, min(40, (room - 24) // 2))
+        block = [f"{ui.paint('▸ ' + name, ui.BOLD, on)}   CPU {_spark(cpu, spark, 100, on, ui.GREEN)}   "
+                 f"temp {_spark(temp, spark, getattr(cfg, 'max_temp', 85) or 85, on, ui.YELLOW, 25)}"]
+        block += [ui.paint("  " + line, ui.GREY, on) for line in found]
+        if budget < len(block) + 1:
+            break
+        budget -= len(block) + 1
+        out.append(block)
+    return out
 
 
 class LiveTable:
@@ -451,7 +491,12 @@ class ParallelSeriesRunner(SeriesRunner):
             status = [head, ui.phase_bar(phase, overall, length, on)
                       + f" {min(100, int(overall * 100)):>3} %  {ui.ICON_TIME} ~{ui.clock(left)} left"
                       + ("  (all nodes)" if len(plans) > 1 else "")]
-        return build_frame(f"PARALLEL TEST · {len(plans)} nodes", status, rows, width, on)
+        extra = []
+        height = ui.term_rows(sys.stdout)
+        if height is not None and ui.height_mode(height) == "tall":
+            used = len(build_frame("", status, rows, width, on))
+            extra = tall_sections(plans, width, on, height - 1 - used)
+        return build_frame(f"PARALLEL TEST · {len(plans)} nodes", status, rows, width, on, extra)
 
     def _terminate(self, procs: dict) -> None:
         """Shuts the subprocesses down gracefully (SIGTERM = pod cleanup), forcibly after a while."""

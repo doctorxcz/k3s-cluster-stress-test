@@ -121,7 +121,10 @@ def test_livescreen_keeps_only_last_events(plain):
     s = ui.LiveScreen("n", stream=io.StringIO())
     for i in range(20):
         s.event(f"line {i}")
-    assert len(s.events) == ui.LiveScreen.EVENTS and s.events[-1] == "line 19"
+    assert len(s.events) == 20 <= ui.LiveScreen.EVENTS_TALL and s.events[-1] == "line 19"          # a tall window keeps more
+    for i in range(100):
+        s.event(f"more {i}")
+    assert len(s.events) == ui.LiveScreen.EVENTS_TALL
 
 
 def test_livescreen_wanted_respects_env(monkeypatch):

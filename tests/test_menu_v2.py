@@ -44,8 +44,8 @@ def test_menu_lines_show_all_entries_and_keys():
     text = "\n".join(menu.menu_lines("c", [], False, 76))
     for key, name, _hint in menu.MENU_ITEMS:
         assert f"{key} ▸ " in text and name in text
-    for key, label in menu.KEYS:
-        assert f"{key} ▸ {label}" in text
+    for key, label, icon in menu.KEYS:
+        assert f"{icon} {key} ▸ {label}" in text
 
 
 def test_menu_box_direct_matches_menu_lines():
@@ -212,7 +212,7 @@ def test_keys_1_to_8_build_the_same_options(key, answers, expected):
     assert menu.build_action(key, scripted(*answers)) == expected
 
 
-@pytest.mark.parametrize("bad", ["9", "x", "!", "-1"])
+@pytest.mark.parametrize("bad", ["11", "x", "!", "-1"])
 def test_invalid_keys_warn_and_continue(bad, capsys):
     code, ran = run([bad, "0"])
     assert ran == [] and "Invalid choice." in capsys.readouterr().out

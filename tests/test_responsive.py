@@ -9,10 +9,10 @@ from stress_test.parallel import LiveInfo, frame_row
 
 
 def _lines(cols, nodes=True):
-    menu._NODES_CACHE[:] = [("dell-9020-sff-i7", False, True), ("hp-g2-celeron", False, False),
-                            ("hp-prodesk-400-g6-master", True, True)] if nodes else []
+    menu._NODES_CACHE[:] = [("worker-1", False, True), ("worker-3", False, False),
+                            ("control-plane-node-00001", True, True)] if nodes else []
     return menu.menu_lines("cluster: 3 nodes", ["🔁 last: ./stress.sh --self-test"], False, cols=cols,
-                           temps={"dell-9020-sff-i7": 77})
+                           temps={"worker-1": 77})
 
 
 def test_menu_mode_thresholds():
@@ -31,7 +31,7 @@ def test_every_menu_row_has_the_same_width(cols):
 
 def test_compact_menu_has_no_hints_and_short_keys():
     text = "\n".join(_lines(50))
-    assert "classic" not in text and "R ▸ rep" in text and "Q ▸ quit" in text
+    assert "classic" not in text and "🔁 R" in text and "🚪 Q" in text and "📺 D" in text and "R ▸" not in text
 
 
 def test_normal_menu_is_the_known_layout():
@@ -42,7 +42,7 @@ def test_normal_menu_is_the_known_layout():
 def test_wide_menu_has_two_columns_nodes_and_temperatures():
     text = "\n".join(_lines(140))
     assert "│" in text and "NODES" in text and "77 °C" in text and "NOT Ready" in text
-    assert "hp-prodesk-400-g6-master" in text and "master" in text
+    assert "control-plane-node-00001" in text and "master" in text
     assert "whole cluster" in text and "TIPS" in text and "quit (0 works too)" in text
 
 
@@ -64,9 +64,9 @@ def test_box_rows_do_not_contain_variation_selectors():
 @pytest.mark.parametrize("width", [45, 59, 69, 70, 96, 97, 107, 108, 112])
 def test_frame_row_fits_its_frame_at_every_width(width):
     info = LiveInfo(cpu=100.0, temp=61, freq=3400, ram_pct=25.0, has_sample=True, stage=(2, 4, 50))
-    row = frame_row("hp-elitedesk-705-g4-35w-a10", info, None, ("test", 0.5, "1:00"), "", False, width=width)
+    row = frame_row("worker-node-long-name-00004", info, None, ("test", 0.5, "1:00"), "", False, width=width)
     assert ui.visible_len(row) <= width - 4, (width, ui.visible_len(row), row)
-    assert "hp-elitedesk" in row or width < 70
+    assert "worker-node" in row or width < 70
 
 
 class _TTY(io.StringIO):

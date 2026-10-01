@@ -24,7 +24,7 @@ def test_parse_quantity_invalid():
 
 
 def test_parse_top_ok():
-    top = parse_top("hp-prodesk 4190m 52% 3163Mi 43%")
+    top = parse_top("control-1 4190m 52% 3163Mi 43%")
     assert top.cpu == "4190m" and top.cpu_pct == "52%"
     assert top.mem_mib == 3163 and top.mem_pct == "43%"
 

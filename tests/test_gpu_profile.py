@@ -240,7 +240,8 @@ def test_ctrl_c_cleans_up_the_gpu_pod(tmp_path):
     p = subprocess.Popen([sys.executable, "-m", "stress_test", "--node", "fake-node", "--non-interactive",
                           "--interval", "0.5", "--cooldown", "0", "--log-dir", str(tmp_path / "logs"),
                           "--profile", "gpu", "--time", "60", "--yes"], cwd=tmp_path, env=e,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))   # a job started with `&` ignores SIGINT, and the child inherits that
     try:
         assert wait_for(lambda: (tmp_path / "events.txt").exists() and "start" in (tmp_path / "events.txt").read_text())
         time.sleep(1.5)

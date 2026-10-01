@@ -237,6 +237,33 @@ def smart_pod(node: str, names: PodNames, deadline: int = 300) -> dict:
     return pod
 
 
+DASHBOARD_LABEL = "stress-test-dashboard"          # NOT the tool's test label: a dashboard never blocks a test
+
+
+def dashboard_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
+    """The dashboard's probe: unprivileged busybox, /sys read-only (like the test probe), removed when the dashboard closes."""
+    pod = probe_pod(node, PodNames(run_id, name, name, name), deadline)
+    pod["metadata"]["labels"] = {"app": DASHBOARD_LABEL, "run-id": run_id, "role": "dashboard-probe"}
+    return pod
+
+
+def dashboard_gpu_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
+    """Only runs nvidia-smi: the nvidia runtime + NVIDIA_VISIBLE_DEVICES=all, WITHOUT a `nvidia.com/gpu` limit, so it never
+    takes the GPU away from a test (read-only monitoring). Unprivileged, no hostPath."""
+    pod = _base_pod(name, node, deadline, run_id, "dashboard-gpu")
+    pod["metadata"]["labels"]["app"] = DASHBOARD_LABEL
+    pod["spec"]["runtimeClassName"] = "nvidia"
+    pod["spec"]["containers"] = [{
+        "name": "gpu-probe",
+        "image": IMAGE_UBUNTU,
+        "securityContext": {"allowPrivilegeEscalation": False},
+        "command": ["sleep", "infinity"],
+        "env": [{"name": "NVIDIA_VISIBLE_DEVICES", "value": "all"}, {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "utility"}],
+        "resources": {"requests": {"memory": "16Mi"}, "limits": {"memory": "128Mi"}},
+    }]
+    return pod
+
+
 def gpu_scan_pod(node: str, names: PodNames, deadline: int = 240) -> dict:
     """Read-only pod listing the graphics cards of a node (lspci). Unprivileged, no hostPath."""
     from .gpuscan import SCAN_SCRIPT

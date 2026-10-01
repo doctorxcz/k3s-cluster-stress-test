@@ -94,12 +94,14 @@ def gpu_mode(node):
 def node_object(spec):
     labels = {"node-role.kubernetes.io/control-plane": "true"} if spec.get("master") else {}
     return {
-        "metadata": {"name": spec["name"], "labels": labels},
+        "metadata": {"name": spec["name"], "labels": labels, "creationTimestamp": "2026-09-01T10:00:00Z"},
+        "spec": {"taints": spec.get("taints", []), "unschedulable": bool(spec.get("cordoned"))},
         "status": {
             "conditions": [{"type": "Ready", "status": "True" if spec.get("ready", True) else "False"}],
-            "allocatable": dict({"memory": "8000000Ki"},
+            "allocatable": dict({"memory": "8000000Ki", "cpu": "8", "pods": "110", "ephemeral-storage": "90000Mi"},
                                 **({"nvidia.com/gpu": "1"} if gpu_mode(spec["name"]) == "1" else {})),
-            "capacity": {"cpu": "8"},
+            "capacity": {"cpu": "8", "memory": "8000000Ki", "pods": "110", "ephemeral-storage": "100000Mi"},
+            "images": [{"sizeBytes": 500_000_000}, {"sizeBytes": 250_000_000}],
             "addresses": [{"type": "InternalIP", "address": spec.get("ip", "10.0.0.1")},
                           {"type": "Hostname", "address": spec["name"]}],
             "nodeInfo": {"osImage": "FakeOS", "kernelVersion": "1.0",
@@ -127,6 +129,28 @@ if cmd == "get":
             print(f'Error from server (NotFound): nodes "{args[2]}" not found', file=sys.stderr)
             sys.exit(1)
         print(json.dumps(node_object(found[0])))
+    elif args[1] == "pods" and "-A" in args and "--field-selector" not in args:       # dashboard: every pod of the cluster
+        default = [{"name": f"app-{s['name']}", "ns": "default", "node": s["name"], "phase": "Running", "restarts": 0}
+                   for s in NODE_SPECS]
+        pods = json.loads(os.environ.get("FAKE_DASH_PODS", "null")) or default
+        print(json.dumps({"items": [{"metadata": {"name": p["name"], "namespace": p.get("ns", "default")},
+                                     "spec": {"nodeName": p["node"], "containers": [{"resources": {"requests": {
+                                         "cpu": p.get("cpu", "100m"), "memory": p.get("mem", "128Mi")}}}]},
+                                     "status": {"phase": p.get("phase", "Running"),
+                                                "containerStatuses": [{"restartCount": p.get("restarts", 0)}]}} for p in pods]}))
+    elif args[1] == "events":
+        events = json.loads(os.environ.get("FAKE_EVENTS", "null"))
+        events = [{"reason": "BackOff", "kind": "Pod", "name": "app-x", "message": "Back-off restarting failed container", "time": "2026-10-01T14:00:00Z"}] if events is None else events
+        print(json.dumps({"items": [{"lastTimestamp": e.get("time", ""), "reason": e["reason"], "message": e["message"],
+                                     "involvedObject": {"kind": e.get("kind", "Pod"), "name": e.get("name", "x")}} for e in events]}))
+    elif args[1] in ("ingress", "pvc", "jobs", "cronjobs") and "-o" in args and args[args.index("-o") + 1] == "json":
+        items = {"pvc": [{"status": {"phase": "Bound"}, "spec": {"resources": {"requests": {"storage": "10Gi"}}}}],
+                 "jobs": [{"status": {"succeeded": 1}}, {"status": {"active": 1, "failed": 2}}], "ingress": [{}, {}], "cronjobs": [{}]}[args[1]]
+        print(json.dumps({"items": items}))
+    elif args[1] in ("pv", "configmaps") and "name" in args:
+        print("\n".join(f"{args[1]}/x{i}" for i in range(3)))
+    elif args[1] in ("deployments", "statefulsets", "daemonsets"):
+        print(json.dumps({"items": [{"spec": {"replicas": 2}, "status": {"readyReplicas": 2, "numberReady": 2, "desiredNumberScheduled": 2}}]}))
     elif args[1] == "pods" and "--field-selector" in args:   # node workload
         selector = args[args.index("--field-selector") + 1]
         node_name = selector.split("=", 1)[1] if "=" in selector else ""
@@ -160,6 +184,9 @@ if cmd == "get":
             print("Error from server (NotFound): pods not found", file=sys.stderr)
             sys.exit(1)
         print("10.42.0.9" if "jsonpath={.status.podIP}" in args else "Succeeded")
+elif cmd == "top" and args[1] == "nodes":
+    for s in NODE_SPECS:
+        print(f"{s['name']} 400m 5% 2000Mi 25%")
 elif cmd == "top":
     print("fake-node 1000m 12% 2000Mi 25%")
 elif cmd == "apply":
@@ -177,6 +204,9 @@ elif cmd == "apply":
         if os.path.exists(flag(f"deleted-{name}")):
             os.remove(flag(f"deleted-{name}"))
 elif cmd == "delete":
+    if "-l" in args:                                  # `delete pod -l app=...` (dashboard leftovers)
+        with open(flag("deleted-by-label"), "a") as fh:
+            fh.write(args[args.index("-l") + 1] + "\n")
     for a in args[2:]:
         if a.startswith("stress-test"):
             open(flag(f"deleted-{a}"), "w").close()
@@ -490,6 +520,24 @@ elif cmd == "exec":
             lines.append("ping_ms lost")
         else:
             lines.append(f"ping_ms {os.environ.get('FAKE_PING_LOAD', '3.0') if phase == 'load' else os.environ.get('FAKE_PING_IDLE', '0.4')}")
+    if "cut -d' ' -f1 /proc/uptime" in args[-1]:           # dashboard: the extra values of EXTRA_SCRIPT
+        n = args[1]
+        lines += ["uptime 93784", "load 0.52 0.40 0.31", "swap_total_kb 0", "swap_free_kb 0", "threads 8", "cores 4",
+                  "cpu_model Intel(R) Core(TM) i7-4790S CPU @ 3.20GHz", "thr 0",
+                  f"nic eno1 1000 up {read_int(sflag('rx', rid)) + 1_500_000} {read_int(sflag('tx', rid)) + 400_000} 1500 full 0 0 2 0",
+                  "disk sda 238 0 Patriot P210 256",
+                  "dmi sys_vendor Dell Inc.", "dmi product_name OptiPlex 9020", "dmi bios_version A18", "dmi bios_date 07/04/2018",
+                  "gov powersave 800 3600 3600", "turbo 0", "cpufreqs 3600 3500 3600 3590", "ctemp Core_0 52000", "ctemp Package_id_0 53000",
+                  "tz acpitz 27000", "psi cpu some 0.40", "psi memory some 0.00", "psi io full 0.30",
+                  "mem MemFree 8192000", "mem Cached 5120000", "mem Dirty 12288",
+                  f"dio sda {read_int(sflag('dio-r', rid)) + 2000} {read_int(sflag('dio-w', rid)) + 1000}",
+                  "files 4200", "tasks 2/534"]
+        write_int(sflag("dio-r", rid), read_int(sflag("dio-r", rid)) + 2000)
+        write_int(sflag("dio-w", rid), read_int(sflag("dio-w", rid)) + 1000)
+        write_int(sflag("rx", rid), read_int(sflag("rx", rid)) + 1_500_000)
+        write_int(sflag("tx", rid), read_int(sflag("tx", rid)) + 400_000)
+        for p in args[-1].split('PEERS="', 1)[-1].split('"', 1)[0].split():
+            lines.append(f"peer {p.split('=')[0]} 0.4")
     watts = os.environ.get("FAKE_WATTS")
     if watts:                                               # RAPL: the energy counter grows by watts * 0.5 s per call (interval of run_tool)
         energy = read_int(sflag("rapl-uj", rid)) + int(float(watts) * 500_000)

@@ -227,11 +227,11 @@ def test_other_test_on_same_node_is_refused(tmp_path):
 
 
 def test_other_test_on_different_node_is_allowed(tmp_path):
-    others = '[{"name":"stress-test-abc","node":"hp-g2-celeron","phase":"Running","run":"abc"}]'
+    others = '[{"name":"stress-test-abc","node":"worker-3","phase":"Running","run":"abc"}]'
     res = run_tool(tmp_path, "--time", "5",
                    env_extra={"FAKE_OTHER_PODS": others, "FAKE_RUN": "2"})
     assert res.returncode == 0, res.stdout
-    assert "Another test is running on node hp-g2-celeron" in res.stdout
+    assert "Another test is running on node worker-3" in res.stdout
 
 
 def test_finished_pods_of_other_runs_do_not_block(tmp_path):

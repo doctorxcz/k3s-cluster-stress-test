@@ -106,7 +106,7 @@ def test_kv_block_classic_without_terminal(monkeypatch):
 @pytest.mark.parametrize("n", WIDTHS)
 def test_kv_block_modes(cols, n):
     cols(n)
-    pairs = [("Node", "hp-prodesk-400-g6-master (master)"), ("Test duration", "10 min (600 s)"), ("CPU load", "100 %"),
+    pairs = [("Node", "control-plane-node-00001 (master)"), ("Test duration", "10 min (600 s)"), ("CPU load", "100 %"),
              ("RAM load", "no"), ("Stop at", "85 °C (2 readings in a row)"), ("Cooldown after test", "60 s of measuring"),
              ("Log", "/home/user/cluster-testing/python-stress-test/logs/2026-09-30/node-600s-2026-09-30_10-00-00.log")]
     lines = ui.kv_block(pairs)
@@ -114,7 +114,7 @@ def test_kv_block_modes(cols, n):
     text = "\n".join(lines)
     assert "Test duration" in text and "85 °C" in text
     if ui.mode(n) == "compact":
-        assert "  Node:" in lines and "    hp-prodesk-400-g6-master (master)" in lines      # the label on its own line
+        assert "  Node:" in lines and "    control-plane-node-00001 (master)" in lines      # the label on its own line
     if ui.mode(n) == "wide":
         assert any(len(re.findall(r"[A-Za-z]:\s{2}", ln)) >= 2 for ln in lines)            # two columns of short pairs
         assert any(ln.startswith("  Log:") for ln in lines)                                # the long value stays full width
@@ -122,13 +122,13 @@ def test_kv_block_modes(cols, n):
 
 def test_table_drops_columns_by_priority_and_cards_in_compact():
     columns = [("Node", 0, "<"), ("State", 0, "<"), ("max", 1, ">"), ("over", 2, ">"), ("extra", 9, ">")]
-    rows = [["hp-prodesk-400-g6-master (master)", "OK", "61", "0 s", "12345678901234567890"]]
+    rows = [["control-plane-node-00001 (master)", "OK", "61", "0 s", "12345678901234567890"]]
     wide = ui.table(columns, rows, 99, "wide")
     assert "extra" in wide[0] and all(ui.visible_len(x) <= 99 for x in wide)
     mid = ui.table(columns, rows, 50, "normal")
     assert "extra" not in mid[0] and "State" in mid[0] and "max" in mid[0] and all(ui.visible_len(x) <= 50 for x in mid)
     card = ui.table(columns, rows, 38, "compact")
-    assert card[0].startswith("hp-prodesk") and any("State OK" in x for x in card) and all(ui.visible_len(x) <= 38 for x in card)
+    assert card[0].startswith("control-plane") and any("State OK" in x for x in card) and all(ui.visible_len(x) <= 38 for x in card)
 
 
 def test_grid_columns():
@@ -157,7 +157,7 @@ def test_emit_never_prints_a_line_wider_than_the_terminal(cols, capsys, n):
     cols(n)
     ui.emit("=" * 52)
     ui.emit("CLUSTER SUMMARY")
-    ui.emit("⚠️  Node hp-prodesk-400-g6-master runs these services (the test loads them, they may slow down or be interrupted):")
+    ui.emit("⚠️  Node control-plane-node-00001 runs these services (the test loads them, they may slow down or be interrupted):")
     ui.emit("    default/nginx-deployment-66b6c48dd5-abcde (Deployment nginx-deployment, 1 pod, cpu 250m, 512Mi)")
     ui.emit("  Log:                  /home/user/cluster-testing/python-stress-test/logs/2026-09-30/node-600s.log")
     ui.emit("https://github.com/doctorxcz/k3s-cluster-stress-test/blob/HEAD/HELPDESK.md and more words after the url")
@@ -249,7 +249,7 @@ def test_help_pages_fit(cols, capsys, n):
 def test_settings_screen_fits(cols, capsys, n, monkeypatch, tmp_path):
     monkeypatch.setenv("STRESS_TEST_MENU_STATE", str(tmp_path / "menu-state.json"))      # never touch the real state file
     cols(n)
-    answers = iter(["1", "hp-g2-celeron-with-a-rather-long-node-name", "0"])
+    answers = iter(["1", "worker-3-with-a-rather-long-node-name", "0"])
     menu.settings_screen(lambda *a, **k: next(answers), {"settings": {}})
     lines = capsys.readouterr().out.split("\n")
     assert_fits(lines, n)
@@ -299,18 +299,18 @@ def _outcome(name, code, peak=None, master=False, reason="", stage=False):
 
 @pytest.mark.parametrize("n", WIDTHS)
 def test_cluster_summary_for_the_screen(n):
-    outcomes = [_outcome("dell-9020-sff-i7", EXIT_OK, 84), _outcome("hp-g2-celeron", EXIT_OK, 49),
-                _outcome("hp-prodesk-400-g6-master", EXIT_OK, 60, master=True),
-                series.NodeOutcome("hp-705-g4-a10", reason="node is not Ready"),
+    outcomes = [_outcome("worker-1", EXIT_OK, 84), _outcome("worker-3", EXIT_OK, 49),
+                _outcome("control-plane-node-00001", EXIT_OK, 60, master=True),
+                series.NodeOutcome("worker-4", reason="node is not Ready"),
                 series.NodeOutcome("w9", reason="not tested (series interrupted)")]
     lines = shown(series.format_cluster_summary(outcomes, width=ui.avail(130, n)), n)
     text = "\n".join(lines)
     assert_fits(lines, n)
-    assert "CLUSTER SUMMARY" in text and "Hottest: dell-9020-sff-i7 (85 °C)." in " ".join(text.split())
-    assert "not tested (series interrupted)" in text and "SKIPPED" in text and "OK" in text
+    assert "CLUSTER SUMMARY" in text and "Hottest: worker-1 (85 °C)." in " ".join(text.split())
+    assert "not tested (series interrupted)" in " ".join(text.split()) and "SKIPPED" in text and "OK" in text      # the reason may wrap in a narrow window
     if n >= 140:
         assert "avg °C" in text and "throttling" in text and "return to idle" in text
-    assert "hp-g2-celeron" in text
+    assert "worker-3" in text
 
 
 def test_cluster_summary_classic_is_unchanged():
@@ -320,13 +320,13 @@ def test_cluster_summary_classic_is_unchanged():
 
 @pytest.mark.parametrize("n", WIDTHS)
 def test_cluster_summary_stepped_stages_fit(n):
-    lines = shown(series.format_cluster_summary([_outcome("dell-9020-sff-i7", EXIT_OK, 84, stage=True)],
+    lines = shown(series.format_cluster_summary([_outcome("worker-1", EXIT_OK, 84, stage=True)],
                                                 width=ui.avail(130, n)), n)
     assert_fits(lines, n)
     assert "Temperatures per stage" in "\n".join(lines) and "100 % →" in " ".join(" ".join(lines).split())
 
 
-def _log(temps_test, temps_cool, node="dell-9020-sff-i7"):
+def _log(temps_test, temps_cool, node="worker-1"):
     import importlib
     tc = importlib.import_module("test_compare")
     return parse_log(tc.make_log(temps_test, temps_cool, node=node), node + ".log")
@@ -348,7 +348,7 @@ def test_compare_fits(n):
 
 
 def _matrix(n_nodes):
-    names = [f"hp-prodesk-400-g6-node{i}" for i in range(n_nodes)]
+    names = [f"control-plane-node-0{i}" for i in range(n_nodes)]
     r = mx.MatrixResult(names, 5, links={n: {"if": "eth0", "speed": 1000, "duplex": "full"} for n in names})
     for c in names:
         for s in names:
@@ -374,7 +374,7 @@ def test_net_matrix_tables_fit_and_keep_every_cell(n, nodes):
 def _nodes():
     return [NodeInfo(name=n, ready=True, is_control_plane=m, allocatable_mem_mib=8000, capacity_cpu="8", os_image="x",
                      kernel="1", architecture="amd64", runtime="r")
-            for n, m in (("dell-9020-sff-i7", False), ("hp-prodesk-400-g6-master", True))]
+            for n, m in (("worker-1", False), ("control-plane-node-00001", True))]
 
 
 @pytest.mark.parametrize("n", WIDTHS)
@@ -387,26 +387,26 @@ def test_selftest_boxes_fit(cols, n, tmp_path):
     text = flat(selftest.warning_box(False))
     assert "READ THIS BEFORE YOU START" in text and "FULL POWER" in text and "circuit breaker" in text
     plan = flat(selftest.plan_box(phases, "standard", _nodes(), False))
-    assert "Network matrix" in plan and "hp-prodesk-400-g6-master (master)" in plan and "level: standard" in plan
+    assert "Network matrix" in plan and "control-plane-node-00001 (master)" in plan and "level: standard" in plan
 
 
 @pytest.mark.parametrize("n", WIDTHS)
 def test_selftest_verdict_fits(cols, n):
     cols(n)
-    reports = {"dell-9020-sff-i7": selftest.NodeReport("dell-9020-sff-i7", temp_max=70, cpu_ops=2500.0, ram_max_pct=41.0,
+    reports = {"worker-1": selftest.NodeReport("worker-1", temp_max=70, cpu_ops=2500.0, ram_max_pct=41.0,
                                                        disk={"seq-read": (480.0, 1000)}, net_avg=930.0),
-               "hp-prodesk-400-g6-master": selftest.NodeReport("hp-prodesk-400-g6-master", True, temp_max=82,
+               "control-plane-node-00001": selftest.NodeReport("control-plane-node-00001", True, temp_max=82,
                                                                problems=["reached 82 °C (limit 80 °C)"],
                                                                warnings=["slow disk WDC WD10EZEX: random read 1.0 MB/s"])}
-    reports["hp-prodesk-400-g6-master"].warnings.append("a long warning text about something that is wrong " * 2)
-    lines = ["❌ hp-prodesk-400-g6-master: reached 82 °C (limit 80 °C)",
-             "⚠️ hp-prodesk-400-g6-master: " + reports["hp-prodesk-400-g6-master"].warnings[-1],
+    reports["control-plane-node-00001"].warnings.append("a long warning text about something that is wrong " * 2)
+    lines = ["❌ control-plane-node-00001: reached 82 °C (limit 80 °C)",
+             "⚠️ control-plane-node-00001: " + reports["control-plane-node-00001"].warnings[-1],
              "VERDICT: ❌ 1 node(s) with problems, 0 with warnings, 1 OK", "====="]
     box = selftest.framed_verdict(reports, lines, False)
     assert_fits(box, n)
     assert_frames_aligned(box)
     text = flat(box)
-    assert "FULL SELF-TEST - RESULT" in text and "dell-9020-sff-i7" in text and "FAIL" in text and "1 node(s) with problems" in text
+    assert "FULL SELF-TEST - RESULT" in text and "worker-1" in text and "FAIL" in text and "1 node(s) with problems" in text
 
 
 # ---------------- whole program through the real command line --------------------------------------------
@@ -454,7 +454,7 @@ def test_plain_run_without_the_variable_keeps_the_classic_layout(tmp_path):
 # ---------------- details ------------------------------------------------------------------------------
 
 def test_cut_word_keeps_the_end_of_a_path_and_the_start_of_a_url():
-    path = "/home/doctorxcz/cluster-testing/python-stress-test/logs/2026-09-30/node-600s.log"
+    path = "/home/user/cluster-testing/python-stress-test/logs/2026-09-30/node-600s.log"
     cut = ui.cut_word(path, 40)
     assert cut.endswith("/node-600s.log") and "…" in cut and ui.visible_len(cut) <= 40 and cut.startswith("/home")
     url = "https://github.com/doctorxcz/k3s-cluster-stress-test/blob/HEAD/HELPDESK.md"

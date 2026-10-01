@@ -42,9 +42,9 @@ def test_board_ignores_updates_for_nodes_that_are_not_running():
 
 @pytest.mark.parametrize("width", [50, 80, 120])
 def test_board_table_is_aligned_and_marks_every_state(width):
-    b = GpuBoard(["dell-9020-sff-i7", "node-two", "node-three", "node-four"], {"dell-9020-sff-i7": "Quadro P620"})
-    b.start("dell-9020-sff-i7")
-    b.finish("dell-9020-sff-i7", 0, summary())
+    b = GpuBoard(["worker-1", "node-two", "node-three", "node-four"], {"worker-1": "Quadro P620"})
+    b.start("worker-1")
+    b.finish("worker-1", 0, summary())
     b.start("node-two")
     b.live("node-two", temp=71, clock=1620, progress=0.54)
     b.rows["node-four"].state, b.rows["node-four"].note = FAILED, "error"

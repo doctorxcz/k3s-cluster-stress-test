@@ -21,6 +21,19 @@ ROOT = Path(__file__).resolve().parent
 _state = {}
 
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_images():
+    """The choice of the prebuilt images (registry, --no-prebuilt, a failed pull) is process-wide: every test starts from the defaults."""
+    sys.path.insert(0, str(ROOT))
+    from stress_test import images
+    images.configure()
+    yield
+    images.configure()
+
+
 def pytest_configure(config):
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     session_dir = ROOT / ".logs" / "tests" / time.strftime("%Y-%m-%d") / f"{stamp}_{os.getpid()}"

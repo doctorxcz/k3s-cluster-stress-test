@@ -15,15 +15,16 @@ from typing import Callable, Optional
 
 from . import ui
 from .kube import Kubectl, KubectlError
+from . import images
 from .models import PodNames
 from .parsing import clean_text
 
 SCAN_SCRIPT = r"""
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq pciutils >/dev/null 2>&1 || echo "SCAN-NOLSPCI"
+@ENSURE_SCAN@ || echo "SCAN-NOLSPCI"
 lspci -nn 2>/dev/null | grep -iE 'vga compatible|3d controller|display controller' | sed 's/^[^ ]* [^:]*: /GPU-CARD /'
 echo SCAN-DONE
-"""
+""".replace("@ENSURE_SCAN@", images.ensure_tools("pciutils"))
 VENDORS = {"10de": "NVIDIA", "8086": "Intel", "1002": "AMD", "1022": "AMD"}
 _ID_RE = re.compile(r"\[([0-9a-f]{4}):([0-9a-f]{4})\]")
 
@@ -86,7 +87,7 @@ def _scan_one(kube: Kubectl, node, timeout: int) -> NodeScan:
         from .manifests import gpu_scan_pod
         names = PodNames.new()
         try:
-            kube.apply(gpu_scan_pod(node.name, names))
+            kube.apply_image_pod(lambda: gpu_scan_pod(node.name, names), names.hw, "tools")
             end = time.monotonic() + timeout
             phase = ""
             while time.monotonic() < end:
@@ -129,14 +130,15 @@ def prepull(kube: Kubectl, names: list, image: str, emit: Callable[[str], None] 
     if not valid_image(image):
         emit(f"⚠️  Not a valid image name, the pre-pull is skipped: {clean_text(image, 60)}")
         return {n: False for n in names}
-    emit(f"{ui.ICON_GPU} Pre-pulling {image} on {len(names)} node(s) (about 3 GB the first time, seconds when cached)...")
+    kind = "gpu" if images.is_prebuilt(image) else None           # the prebuilt GPU image falls back to the CUDA devel image when it cannot be pulled
+    emit(f"{ui.ICON_GPU} Pre-pulling {image} on {len(names)} node(s) ({'about 1.2 GB' if kind else 'about 3 GB'} the first time, seconds when cached)...")
     results: dict = {}
 
     def work(name: str) -> None:
         pod = PodNames.new()
         ok = False
         try:
-            kube.apply(image_pull_pod(name, pod, image))
+            kube.apply_image_pod(lambda: image_pull_pod(name, pod, image if kind is None else images.image(kind)), pod.hw, kind)
             end = time.monotonic() + timeout
             while time.monotonic() < end:
                 phase = kube.pod_phase(pod.hw)

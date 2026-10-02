@@ -22,6 +22,7 @@ from . import ui
 from .kube import Kubectl, KubectlError
 from .logparse import _STAGE_RE, _parse_sample_line, read_log
 from .models import WARN_TEMP, NodeInfo, StressConfig
+from . import images
 from .parsing import clean_text, format_duration
 from .paths import open_private
 from .runner import EXIT_ERROR, EXIT_INTERRUPTED, GATE_TIMEOUT, prep_fraction
@@ -338,6 +339,7 @@ def child_args(cfg: StressConfig, options: SeriesOptions, log_file: str, concurr
         args.append("--allow-no-sensor")
     if options.hw_privileged:
         args.append("--hw-privileged")
+    args += images.cli_args()
     if options.skip_hw:
         args.append("--no-hw")
     args += ["--max-busy-pct", str(options.max_busy_pct)]

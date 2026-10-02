@@ -359,9 +359,9 @@ class Collector:
 
             def prepare(n=name, p=probe, g=gpu) -> None:
                 try:
-                    self.kube.apply(dashboard_pod(n, p, self.rid, POD_DEADLINE))
+                    self.kube.apply_image_pod(lambda n=n, p=p: dashboard_pod(n, p, self.rid, POD_DEADLINE), p, "probe", log.warning)
                     if g:
-                        self.kube.apply(dashboard_gpu_pod(n, g, self.rid, POD_DEADLINE))
+                        self.kube.apply_image_pod(lambda n=n, g=g: dashboard_gpu_pod(n, g, self.rid, POD_DEADLINE), g, "tools", log.warning)
                     ok = self.kube.wait_ready(p, 90) and (not g or self.kube.wait_ready(g, 120))
                 except KubectlError:
                     ok = False

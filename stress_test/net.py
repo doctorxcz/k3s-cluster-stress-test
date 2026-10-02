@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .images import ensure_tools
+
 NET_TIME_DEFAULT = 10                    # s, one iperf3 test
 MIN_NET_TIME, MAX_NET_TIME = 5, 60
 NET_MODES = ("host", "pod")              # host = the nodes' real network, pod = the pod network (CNI/overlay)
@@ -376,5 +378,5 @@ def build_net_command(target: str, port: int, mode: str, net_time: int, rate_mbi
 
 
 NET_SERVER_SCRIPT = ("export DEBIAN_FRONTEND=noninteractive; "
-                     "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq iperf3 >/dev/null 2>&1 "
-                     "|| { echo NET-SERVER-FAILED; exit 1; }; exec iperf3 -s --forceflush -p PORT")
+                     + ensure_tools("iperf3") +
+                     " || { echo NET-SERVER-FAILED; exit 1; }; exec iperf3 -s --forceflush -p PORT")

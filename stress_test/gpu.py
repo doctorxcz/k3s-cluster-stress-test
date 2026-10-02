@@ -5,7 +5,10 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-GPU_IMAGE_DEFAULT = "nvidia/cuda:12.9.1-devel-ubuntu24.04"   # CUDA 12.x: also fine for Pascal cards (e.g. Quadro P620)
+from . import images
+
+GPU_IMAGE_DEFAULT = "nvidia/cuda:12.9.1-devel-ubuntu24.04"   # the FALLBACK image (builds gpu-burn in the pod); CUDA 12.x is fine for Pascal cards (e.g. Quadro P620)
+# The normal image is the prebuilt one (images.image("gpu")): the CUDA runtime with gpu_burn already built for several GPU generations
 GPU_BURN_REPO = "https://github.com/wilicc/gpu-burn"
 GPU_BURN_COMMIT = "3ead140434da9473582b68452f7115967a7a0581"       # pinned: the pod must never build whatever the repository has today
 _IMAGE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,254}")
@@ -178,6 +181,7 @@ def build_gpu_setup(mem_pct: int = GPU_MEM_PCT_DEFAULT) -> str:
     """Shell run after apt: finds a ready gpu_burn (prebuilt --gpu-image) or builds it for this card."""
     return ("GPU_BIN=$(command -v gpu_burn || ls /app/gpu_burn 2>/dev/null); "
             "if [ -z \"$GPU_BIN\" ]; then "
+            f"{images.ensure_tools('git make g++')} && "
             f"git init -q /tmp/gpu-burn && cd /tmp/gpu-burn && git fetch -q --depth 1 {GPU_BURN_REPO} {GPU_BURN_COMMIT} && "
             "git checkout -q FETCH_HEAD && "
             "CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '. '); "

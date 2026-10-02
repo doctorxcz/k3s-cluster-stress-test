@@ -26,6 +26,7 @@ Controlled by environment variables:
   FAKE_MEM_AVAILABLE_KB  MemAvailable from the probe in kB (default 6000000)
   FAKE_NO_MEM      "1" = the probe does not return MemAvailable (test of the fallback computation)
   FAKE_OTHER_PODS  JSON list of other pods of the tool
+  FAKE_PULL_FAIL  "1" = the prebuilt images (names with /k3s-stress-) cannot be pulled: the pod's waiting reason is ErrImagePull
   GPU simulation (profile gpu):
   FAKE_GPU         "1" = the node has allocatable nvidia.com/gpu: 1 and the hw script prints an NVIDIA GPU line;
                    "plugin-missing" = the hw script prints NVIDIA, but allocatable has no nvidia.com/gpu;
@@ -183,6 +184,16 @@ if cmd == "get":
         if pod.startswith("stress-test") and deleted(pod):
             print("Error from server (NotFound): pods not found", file=sys.stderr)
             sys.exit(1)
+        if "jsonpath={.status.containerStatuses[*].state.waiting.reason}" in args:      # why a pod does not start (image pull problems)
+            reason = ""
+            if os.environ.get("FAKE_PULL_FAIL") == "1":                                  # the prebuilt images (k3s-stress-*) cannot be pulled
+                try:
+                    image = json.load(open(flag(f"manifest-{pod}.json")))["spec"]["containers"][0]["image"]
+                    reason = "ErrImagePull" if "/k3s-stress-" in image else ""
+                except (OSError, KeyError, ValueError):
+                    pass
+            print(reason)
+            sys.exit(0)
         print("10.42.0.9" if "jsonpath={.status.podIP}" in args else "Succeeded")
 elif cmd == "top" and args[1] == "nodes":
     for s in NODE_SPECS:
@@ -201,6 +212,8 @@ elif cmd == "apply":
                 os.remove(sflag(stale, rid))
     if name.startswith("stress-test"):
         open(sflag("stress-started", rid), "w").close()
+        if os.path.exists(sflag("stress-ended", rid)):                 # the pod is applied again (image fallback): the load starts anew
+            os.remove(sflag("stress-ended", rid))
         if os.path.exists(flag(f"deleted-{name}")):
             os.remove(flag(f"deleted-{name}"))
 elif cmd == "delete":

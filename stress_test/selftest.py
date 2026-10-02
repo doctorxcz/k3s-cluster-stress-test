@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import ui
+from . import images, ui
 from . import gpu as gpumod
 from .disk import jobs as disk_jobs
 from .kube import Kubectl, KubectlError
@@ -224,7 +224,7 @@ class Probes:
 
     def __enter__(self) -> "Probes":
         for node in self.nodes:
-            self.kube.apply(probe_pod(node.name, self.names[node.name], 1800))
+            self.kube.apply_image_pod(lambda node=node: probe_pod(node.name, self.names[node.name], 1800), self.names[node.name].probe, "probe", ui.emit)
         for node in self.nodes:
             try:
                 if self.kube.wait_ready(self.names[node.name].probe, 90):
@@ -591,7 +591,7 @@ def _plan_run(args: argparse.Namespace, cli, level: str, chosen: list, subset: b
     names = ",".join(n.name for n in chosen)
     title = f"FULL self-test ({level}) · {len(chosen)} node(s)"
     if args.persistent:
-        argv = ["--self-test", "--self-test-level", level, "--self-test-ack", "--yes", "--non-interactive"]
+        argv = ["--self-test", "--self-test-level", level, "--self-test-ack", "--yes", "--non-interactive", *images.cli_args()]
         argv += ["--nodes", names] if subset else (["--include-master"] if with_master else [])
         if args.log_dir:
             argv += ["--log-dir", str(args.log_dir)]

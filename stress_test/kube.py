@@ -9,6 +9,7 @@ import subprocess
 import time
 from typing import Optional
 
+from . import images
 from .models import TOOL_LABEL, NodeInfo, NodeWorkload, ToolPod
 from .parsing import clean_ip, node_from_json, tool_pods_from_json, workload_from_json
 
@@ -118,6 +119,36 @@ class Kubectl:
                  manifest.get("spec", {}).get("nodeName"),
                  manifest.get("spec", {}).get("activeDeadlineSeconds"))
         self.run("apply", "-f", "-", input_text=json.dumps(manifest))
+
+    def pull_problem(self, pod: str) -> str:
+        """The reason why the image of a pod cannot be pulled (`ErrImagePull`, `ImagePullBackOff` ...), or '' (it is pulled, or nothing is wrong)."""
+        out = self.run("get", "pod", pod, "-o", "jsonpath={.status.containerStatuses[*].state.waiting.reason}", check=False)
+        return next((r for r in out.split() if r in images.PULL_ERRORS), "")
+
+    def apply_image_pod(self, build, name: str, kind: Optional[str], say=None, grace: float = 25.0, sleep=time.sleep,
+                        clock=time.monotonic) -> bool:
+        """Applies the pod that `build()` makes (it must read `images.image(kind)` when it is CALLED). When the prebuilt image of this kind
+        cannot be pulled within `grace` seconds the pod is replaced by one on the fallback image (plain Ubuntu / busybox, tools installed by apt -
+        slower, but it works) and every later pod of that kind does the same. True = the fallback was used. kind None = a custom image, no fallback."""
+        self.apply(build())
+        if kind is None or not images.active(kind):
+            return False
+        end = clock() + grace
+        while clock() < end:
+            reason = self.pull_problem(name)
+            if reason:
+                if say:
+                    say(f"⚠️  The prebuilt image {images.prebuilt_ref(kind)} cannot be pulled ({reason}) - continuing with {images.FALLBACK[kind]} "
+                        "and apt (slower). `--no-prebuilt` skips the attempt, `--registry` points at your own registry.")
+                log.warning("prebuilt image %s unavailable (%s): fallback %s", images.prebuilt_ref(kind), reason, images.FALLBACK[kind])
+                self.delete_pods(name)
+                images.mark_unavailable(kind)
+                self.apply(build())
+                return True
+            if self.pod_phase(name) in ("Running", "Succeeded", "Failed"):
+                return False
+            sleep(2)
+        return False
 
     def delete_pods(self, *names: str) -> None:
         """Deletes pods; ignores errors (a pod may not exist)."""

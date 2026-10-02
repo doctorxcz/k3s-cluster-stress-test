@@ -185,6 +185,17 @@ master/control-plane nodes are protected automatically.
   to open all the cards.
 - **`x` did not stop the test**: it asks first (`y`) and sends the same graceful stop as `--stop`; a test that is still cleaning its pod says so, check again with `--status`.
 
+### Prebuilt images (`k3s-stress-tools`, `-gpu`, `-probe`)
+- **"The prebuilt image … cannot be pulled (ErrImagePull)"**: the node could not download `ghcr.io/doctorxcz/k3s-stress-…:<version>` (the images are not published for
+  this version yet, the package is not public, the node has no internet or cannot resolve `ghcr.io`). The tool carries on with plain Ubuntu / busybox and `apt`, so the
+  test still runs, only slower. Check on the node: `kubectl run t --rm -it --image=ghcr.io/doctorxcz/k3s-stress-probe:<version> --restart=Never -- true` and
+  `kubectl describe pod <the pod>`; `--no-prebuilt` skips the attempt.
+- **The first test on a node is slow, later ones are fast**: the image is pulled once (about 170 MB for the tools, ~1.2 GB for the GPU image) and then cached on the node.
+  Several nodes pull at the same time; on a big cluster k3s can share images between nodes (`--embedded-registry`, see `deploy/images/README.md`).
+- **No internet / company network**: copy the images with `deploy/images/pull-to-folder.sh` and `push-to-registry.sh` into your registry and run with `--registry HOST/PATH`.
+- **`ping` says "Operation not permitted" when I try the image with rootless podman**: `ping` needs the `NET_RAW` capability, which pods in k3s have by default; add
+  `--cap-add=NET_RAW` for a local test.
+
 ### Planned tests (`9 SCHEDULE`, `--schedule`)
 - **The plan is gone after a restart:** a plain plan is a waiting process and does not survive a restart of the computer. Plan with *"survive a restart"*
   (menu `T` asks when systemd is available) or `--schedule … --persistent`: it becomes a systemd **user** timer (`~/.config/systemd/user/stress-test-<id>.timer`).

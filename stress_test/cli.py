@@ -13,7 +13,7 @@ from typing import Callable, Optional
 import secrets
 from pathlib import Path
 
-from . import background, baseline, compare, debuglog, parallel, series
+from . import background, baseline, compare, debuglog, images, parallel, series
 from .kube import Kubectl, KubectlError
 from .disk import (DISK_JOB_TIME_DEFAULT, DISK_SIZE_DEFAULT, MAX_DISK_JOB_TIME, MAX_DISK_SIZE,
                    MIN_DISK_JOB_TIME, MIN_DISK_SIZE, jobs as disk_jobs)
@@ -49,6 +49,17 @@ def node_arg(text: str) -> str:
     if not is_node_name(text):
         raise argparse.ArgumentTypeError(f"'{text[:60]}' is not a valid node name (lowercase letters, digits, - and .)")
     return text
+
+
+def registry_arg(text: str) -> str:
+    """--registry HOST[:PORT]/PATH : validated here, so that a typo is an argparse error and not a broken image name in a pod."""
+    try:
+        images.configure(text, True)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+    finally:
+        images.configure()                      # only a check: the choice is applied in _main
+    return text.strip().rstrip("/")
 
 
 def node_list_arg(text: str) -> str:
@@ -424,6 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="confirm questions automatically (e.g. for the master)")
     g.add_argument("--non-interactive", action="store_true",
                    help="do not ask anything, take missing values from the defaults")
+    g.add_argument("--registry", type=registry_arg, default=None, metavar="HOST/PATH",
+                   help=f"registry of the three prebuilt images (k3s-stress-tools, k3s-stress-gpu, k3s-stress-probe; default {images.REGISTRY_DEFAULT}) - "
+                        "your own registry for an offline or company cluster (see deploy/images/README.md)")
+    g.add_argument("--no-prebuilt", action="store_true",
+                   help="do not use the prebuilt images: pods start from plain Ubuntu / busybox and install their tools with apt (slower; the same "
+                        "happens by itself, with a warning, when a prebuilt image cannot be pulled)")
     g.add_argument("--no-hw", action="store_true",
                    help="do not detect node hardware (the hw-info pod is not started)")
     g.add_argument("--hw-privileged", action="store_true",
@@ -826,7 +843,7 @@ def _maybe_prepull(args: argparse.Namespace, kube: Kubectl, cfg: StressConfig, n
     """--gpu-prepull: warms the CUDA image on the nodes of a GPU test before anything starts."""
     if cfg.gpu and args.gpu_prepull and names:
         from . import gpu as gpumod, gpuscan
-        gpuscan.prepull(kube, names, cfg.gpu_image or gpumod.GPU_IMAGE_DEFAULT)
+        gpuscan.prepull(kube, names, cfg.gpu_image or images.image("gpu"))
 
 
 def cmd_list_gpus() -> int:
@@ -1322,6 +1339,8 @@ def cmd_migrate_logs() -> int:
 
 
 def _main(args: argparse.Namespace) -> int:
+    if args.registry or args.no_prebuilt:                    # only when asked: a FULL self-test runs its phases in this process and keeps the choice
+        images.configure(args.registry or images.registry(), not args.no_prebuilt)
     apply_quick(args)
     if args.migrate_logs:
         return cmd_migrate_logs()

@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .kube import Kubectl, KubectlError
-from .manifests import HW_LIMIT_MIB, IMAGE_UBUNTU, _base_pod
+from . import images
+from .manifests import HW_LIMIT_MIB, _base_pod
 from .models import PodNames
 from .net import PORT_BASE, PORT_SPAN, NET_RATE_CAP_MASTER, NetResult, parse_iperf, parse_kv, parse_ping
 
@@ -21,7 +22,7 @@ ASYMMETRY_FRACTION = 0.25         # A->B and B->A differing by more than 25 % ar
 POD_PREFIX = "net-mx"
 
 MX_SETUP_SCRIPT = ("export DEBIAN_FRONTEND=noninteractive; "
-                   "if apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq iperf3 iputils-ping >/dev/null 2>&1; "
+                   f"if {images.ensure_tools('iperf3 iputils-ping')}; "
                    f"then echo {MX_READY}; else echo MX-FAILED; fi; exec sleep infinity")
 MX_LINK_SCRIPT = ("if=$(awk '$2==\"00000000\"{print $1; exit}' /proc/net/route); "
                   "echo \"if=$if speed=$(cat /sys/class/net/$if/speed 2>/dev/null) "
@@ -60,7 +61,7 @@ def matrix_pod(node: str, name: str, deadline: int, run_id: str) -> dict:
     pod["spec"]["dnsPolicy"] = "ClusterFirstWithHostNet"
     pod["spec"]["containers"] = [{
         "name": "net-mx",
-        "image": IMAGE_UBUNTU,
+        "image": images.image("tools"),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["bash", "-c", MX_SETUP_SCRIPT],
         "resources": {"requests": {"memory": "64Mi"}, "limits": {"memory": f"{HW_LIMIT_MIB}Mi"}},
@@ -123,13 +124,13 @@ def run_matrix(kube: Kubectl, nodes: list, net_time: int, out: Callable[[str], N
     pair_count = len(nodes) * (len(nodes) - 1)
     deadline = pair_count * (net_time + 15) + MX_DEADLINE_MARGIN + deadline_extra
     try:
-        out(f"⏳ Starting a helper pod on each of {len(nodes)} nodes (iperf3 is installed via apt)...")
+        out(f"⏳ Starting a helper pod on each of {len(nodes)} nodes (iperf3 is in the image, or installed via apt)...")
         for n in nodes:
-            kube.apply(matrix_pod(n.name, pods[n.name], deadline, names.run_id))
+            kube.apply_image_pod(lambda n=n: matrix_pod(n.name, pods[n.name], deadline, names.run_id), pods[n.name], "tools", out)
         ready = []
         for n in nodes:
             if screen:
-                screen.prep(len(ready), len(nodes), f"waiting for the helper pod on {n.name} (iperf3 is installed via apt)")
+                screen.prep(len(ready), len(nodes), f"waiting for the helper pod on {n.name} (iperf3 is in the image, or installed via apt)")
             if _wait_ready(kube, pods[n.name]):
                 ready.append(n)
             else:

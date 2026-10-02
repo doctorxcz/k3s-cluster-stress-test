@@ -3,14 +3,16 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
+from . import images
 from .disk import build_disk_command
 from .gpu import build_gpu_command
 from .net import NET_SERVER_SCRIPT, build_net_command
 from .models import SPIKE_LOW_PCT, TOOL_LABEL, PodNames, StressConfig
 
-# image versions pinned firmly (no "latest", behaviour does not change by itself)
-IMAGE_UBUNTU = "ubuntu:24.04"
-IMAGE_BUSYBOX = "busybox:1.36"
+# image versions pinned firmly (no "latest", behaviour does not change by itself). These two are the FALLBACK images (a pod that cannot pull the prebuilt
+# one starts from them and installs its tools with apt); the pods normally use the prebuilt images of `images.py` (tools / gpu / probe).
+IMAGE_UBUNTU = images.FALLBACK["tools"]
+IMAGE_BUSYBOX = images.FALLBACK["probe"]
 
 # pod memory limits (the load pod may use the RAM test target + overhead, no more)
 STRESS_BASE_LIMIT_MIB = 1536       # test without RAM load (apt, stress-ng)
@@ -73,7 +75,7 @@ echo "System: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/d
 echo "Motherboard: $(cat /sys/class/dmi/id/board_name 2>/dev/null)"
 echo "RAM total: $(free -m | awk '/Mem:/{print $2}') MB"
 
-apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq dmidecode pciutils >/dev/null 2>&1
+@ENSURE_HW@ >/dev/null 2>&1
 dmidecode -t memory 2>/dev/null | awk -F': ' -v priv="$HW_PRIVILEGED" '
     function flush() {
         if (inrec && size != "" && size !~ /No Module/) {
@@ -97,13 +99,13 @@ dmidecode -t memory 2>/dev/null | awk -F': ' -v priv="$HW_PRIVILEGED" '
 gpu=$(lspci 2>/dev/null | grep -iE 'vga compatible|3d controller|display controller' | sed 's/^[^ ]* [^:]*: //' | paste -sd ';' - | sed 's/;/; /g')
 echo "GPU: ${gpu:-none detected (or pciutils could not be installed)}"
 lsblk -dn -o NAME,SIZE,ROTA,MODEL 2>/dev/null | awk '$1 !~ /^(loop|ram|zram|sr)/ {kind=($3=="1")?"HDD":"SSD/NVMe"; m=""; for(i=4;i<=NF;i++) m=m" "$i; printf "Disk %s: %s | %s |%s\n", $1, $2, kind, m}'
-"""
+""".replace("@ENSURE_HW@", images.ensure_tools("dmidecode pciutils"))
 
 
 # Disk health: SMART data of all disks as JSON between SMART-BEGIN/SMART-END markers (privileged pod).
 SMART_SCRIPT = r"""
 export DEBIAN_FRONTEND=noninteractive
-if ! { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq smartmontools >/dev/null 2>&1; }; then
+if ! @ENSURE_SMART@; then
     echo "SMART-UNAVAILABLE apt"; exit 0
 fi
 for dev in $(smartctl --scan 2>/dev/null | awk '{print $1}'); do
@@ -111,7 +113,7 @@ for dev in $(smartctl --scan 2>/dev/null | awk '{print $1}'); do
     smartctl -j -H -A -i "$dev" 2>/dev/null
     echo "SMART-END"
 done
-"""
+""".replace("@ENSURE_SMART@", images.ensure_tools("smartmontools"))
 
 
 def stress_memory_limit_mib(ram_target_mib: Optional[int]) -> int:
@@ -213,7 +215,7 @@ def hw_pod(node: str, names: PodNames, deadline: int = 300,
                 else {"allowPrivilegeEscalation": False})
     pod["spec"]["containers"] = [{
         "name": "hw-info",
-        "image": IMAGE_UBUNTU,
+        "image": images.image("tools"),
         "securityContext": security,
         "env": [{"name": "HW_PRIVILEGED", "value": "1" if privileged else "0"}],
         "command": ["bash", "-c", HW_SCRIPT],
@@ -228,7 +230,7 @@ def smart_pod(node: str, names: PodNames, deadline: int = 300) -> dict:
     pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
     pod["spec"]["containers"] = [{
         "name": "smart",
-        "image": IMAGE_UBUNTU,
+        "image": images.image("tools"),
         "securityContext": {"privileged": True},
         "command": ["bash", "-c", SMART_SCRIPT],
         "resources": {"requests": {"memory": "64Mi"},
@@ -255,7 +257,7 @@ def dashboard_gpu_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
     pod["spec"]["runtimeClassName"] = "nvidia"
     pod["spec"]["containers"] = [{
         "name": "gpu-probe",
-        "image": IMAGE_UBUNTU,
+        "image": images.image("tools"),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["sleep", "infinity"],
         "env": [{"name": "NVIDIA_VISIBLE_DEVICES", "value": "all"}, {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "utility"}],
@@ -270,7 +272,7 @@ def gpu_scan_pod(node: str, names: PodNames, deadline: int = 240) -> dict:
     pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
     pod["spec"]["containers"] = [{
         "name": "gpu-scan",
-        "image": IMAGE_UBUNTU,
+        "image": images.image("tools"),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["bash", "-c", SCAN_SCRIPT],
         "resources": {"requests": {"memory": "64Mi"},
@@ -298,7 +300,7 @@ def net_server_pod(node: str, names: PodNames, deadline: int, port: int, host_ne
     pod = _base_pod(names.hw, node, deadline, names.run_id, "net-server")
     pod["spec"]["containers"] = [{
         "name": "net-server",
-        "image": IMAGE_UBUNTU,
+        "image": images.image("tools"),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["bash", "-c", NET_SERVER_SCRIPT.replace("PORT", str(port))],
         "resources": {"requests": {"memory": "64Mi"},
@@ -322,7 +324,7 @@ def probe_pod(node: str, names: PodNames, deadline: int) -> dict:
     pod = _base_pod(names.probe, node, deadline, names.run_id, "probe")
     pod["spec"]["containers"] = [{
         "name": "probe",
-        "image": IMAGE_BUSYBOX,
+        "image": images.image("probe"),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["sleep", "infinity"],
         "resources": {"requests": {"memory": "16Mi"},
@@ -341,17 +343,17 @@ def stress_pod(node: str, names: PodNames, deadline: int, stress_cmd: str,
     # the file /tmp/go appears, so that all the pods of a parallel test can start the load together
     gate = (f"echo '{READY_MARKER}'; while [ ! -f {GATE_FILE} ] && [ $SECONDS -lt {gate_seconds} ]; do sleep 0.2; done; "
             f"if [ ! -f {GATE_FILE} ]; then echo '{FAILED_MARKER}'; exit 1; fi; ") if gate_seconds > 0 else ""
+    # the tools are normally in the prebuilt image already (`command -v`), otherwise apt installs the missing ones
     script = (
         "export DEBIAN_FRONTEND=noninteractive; "
-        "if apt-get update -qq >/dev/null 2>&1 && "
-        f"apt-get install -y -qq {package} >/dev/null 2>&1{f' && {setup}' if setup else ''}; then "
+        f"if {images.ensure_tools(package) if package else 'true'}{f' && {setup}' if setup else ''}; then "
         f"{gate}echo '{STARTED_MARKER}'; {stress_cmd}; "
         f"else echo '{FAILED_MARKER}'; fi"
     )
     pod = _base_pod(names.stress, node, deadline, names.run_id, "stress")
     pod["spec"]["containers"] = [{
         "name": "stress-test",
-        "image": image or IMAGE_UBUNTU,
+        "image": image or images.image("gpu" if gpu else "tools"),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["/bin/bash", "-c", script],
         # small request + fixed limit: when memory runs short the kernel kills this pod first

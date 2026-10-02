@@ -1394,13 +1394,30 @@ time           cpu %    temp °C      ram %  clock MHz    power W    net B/s
 </details>
 
 
+## Prebuilt images (since 1.18.0)
+Pods used to start from a clean `ubuntu:24.04` and run `apt-get update` + `apt-get install` first: 25 s on a fast node, **130 s on a slow Celeron**, in every test.
+Now they start from three ready-made images, pulled **once per node** and cached:
+
+| image | for |
+|---|---|
+| `k3s-stress-tools` | CPU / RAM / disk / network tests, hardware and SMART detection, GPU scan (`stress-ng`, `fio`, `smartmontools`, `iperf3`, `ping`, `mtr`, `curl`, `dmidecode`, `pciutils`, `lm-sensors`, `htop`, `sysstat`, `ethtool`, `dig` ...; the same Ubuntu 24.04 packages as before, so results stay comparable) |
+| `k3s-stress-gpu` | the GPU test: CUDA runtime + `gpu-burn` built for several GPU generations (6.1 ... 12.0) |
+| `k3s-stress-probe` | the temperature probe and the dashboard probes (busybox) |
+
+- **Default:** `ghcr.io/doctorxcz/<name>:<version>` for `linux/amd64` (arm64: build them yourself with `deploy/images/build.sh` on an arm64 machine, or with the GitHub workflow in `deploy/images/README.md`). The first use of a node downloads about 170 MB (`tools`), ~1.2 GB (`gpu`).
+- **Fallback:** when an image cannot be pulled (not published yet, no access, no internet) the tool warns and starts that kind of pod from plain Ubuntu /
+  busybox and installs the tools with `apt` - slower, but it works, like 1.17.0. `--no-prebuilt` forces that path.
+- **Your own registry** (offline or company cluster): `--registry registry.local:5000/lab`; `deploy/images/pull-to-folder.sh` and `push-to-registry.sh` carry the images
+  over as tar files. Building the images yourself, publishing with GitHub Actions and pinning by digest: [`deploy/images/README.md`](deploy/images/README.md).
+
 ## Requirements
 - Python 3.9+ (tested on 3.12)
 - `kubectl` with access to the cluster (k3s ships a symlink `/usr/local/bin/kubectl`)
 - `metrics-server` (for the `kubectl top` fallback of the RAM test; default in k3s)
-- a node with internet access (the pods pull the image and install `stress-ng` via `apt`)
-- nothing to install on the nodes themselves: the tools the tests need (`stress-ng`, `fio`, `smartctl`, `iperf3`,
-  `ping`, optionally `mtr`/`curl`) are installed by the pods with `apt` at run time and removed with the pod
+- a node that can pull container images (the three prebuilt images from `ghcr.io`, once per node - see **Prebuilt images** below; or your own registry
+  with `--registry`). Without them the pods fall back to plain Ubuntu and `apt`, which needs internet on the node
+- nothing to install on the nodes themselves: the tools the tests need (`stress-ng`, `fio`, `smartctl`, `iperf3`, `ping`, `mtr`, `curl`, `dmidecode`,
+  `lspci` ...) come with the prebuilt image (or are installed by the pod with `apt` when the image cannot be pulled) and go away with the pod
 - `--smart` and `--hw-privileged` start a **privileged** pod — the cluster must allow privileged pods
 - network tests need open TCP/UDP ports 30000–32767 between the nodes (see the warning below)
 - installation step by step: [`HELPDESK.md`](HELPDESK.md)
@@ -1457,6 +1474,8 @@ python3 -m stress_test --help
 | `--force` | bypass the master protection (`FORCE=1 python3 -m stress_test` works too) |
 | `-y`, `--yes` | confirm questions automatically (e.g. for the master) |
 | `--allow-no-sensor` | continue even without a CPU temperature sensor |
+| `--registry HOST/PATH` | take the three prebuilt images (`k3s-stress-tools`, `-gpu`, `-probe`) from this registry instead of `ghcr.io/doctorxcz` (offline / company cluster) |
+| `--no-prebuilt` | do not use the prebuilt images: pods start from plain Ubuntu / busybox and install their tools with `apt` (slower; it also happens by itself, with a warning, when an image cannot be pulled) |
 | `--no-hw` | do not detect node hardware (the `hw-info` pod is not started) |
 | `--hw-privileged` | the `hw-info` pod runs privileged (to list RAM modules via `dmidecode`); the default is without `privileged`. The hardware list also shows the GPU (`lspci`) and the disks (`lsblk`) |
 | `--non-interactive` | do not ask anything, take missing values from the defaults (`--node` required) |

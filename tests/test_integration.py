@@ -514,7 +514,7 @@ def test_cpu_only_test_has_base_memory_limit(tmp_path):
     assert res.returncode == 0
     pod = manifest(tmp_path, "stress-test")
     assert pod["spec"]["containers"][0]["resources"]["limits"]["memory"] == "1536Mi"
-    assert pod["spec"]["containers"][0]["image"] == "ubuntu:24.04"
+    assert pod["spec"]["containers"][0]["image"].startswith("ghcr.io/doctorxcz/k3s-stress-tools:")
 
 
 def test_hw_pod_unprivileged_by_default(tmp_path):

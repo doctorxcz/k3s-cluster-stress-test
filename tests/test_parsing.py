@@ -228,14 +228,14 @@ def test_pinned_images_and_hardening():
     n = PodNames.new("t1")
     stress = stress_pod("n", n, 100, "c", memory_limit_mib=5120)
     c = stress["spec"]["containers"][0]
-    assert c["image"] == IMAGE_UBUNTU == "ubuntu:24.04"
+    assert IMAGE_UBUNTU == "ubuntu:24.04" and c["image"].startswith("ghcr.io/doctorxcz/k3s-stress-tools:")      # fallback pinned, normal pod = the prebuilt image
     assert ":" in IMAGE_BUSYBOX and not IMAGE_UBUNTU.endswith("latest")
     assert stress["spec"]["automountServiceAccountToken"] is False
     assert c["securityContext"]["allowPrivilegeEscalation"] is False
     assert c["resources"]["limits"]["memory"] == "5120Mi"
     assert c["resources"]["requests"]["memory"] == "64Mi"      # small request -> OOM first
     probe = probe_pod("n", n, 100)["spec"]["containers"][0]
-    assert probe["image"] == IMAGE_BUSYBOX
+    assert IMAGE_BUSYBOX == "busybox:1.36" and probe["image"].startswith("ghcr.io/doctorxcz/k3s-stress-probe:")
     assert probe["volumeMounts"][0]["readOnly"] is True
 
 

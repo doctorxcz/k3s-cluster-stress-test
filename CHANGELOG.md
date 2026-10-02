@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.18.0 - 2026-10-02
+- **Prebuilt images (tools / gpu / probe):** the pods start from three ready-made images (`ghcr.io/doctorxcz/k3s-stress-tools|gpu|probe`, amd64) instead of
+  installing their tools with `apt-get` in every test. Measured in the logs of 33 real runs: the preparation of a test took 81 s on the slowest node
+  (130 s of it `apt-get install stress-ng`; 118-157 s lately) and 25 s on the fastest. Each image is pulled once per node and cached. The pod scripts install
+  only what is missing (`command -v tool || apt-get ...`), so when an image cannot be pulled the tool **falls back by itself** (with a warning) to plain
+  Ubuntu / busybox + apt, exactly as before. New `--no-prebuilt` and `--registry HOST/PATH` (your own registry, offline clusters; scripts in `deploy/images/`).
+  The tools image also carries `lm-sensors`, `htop`, `sysstat`, `ethtool`, `dig`, `nvme-cli` and other diagnostics; the GPU image has gpu-burn built for
+  several GPU generations. See `deploy/images/README.md`.
+
 ## 1.17.0 - 2026-10-01
 - **Dashboard (`D`, `--dashboard`):** a live overview of every node in three widths (up to 90 / 91-160 / over 160 columns), refresh 0.5 - 30 s, read-only probe pods that
   exist only while it is open. New keys: `o` sort, `/` filter, `f` show (problems / workers / gpu), `v` views (temperatures, network, disks, GPU), `l` pods and the end of a pod log

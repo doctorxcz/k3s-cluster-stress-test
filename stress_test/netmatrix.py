@@ -61,7 +61,7 @@ def matrix_pod(node: str, name: str, deadline: int, run_id: str) -> dict:
     pod["spec"]["dnsPolicy"] = "ClusterFirstWithHostNet"
     pod["spec"]["containers"] = [{
         "name": "net-mx",
-        "image": images.image("tools"),
+        "image": images.image("tools", node),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["bash", "-c", MX_SETUP_SCRIPT],
         "resources": {"requests": {"memory": "64Mi"}, "limits": {"memory": f"{HW_LIMIT_MIB}Mi"}},
@@ -126,7 +126,7 @@ def run_matrix(kube: Kubectl, nodes: list, net_time: int, out: Callable[[str], N
     try:
         out(f"⏳ Starting a helper pod on each of {len(nodes)} nodes (iperf3 is in the image, or installed via apt)...")
         for n in nodes:
-            kube.apply_image_pod(lambda n=n: matrix_pod(n.name, pods[n.name], deadline, names.run_id), pods[n.name], "tools", out)
+            kube.apply_image_pod(lambda n=n: matrix_pod(n.name, pods[n.name], deadline, names.run_id), pods[n.name], "tools", out, node=n.name)
         ready = []
         for n in nodes:
             if screen:

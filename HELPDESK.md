@@ -6,6 +6,7 @@ check the "Common issues" section at the bottom before opening an issue.
 
 ## 0. What this tool actually needs
 
+- Nodes of **amd64 or arm64** (a mixed cluster is fine; Raspberry Pi 3/4/5 with a 64-bit OS work too - see "Raspberry Pi / ARM nodes" below).
 - A machine with **Python 3.9+** and a working **`kubectl`** pointed at your cluster.
 - That's it — no config files, no API keys, no account. The tool only ever runs `kubectl` commands
   under the hood, using whatever context is already active on your machine.
@@ -183,7 +184,23 @@ master/control-plane nodes are protected automatically.
   parallel subprocess is shown by its series. A finished test disappears at once.
 - **A narrow window shows cards instead of a table**: under 60 columns every test is a card (scroll with `j` `k`); widen the window for the table, or make it taller
   to open all the cards.
+- **Where is the time to the end?** Every test shows `⏱ started · running · ~left · ends`; for a test on several nodes the time is an estimate from the plan (marked `~`), for one node it
+  follows the log. `LEFT` per node needs 110 columns; a very narrow window shows the time in the card of the test.
 - **`x` did not stop the test**: it asks first (`y`) and sends the same graceful stop as `--stop`; a test that is still cleaning its pod says so, check again with `--status`.
+
+### Raspberry Pi / ARM nodes
+- **Which images does an ARM node use?** `tools` and `probe` 1.19.0 are multi-arch, so an arm64 node (Raspberry Pi with a 64-bit OS, most ARM boards) pulls the arm64 variant of the
+  same image - no `apt`, fast start. A 32-bit OS (armv7) uses plain Ubuntu / busybox and installs the tools with `apt` (slower start, needs internet). Check with
+  `./stress.sh --list-nodes` (it shows `arm64` / `armv7` next to every node).
+- **"No CPU temperature sensor was found on the node!" / "The test without temperature protection was not confirmed"**: the tool reads `cpu_thermal` (Raspberry Pi), `soc_thermal` / `bigcore*_thermal` (Rockchip) and the CPU / SoC zones of
+  `/sys/class/thermal`. Your board names it differently. On the node run `for d in /sys/class/hwmon/hwmon*; do echo "$d $(cat $d/name) $(cat $d/temp1_input)"; done` and
+  `for z in /sys/class/thermal/thermal_zone*; do echo "$z $(cat $z/type) $(cat $z/temp)"; done` and keep the output for a bug report. Until it is supported run with `--allow-no-sensor`
+  (there is then **no automatic stop on overheating** - use a short `--time` and watch the temperature, e.g. with `vcgencmd measure_temp` on a Pi).
+- **CPU clock or power is empty**: not every ARM kernel offers cpufreq, and CPU power (RAPL) is Intel only; nothing breaks, those columns are just empty.
+- **"The GPU test supports NVIDIA cards on amd64 nodes only"**: the GPU test uses an NVIDIA CUDA image for x86; it is refused on ARM nodes on purpose.
+- **A Raspberry Pi throttles at once**: that is normal under full load without cooling or with a weak power supply; the summary says "throttling" when the clock drops. Use a proper
+  power supply and a heat sink / fan, and compare with `--compare` or a baseline.
+- **The disk shows `SD/eMMC`**: SD cards and eMMC are labelled like that in the hardware text; the fio disk test works on them (an SD card is slow and wears out - use a small `--disk-size`).
 
 ### Prebuilt images (`k3s-stress-tools`, `-gpu`, `-probe`)
 - **"The prebuilt image … cannot be pulled (ErrImagePull)"**: the node could not download `ghcr.io/doctorxcz/k3s-stress-…:<version>` (the images are not published for

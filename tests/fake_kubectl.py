@@ -15,6 +15,7 @@ Controlled by environment variables:
   FAKE_FREQ_DROP   "1" = the clock under load drops by 100 MHz at every reading (throttling simulation)
   FAKE_CPU_BUSY    CPU utilisation in % under the load of a classic test (default 100; idle 10, cooldown 5)
   FAKE_MASTER      "1" = the only default node has the control-plane role
+  FAKE_ARCH        node architecture reported to the tool (default amd64; e.g. arm64); a node of FAKE_NODES may carry its own "arch"
   FAKE_NO_SENSOR   "1" = the probe does not return the CPU temperature
   FAKE_RUN         how long (s) stress-ng "runs" in total (in the stepped test it is split between the stages);
                    at the end it prints "successful run completed" (for every stage separately)
@@ -106,7 +107,7 @@ def node_object(spec):
             "addresses": [{"type": "InternalIP", "address": spec.get("ip", "10.0.0.1")},
                           {"type": "Hostname", "address": spec["name"]}],
             "nodeInfo": {"osImage": "FakeOS", "kernelVersion": "1.0",
-                         "architecture": "amd64", "containerRuntimeVersion": "fake://1"},
+                         "architecture": spec.get("arch") or os.environ.get("FAKE_ARCH", "amd64"), "containerRuntimeVersion": "fake://1"},
         },
     }
 

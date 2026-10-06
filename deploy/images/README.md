@@ -9,7 +9,9 @@ Since 1.18.0 the pods of the tool start from three ready-made images instead of 
 | `k3s-stress-gpu` | the GPU test | the CUDA runtime + `gpu-burn` (pinned commit) built for compute capabilities 6.1 / 7.0 / 7.5 / 8.0 / 8.6 / 8.9 / 9.0 / 12.0; a wrapper picks the kernel that fits the card |
 | `k3s-stress-probe` | the temperature probe and the dashboard probes | busybox (pinned) |
 
-Default location: `ghcr.io/doctorxcz/<name>:<version of the tool>` (for example `ghcr.io/doctorxcz/k3s-stress-tools:1.18.0`), for `linux/amd64`. The published images are amd64 only; for arm64 nodes build them on an arm64 machine (`./build.sh`, no QEMU needed there) and use `--registry`, or use the GitHub workflow below.
+Default location: `ghcr.io/doctorxcz/<name>:<IMAGE_TAG>` (for example `ghcr.io/doctorxcz/k3s-stress-tools:1.18.0`). `IMAGE_TAG` (in `stress_test/images.py`) is the tag of the published images - **not** the version of the tool, so the tool can be released without new images.
+
+**Architectures.** The tool reads the architecture of every node from Kubernetes and gives each pod an image that can run there. The 1.18.0 images are `linux/amd64` only, so an arm64 / armv7 node (Raspberry Pi, any ARM board) starts from the multi-arch fallback images (`ubuntu:24.04`, `busybox:1.36`) and installs the tools with apt (slower start, works). `images.PUBLISHED` says for which architectures the images of `IMAGE_TAG` exist; once a multi-arch tag is published (below) ARM nodes use the prebuilt images too. The GPU image stays amd64 only (gpu-burn and the NVIDIA runtime are built for x86 cards; the GPU test is refused on other nodes).
 Each image is pulled **once per node** and stays in the node's image cache; later tests start in seconds.
 
 ## What the tool does with them
@@ -27,10 +29,17 @@ cd deploy/images
 ./build.sh --only "tools probe"    # the GPU image downloads the CUDA devel image (~3.5 GB)
 ./build.sh --save ~/images         # also writes k3s-stress-<name>-<tag>.tar files
 ```
-A multi-arch (`linux/amd64` + `linux/arm64`) publication is done by the GitHub workflow (`.github/workflows/images.yml` in the lab / main repository, QEMU); locally `arm64` needs an arm64 machine or `qemu-user-static`.
+### Multi-arch (amd64 + arm64) - locally
+```bash
+sudo apt install qemu-user-binfmt qemu-user        # once (Ubuntu 26.04; on Debian / Ubuntu <= 24.04 it is `qemu-user-static`): lets this amd64 machine run arm64 containers (an arm64 machine needs nothing)
+./build.sh 1.19.0 --platforms linux/amd64,linux/arm64 --only "tools probe"     # builds a manifest list, tests the tools on BOTH platforms (arm64 under QEMU: minutes); pushes nothing
+./publish.sh 1.19.0                                # shows what it will push, asks, refuses to replace an existing tag; podman must be logged in to ghcr.io
+./check_published.py 1.19.0                        # reads the registry: platforms + digests + the snippet for stress_test/images.py
+```
+Then put the snippet into `stress_test/images.py` (`IMAGE_TAG`, `DIGESTS` with the digests of the INDEXES, `PUBLISHED` with `arm64`), set new packages to public, and run `./check_published.py --verify-code` (exit 1 when the code and the registry disagree). Use a NEW tag (not 1.18.0): the digest pin of 1.18.0 and the nodes' image caches refer to it.
 
 ## Publish (GitHub Actions)
-The workflow `.github/workflows/images.yml` (kept in the development repository, not in the release) builds and pushes all three images for `linux/amd64` and `linux/arm64` when a version tag (`v1.18.0`) is pushed, and records
+The workflow `.github/workflows/images.yml` (kept in the development repository, not in the release; to use it, it has to live in a GitHub repository) builds and pushes `tools` and `probe` for `linux/amd64` + `linux/arm64` and `gpu` for `linux/amd64` when a version tag (`v1.19.0`) is pushed, smoke-tests every platform (arm64 under QEMU), and records
 the digests in the job summary. After the first push set each package to **public** (GitHub > your profile > Packages > the package > Package settings >
 Change visibility), otherwise the nodes cannot pull it without a login. To pin exactly the tested bytes put the digests into `DIGESTS` in
 `stress_test/images.py` (the pods then use `name:tag@sha256:...`).

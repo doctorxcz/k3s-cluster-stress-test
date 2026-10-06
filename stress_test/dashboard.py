@@ -237,6 +237,7 @@ class ClusterView:
     problems: list = field(default_factory=list)        # (node, ns/name, reason, restarts) of pods that are not fine
     top_restarts: list = field(default_factory=list)
     running: list = field(default_factory=list)         # background tests
+    live: list = field(default_factory=list)            # the same with progress, time left and what the logs say (watch.live_summary)
     plans: list = field(default_factory=list)           # planned tests
     stamp: float = 0.0
     error: str = ""
@@ -284,7 +285,7 @@ def parse_extras(text: str) -> dict:
             elif key == "tasks" and parts:
                 out["tasks"] = parts[0]
             elif key == "disk" and len(parts) >= 3:
-                out["disks"].append({"name": parts[0], "size_gb": int(parts[1]) // 1, "kind": "HDD" if parts[2] == "1" else "SSD/NVMe",
+                out["disks"].append({"name": parts[0], "size_gb": int(parts[1]) // 1, "kind": "SD/eMMC" if parts[0].startswith("mmcblk") else "HDD" if parts[2] == "1" else "SSD/NVMe",
                                      "model": clean_text(" ".join(parts[3:]), 40)})
             elif key == "peer" and len(parts) >= 2:
                 out["peers"][parts[0]] = None if parts[1] == "lost" else float(parts[1])
@@ -338,6 +339,7 @@ class Collector:
         self._events_at = 0.0
         self._tests_at = 0.0
         self._test_cache: dict = {}                # log path -> (mtime, summary)
+        self._watcher = None                       # reads the logs of the running tests (created on first use)
         self._lock = threading.RLock()
         self.status = "starting"
 
@@ -359,9 +361,9 @@ class Collector:
 
             def prepare(n=name, p=probe, g=gpu) -> None:
                 try:
-                    self.kube.apply_image_pod(lambda n=n, p=p: dashboard_pod(n, p, self.rid, POD_DEADLINE), p, "probe", log.warning)
+                    self.kube.apply_image_pod(lambda n=n, p=p: dashboard_pod(n, p, self.rid, POD_DEADLINE), p, "probe", log.warning, node=n)
                     if g:
-                        self.kube.apply_image_pod(lambda n=n, g=g: dashboard_gpu_pod(n, g, self.rid, POD_DEADLINE), g, "tools", log.warning)
+                        self.kube.apply_image_pod(lambda n=n, g=g: dashboard_gpu_pod(n, g, self.rid, POD_DEADLINE), g, "tools", log.warning, node=n)
                     ok = self.kube.wait_ready(p, 90) and (not g or self.kube.wait_ready(g, 120))
                 except KubectlError:
                     ok = False
@@ -408,8 +410,21 @@ class Collector:
                 self.view.plans = schedule.list_plans()
             except Exception:                                    # noqa: BLE001 - the plan list must not break the screen
                 self.view.plans = []
+            self.view.live = self._live_tests()
             self.view.stamp = time.time()
         return self.view
+
+    def _live_tests(self) -> list:
+        """Progress, time left and the numbers of the running tests, from their registry records and result logs."""
+        try:
+            from . import watch
+            if self._watcher is None:
+                self._watcher = watch.Watcher()
+            self._watcher.refresh()
+            return watch.live_summary(self._watcher)
+        except Exception:                                        # noqa: BLE001 - extra information must never break the dashboard
+            log.debug("live test summary failed", exc_info=True)
+            return []
 
     def _guard(self, step, what: str) -> None:
         """One part of a round may fail (an odd object in the cluster, a timeout) - the rest of the data must still show."""
@@ -889,10 +904,20 @@ def _alerts(view: ClusterView, on: bool) -> list:
     return [ui.paint(a, ui.YELLOW, on) for a in out[:3]]
 
 
-def _tests_rows(view: ClusterView, on: bool) -> list:
+def _tests_rows(view: ClusterView, on: bool, detail: bool = False) -> list:
+    """The running tests: with progress and time left when the logs are known; `detail` adds the timing and the numbers."""
     rows = []
+    live = {x["id"]: x for x in view.live}
     for r in view.running:
-        rows.append(f"🟡 {ui.paint('running', ui.YELLOW, on)} {r.get('title') or r.get('node', '?')} ({r.get('node', '?')})")
+        x = live.get(r.get("run_id"))
+        if x is None:
+            rows.append(f"🟡 {ui.paint('running', ui.YELLOW, on)} {r.get('title') or r.get('node', '?')} ({r.get('node', '?')})")
+            continue
+        filled = round(10 * x["frac"])
+        rows.append(f"🟡 {ui.paint('running', ui.YELLOW, on)} {x['icon']} {x['name']} {x['where']}  "
+                    f"{ui.paint('█' * filled + '░' * (10 - filled), ui.GREEN, on)} {100 * x['frac']:.0f}%  {x['label']}")
+        if detail:
+            rows += [f"   {ui.paint(x[k], ui.GREY, on)}" for k in ("timing", "info") if x[k]]
     for p in view.plans[:5]:
         rows.append(f"🕒 {schedule.describe_when(p['start_at'])}  {p['title']}")
     return rows or [ui.paint("no test is running or planned", ui.GREY, on)]
@@ -1175,7 +1200,7 @@ def block_problems(view: ClusterView, on: bool, width: int) -> list:
 
 def block_tests(view: ClusterView, on: bool) -> list:
     rows = [_title("tests", on)]
-    rows += _tests_rows(view, on)[:3]
+    rows += _tests_rows(view, on, detail=True)[:7]
     for n in view.nodes:
         if n.last_test:
             rows.append(f"{n.name[:24]:<24} {n.last_test}" + (ui.paint("  ✓ baseline", ui.GREEN, on) if n.has_baseline else ""))

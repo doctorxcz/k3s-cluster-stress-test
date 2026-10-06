@@ -224,7 +224,7 @@ class Probes:
 
     def __enter__(self) -> "Probes":
         for node in self.nodes:
-            self.kube.apply_image_pod(lambda node=node: probe_pod(node.name, self.names[node.name], 1800), self.names[node.name].probe, "probe", ui.emit)
+            self.kube.apply_image_pod(lambda node=node: probe_pod(node.name, self.names[node.name], 1800), self.names[node.name].probe, "probe", ui.emit, node=node.name)
         for node in self.nodes:
             try:
                 if self.kube.wait_ready(self.names[node.name].probe, 90):

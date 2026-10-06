@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.19.0 - 2026-10-06
+**Runs on Raspberry Pi and other ARM boards (arm64), and shows how long a test still takes.**
+
+### Added
+- **arm64 / mixed amd64 + arm64 clusters.** The tool reads the architecture of every node from Kubernetes (`--list-nodes` shows it) and gives each pod an image that can run there.
+  The prebuilt `tools` and `probe` images **1.19.0 are multi-arch (`linux/amd64` + `linux/arm64`)**, so a Raspberry Pi 3/4/5 with a 64-bit OS starts a test without `apt`. A 32-bit ARM node
+  (or any architecture without a prebuilt image) starts from the multi-arch `ubuntu:24.04` / `busybox:1.36` images and installs the tools with `apt` (slower start). A pull failure on
+  one architecture no longer switches the prebuilt image off for the others. The GPU image stays amd64 only (`1.18.0`); the GPU test is refused on other nodes with a clear message.
+- **CPU temperature and automatic stop on ARM.** The probe reads `cpu_thermal` (Raspberry Pi), `soc_thermal` / `bigcore*_thermal` (Rockchip) and, when no such sensor exists,
+  `/sys/class/thermal/thermal_zone*` of a CPU / SoC zone. GPU, NPU, DDR, battery and Wi-Fi zones are never taken for the CPU.
+- **Hardware text on ARM.** The CPU core comes from `lscpu` (arm64 kernels print no `model name`), the board from the device tree ("Raspberry Pi 4 Model B Rev 1.5"), an SD card or eMMC is
+  labelled `SD/eMMC`, and there is a new `Arch:` line. A new "Platforms: amd64 and arm64" section in the README and a "Raspberry Pi / ARM nodes" section in `HELPDESK.md`.
+- **Time to the end** in the live status (key `W`) and in the cluster dashboard: `⏱ started 10:23 · running 5:12 · ~54:48 left · ends ~11:28` for every test (a single node is measured
+  from its log, including the cooldown; several nodes are an estimate from the plan, marked `~`). The progress bar of several nodes follows the time, the table of nodes has a `LEFT` column
+  (from 110 columns), a multi-node test shows the **hottest node and its margin to the stop limit**, and a CPU test its **peak temperature, average CPU load and average power**.
+  The running tests block of the dashboard shows the same.
+- **Publishing multi-arch images** (`deploy/images/`): `build.sh --platforms linux/amd64,linux/arm64` builds and tests an image on every platform (podman + QEMU), `publish.sh` pushes it (asks first,
+  never replaces an existing tag) and `check_published.py` reads the registry (platforms, digests) and compares it with the code.
+- Tests: `test_multiarch.py`, `test_platforms.py` (+ `platform_matrix.py`, the measurement of amd64 / arm64 platforms), `test_image_publishing.py`; 1584 passing tests in total.
+
+### Changed
+- The image tag is now independent of the version of the tool (`IMAGE_TAG` in `stress_test/images.py`): the tool can be released without publishing new images.
+- Hardening: the CI workflow that publishes images pins third-party actions by commit; `deploy/images/check_published.py` fetches only `https` URLs and validates the registry name.
+
+### Good to know
+- The ARM support was developed and tested against modelled `/sys` and `/proc` layouts of typical boards (Raspberry Pi 3/4/5, a Rockchip RK3588 board, a bare arm64 box) with the real probe scripts,
+  and against the multi-arch images run under QEMU - not yet on every real board. If your board is refused for a missing CPU sensor, `HELPDESK.md` tells what to send; `--allow-no-sensor` runs the
+  test anyway (then there is **no automatic stop on overheating**).
+- Known open hardening (not vulnerabilities): the pods do not yet drop all capabilities or set `seccompProfile: RuntimeDefault` (marked `xfail` in `tests/test_security.py`).
+
 ## 1.18.0 - 2026-10-02
 - **Prebuilt images (tools / gpu / probe):** the pods start from three ready-made images (`ghcr.io/doctorxcz/k3s-stress-tools|gpu|probe`, amd64) instead of
   installing their tools with `apt-get` in every test. Measured in the logs of 33 real runs: the preparation of a test took 81 s on the slowest node

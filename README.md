@@ -4,7 +4,8 @@
 
 # Kubernetes stress test (Python)
 
-> **Version 1.17.0 (English)** (cluster dashboard with graphs, live status of the running tests, scheduling, height-aware screens, GPU test, FULL self-test - see
+> **Version 1.19.0 (English)** (**runs on amd64 and arm64 - Raspberry Pi and other ARM boards**, multi-arch prebuilt images, time to the end in the live status and the
+> dashboard, cluster dashboard with graphs, live status of the running tests, scheduling, height-aware screens, GPU test, FULL self-test - see
 > [`CHANGELOG.md`](CHANGELOG.md)). New here? Start with [`HELPDESK.md`](HELPDESK.md) — a step-by-step
 > installation and troubleshooting guide. **What does it look like?** See the [Gallery](#gallery---what-every-screen-looks-like). Quick start: `./stress.sh --list-nodes`, then
 > `./stress.sh --node <worker> --time 60 --cpu-load 50` (a safe first test) or just `./stress.sh` for the menu.
@@ -135,6 +136,12 @@ in one line), a **CPU** test the CPU, RAM, temperature, clock, power, stage and 
 test a table of the nodes with the detail of the selected one and the phase. Narrow windows (under 60 columns) get **cards stacked downwards** with scrolling (`j` `k`)
 instead of a squeezed table; tall windows open all of them. Keys: `↑↓` test · `Tab` node · `Enter` end of the log · `x` stop the test (asks first) · `+` `-` interval ·
 `p` pause · `e` save the screen · `q` back.
+
+**Time to the end and more (since 1.19.0).** Every test shows `⏱ started 10:23 · running 5:12 · ~54:48 left · ends ~11:28` (for a test on one node measured from its log, including the cooldown;
+for several nodes an estimate from the plan, marked `~`), the progress bar of several nodes follows the time instead of the number of finished nodes, and the table of nodes has a
+`LEFT` column (from 110 columns). A multi-node test also shows the **hottest node and its margin to the stop limit** (`🌡 hottest dell-9020 79° · margin 6° to 85 · peak 79°`), a CPU test
+the **peak temperature, average CPU load and average power** seen so far (`📊 peak 79° (6° below the stop) · avg CPU 100 % · avg power 20 W`). The same progress, time left and numbers
+appear in the **running tests block of the cluster dashboard** (wide window; a narrow one keeps one line in the header).
 
 ## Scheduling tests for later (`9 SCHEDULE`, key `T`)
 Any test - CPU, GPU, disk, network, quick and the FULL self-test - can be planned:
@@ -1394,6 +1401,24 @@ time           cpu %    temp °C      ram %  clock MHz    power W    net B/s
 </details>
 
 
+## Platforms: amd64 and arm64 (Raspberry Pi, ARM boards) - since 1.19.0
+The tool reads the architecture of every node from Kubernetes (`kubectl get nodes`, `--list-nodes` shows it) and adapts to it, so one program tests a **mixed cluster**:
+
+| | amd64 (Intel, AMD) | arm64 (Raspberry Pi 3/4/5 64-bit, Rockchip, Allwinner, ... boards) | armv7 (32-bit ARM) |
+|---|---|---|---|
+| CPU temperature + automatic stop | `coretemp`, `k10temp`, `zenpower` | `cpu_thermal` (Raspberry Pi), `soc_thermal` / `bigcore*_thermal` (Rockchip), else `/sys/class/thermal/thermal_zone*` of a CPU / SoC zone | same as arm64 |
+| CPU clock | cpufreq | cpufreq (if the kernel offers it; otherwise the clock column stays empty) | same |
+| CPU power (W) | Intel RAPL | not available (nothing is printed) | not available |
+| Hardware text | CPU model from `/proc/cpuinfo`, machine from DMI | CPU core from `lscpu` (e.g. `Cortex-A72`), board from the device tree (`Raspberry Pi 4 Model B`), SD card / eMMC shown as `SD/eMMC` | same |
+| Container images | the prebuilt images (fast start) | the **same multi-arch prebuilt images** (fast start) | Ubuntu / busybox + `apt` (slower start) |
+| GPU test (NVIDIA) | yes | **refused** with a clear message (gpu-burn is built for x86 cards) | refused |
+
+- A sensor the tool does not know is never guessed: GPU, NPU, DDR, battery and Wi-Fi zones are not taken for the CPU. If no CPU temperature can be read, the tool warns that the
+  automatic stop on overheating would not work and asks you to confirm (refused when it asks nothing; `--allow-no-sensor` runs it anyway - then watch the temperature yourself).
+- Raspberry Pi tip: use a good power supply and cooling, and expect the clock to drop on its own (the throttling check in the summary shows it).
+- Only the layout of typical devices was checked (modelled `/sys` and `/proc` of Raspberry Pi 3/4/5, a Rockchip RK3588 board and a bare arm64 box, with the real probe scripts) - not every
+  board names its sensors the same way. If your board is refused for a missing sensor, `HELPDESK.md` ("Raspberry Pi / ARM nodes") tells what to send.
+
 ## Prebuilt images (since 1.18.0)
 Pods used to start from a clean `ubuntu:24.04` and run `apt-get update` + `apt-get install` first: 25 s on a fast node, **130 s on a slow Celeron**, in every test.
 Now they start from three ready-made images, pulled **once per node** and cached:
@@ -1404,7 +1429,7 @@ Now they start from three ready-made images, pulled **once per node** and cached
 | `k3s-stress-gpu` | the GPU test: CUDA runtime + `gpu-burn` built for several GPU generations (6.1 ... 12.0) |
 | `k3s-stress-probe` | the temperature probe and the dashboard probes (busybox) |
 
-- **Default:** `ghcr.io/doctorxcz/<name>:<version>` for `linux/amd64` (arm64: build them yourself with `deploy/images/build.sh` on an arm64 machine, or with the GitHub workflow in `deploy/images/README.md`). The first use of a node downloads about 170 MB (`tools`), ~1.2 GB (`gpu`).
+- **Default:** `ghcr.io/doctorxcz/<name>:<image tag>` - `tools` and `probe` **1.19.0 are multi-arch (`linux/amd64` + `linux/arm64`)**, the GPU image is `1.18.0` (amd64 only). The image tag is independent of the version of the program (`IMAGE_TAG` in `stress_test/images.py`). Each node pulls the variant of its own architecture; 32-bit ARM nodes use the fallback below. Building or publishing multi-arch images yourself: `deploy/images/README.md`. The first use of a node downloads about 170 MB (`tools`), ~1.2 GB (`gpu`).
 - **Fallback:** when an image cannot be pulled (not published yet, no access, no internet) the tool warns and starts that kind of pod from plain Ubuntu /
   busybox and installs the tools with `apt` - slower, but it works, like 1.17.0. `--no-prebuilt` forces that path.
 - **Your own registry** (offline or company cluster): `--registry registry.local:5000/lab`; `deploy/images/pull-to-folder.sh` and `push-to-registry.sh` carry the images
@@ -1412,6 +1437,7 @@ Now they start from three ready-made images, pulled **once per node** and cached
 
 ## Requirements
 - Python 3.9+ (tested on 3.12)
+- a cluster of **amd64 and/or arm64** nodes (a mixed cluster works; see **Platforms** below)
 - `kubectl` with access to the cluster (k3s ships a symlink `/usr/local/bin/kubectl`)
 - `metrics-server` (for the `kubectl top` fallback of the RAM test; default in k3s)
 - a node that can pull container images (the three prebuilt images from `ghcr.io`, once per node - see **Prebuilt images** below; or your own registry
@@ -1855,6 +1881,7 @@ stress_test/
   gpuscan.py    GPU scan of all nodes (--list-gpus, menu 2), node choice, the multi-node table (GpuBoard), image pre-pull
   net.py        network test of one node (--profile net, --net-extra, --net-watch)
   netmatrix.py  network matrix of all nodes (--net-matrix)
+  images.py     the container images: tags, digests, architectures (amd64 / arm64), fallback to apt, per-node choice
 conftest.py     writes the history of pytest runs to .logs/tests/<day>/
 tests/
   test_parsing.py, test_models.py, test_monitor.py, test_summary.py, test_compare.py,
@@ -1863,7 +1890,9 @@ tests/
   test_net.py, test_net_extras.py, test_net_watch.py, test_netmatrix.py, test_power.py,
   test_menu.py, test_menu_v2.py, test_security.py, test_live_ui.py, test_sync_start.py,
   test_net_udp_light.py, test_selftest.py, test_daily_logs.py, test_gpu.py, test_gpu_profile.py,
-  test_gpuscan.py, test_gpu_board.py, test_schedule.py, test_dashboard.py, test_gpu_fan.py, test_width_modes.py, test_responsive.py   unit tests
+  test_gpuscan.py, test_gpu_board.py, test_schedule.py, test_dashboard.py, test_gpu_fan.py, test_width_modes.py, test_responsive.py,
+  test_watch.py, test_images.py, test_multiarch.py, test_platforms.py (+ platform_matrix.py: the measurement of amd64 / arm64 platforms),
+  test_image_publishing.py   unit tests
 deploy/
   nvidia-device-plugin-k3s.yaml, gpu-smoke-test.yaml   manifests for the GPU node setup (see HELPDESK.md)
   fake_kubectl.py + test_integration.py               the whole flow against a fake kubectl

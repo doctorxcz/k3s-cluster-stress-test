@@ -26,16 +26,37 @@ READY_MARKER = "STRESS-NG READY"          # synchronised start: the tool is inst
 GATE_FILE = "/tmp/go"
 
 # Reads temperatures (hwmon) and the average CPU clock. Output: `temp ...` and `freq ...` lines.
+# CPU temperature: x86 `coretemp` / `k10temp` / `zenpower`; ARM boards name the sensor after the thermal zone (`cpu_thermal` on a Raspberry Pi, `soc_thermal` /
+# `bigcore0_thermal` on Rockchip ...). When no hwmon CPU sensor exists at all, /sys/class/thermal/thermal_zone*/temp of a cpu / soc zone is the fallback
+# (printed as `temp tz:<zone type> <millidegrees>`). GPU, NPU, DDR, battery ... zones are skipped.
 PROBE_SCRIPT = r"""
+cpu_found=0
 for d in /host-sys/class/hwmon/hwmon*; do
     n=$(cat "$d/name" 2>/dev/null)
     case "$n" in
-        k10temp|coretemp|zenpower|amdgpu|radeon|nouveau|nvme|drivetemp)
+        amdgpu|radeon|nouveau|nvme|drivetemp)
             t=$(cat "$d/temp1_input" 2>/dev/null)
             [ -n "$t" ] && echo "temp $n $t"
             ;;
+        *gpu*|*npu*|*ddr*|*battery*|*wifi*|*pmic*) ;;
+        k10temp|coretemp|zenpower|*cpu*|*soc*|*core*)
+            t=$(cat "$d/temp1_input" 2>/dev/null)
+            if [ -n "$t" ]; then echo "temp $n $t"; cpu_found=1; fi
+            ;;
     esac
 done
+if [ "$cpu_found" = 0 ]; then
+    for z in /host-sys/class/thermal/thermal_zone*; do
+        ty=$(cat "$z/type" 2>/dev/null)
+        case "$ty" in
+            *gpu*|*npu*|*ddr*|*battery*|*wifi*|*pmic*) ;;
+            *cpu*|*soc*|*core*|x86_pkg_temp)
+                t=$(cat "$z/temp" 2>/dev/null)
+                [ -n "$t" ] && echo "temp tz:$ty $t"
+                ;;
+        esac
+    done
+fi
 f=0; c=0
 for x in /host-sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
     v=$(cat "$x" 2>/dev/null)
@@ -68,10 +89,19 @@ exit 0
 
 # Detects node hardware (CPU, RAM modules...). Runs in a privileged pod.
 HW_SCRIPT = r"""
-echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+# the CPU name: x86 prints `model name` in /proc/cpuinfo; arm64 kernels do not (and a 32-bit ARM one only says "ARMv7 Processor"), lscpu knows the core (Cortex-A72)
+cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+case "$cpu" in
+    ""|ARMv*) alt=$(lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -n 1); [ -n "$alt" ] && cpu="$alt" ;;
+esac
+echo "CPU: $cpu"
+echo "Arch: $(uname -m)"
 echo "Threads: $(nproc)"
 echo "Cores: $(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
-echo "System: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+# the machine: DMI on x86, the device tree on ARM boards ("Raspberry Pi 4 Model B Rev 1.5")
+sys=$(echo $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/dmi/id/product_name 2>/dev/null))
+[ -n "$sys" ] || sys=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
+echo "System: $sys"
 echo "Motherboard: $(cat /sys/class/dmi/id/board_name 2>/dev/null)"
 echo "RAM total: $(free -m | awk '/Mem:/{print $2}') MB"
 
@@ -98,7 +128,7 @@ dmidecode -t memory 2>/dev/null | awk -F': ' -v priv="$HW_PRIVILEGED" '
     }'
 gpu=$(lspci 2>/dev/null | grep -iE 'vga compatible|3d controller|display controller' | sed 's/^[^ ]* [^:]*: //' | paste -sd ';' - | sed 's/;/; /g')
 echo "GPU: ${gpu:-none detected (or pciutils could not be installed)}"
-lsblk -dn -o NAME,SIZE,ROTA,MODEL 2>/dev/null | awk '$1 !~ /^(loop|ram|zram|sr)/ {kind=($3=="1")?"HDD":"SSD/NVMe"; m=""; for(i=4;i<=NF;i++) m=m" "$i; printf "Disk %s: %s | %s |%s\n", $1, $2, kind, m}'
+lsblk -dn -o NAME,SIZE,ROTA,MODEL 2>/dev/null | awk '$1 !~ /^(loop|ram|zram|sr)/ {kind=($1 ~ /^mmcblk/)?"SD/eMMC":($3=="1")?"HDD":"SSD/NVMe"; m=""; for(i=4;i<=NF;i++) m=m" "$i; printf "Disk %s: %s | %s |%s\n", $1, $2, kind, m}'
 """.replace("@ENSURE_HW@", images.ensure_tools("dmidecode pciutils"))
 
 
@@ -215,7 +245,7 @@ def hw_pod(node: str, names: PodNames, deadline: int = 300,
                 else {"allowPrivilegeEscalation": False})
     pod["spec"]["containers"] = [{
         "name": "hw-info",
-        "image": images.image("tools"),
+        "image": images.image("tools", node),
         "securityContext": security,
         "env": [{"name": "HW_PRIVILEGED", "value": "1" if privileged else "0"}],
         "command": ["bash", "-c", HW_SCRIPT],
@@ -230,7 +260,7 @@ def smart_pod(node: str, names: PodNames, deadline: int = 300) -> dict:
     pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
     pod["spec"]["containers"] = [{
         "name": "smart",
-        "image": images.image("tools"),
+        "image": images.image("tools", node),
         "securityContext": {"privileged": True},
         "command": ["bash", "-c", SMART_SCRIPT],
         "resources": {"requests": {"memory": "64Mi"},
@@ -257,7 +287,7 @@ def dashboard_gpu_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
     pod["spec"]["runtimeClassName"] = "nvidia"
     pod["spec"]["containers"] = [{
         "name": "gpu-probe",
-        "image": images.image("tools"),
+        "image": images.image("tools", node),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["sleep", "infinity"],
         "env": [{"name": "NVIDIA_VISIBLE_DEVICES", "value": "all"}, {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "utility"}],
@@ -272,7 +302,7 @@ def gpu_scan_pod(node: str, names: PodNames, deadline: int = 240) -> dict:
     pod = _base_pod(names.hw, node, deadline, names.run_id, "hw")
     pod["spec"]["containers"] = [{
         "name": "gpu-scan",
-        "image": images.image("tools"),
+        "image": images.image("tools", node),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["bash", "-c", SCAN_SCRIPT],
         "resources": {"requests": {"memory": "64Mi"},
@@ -300,7 +330,7 @@ def net_server_pod(node: str, names: PodNames, deadline: int, port: int, host_ne
     pod = _base_pod(names.hw, node, deadline, names.run_id, "net-server")
     pod["spec"]["containers"] = [{
         "name": "net-server",
-        "image": images.image("tools"),
+        "image": images.image("tools", node),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["bash", "-c", NET_SERVER_SCRIPT.replace("PORT", str(port))],
         "resources": {"requests": {"memory": "64Mi"},
@@ -324,7 +354,7 @@ def probe_pod(node: str, names: PodNames, deadline: int) -> dict:
     pod = _base_pod(names.probe, node, deadline, names.run_id, "probe")
     pod["spec"]["containers"] = [{
         "name": "probe",
-        "image": images.image("probe"),
+        "image": images.image("probe", node),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["sleep", "infinity"],
         "resources": {"requests": {"memory": "16Mi"},
@@ -353,7 +383,7 @@ def stress_pod(node: str, names: PodNames, deadline: int, stress_cmd: str,
     pod = _base_pod(names.stress, node, deadline, names.run_id, "stress")
     pod["spec"]["containers"] = [{
         "name": "stress-test",
-        "image": image or images.image("gpu" if gpu else "tools"),
+        "image": image or images.image("gpu" if gpu else "tools", node),
         "securityContext": {"allowPrivilegeEscalation": False},
         "command": ["/bin/bash", "-c", script],
         # small request + fixed limit: when memory runs short the kernel kills this pod first

@@ -246,6 +246,71 @@ def test_progress_label_and_bar_follow_the_log(reg):
     assert 0.45 < frac < 0.55 and "left" in label
 
 
+# ---------------- timing and extra information ------------------------------------------------------------------------------
+
+def test_single_node_shows_start_running_left_and_end(reg):
+    path = make_node_log(reg, "n1", "classic", samples=13)               # 60 s of 120 s done
+    register(reg, "c1", "classic", ["n1"], log=str(path), duration=120, cooldown=60)
+    w = watcher()
+    t = watch.timing_of(w.tests[0])
+    assert t["state"] == "running" and t["left"] == 120 and not t["approx"]         # 60 s of the test + 60 s cooldown
+    text = "\n".join(lines_of(w, 160))
+    assert "started" in text and "running" in text and "2:00 left" in text and "ends" in text
+
+
+def test_multi_node_shows_time_left_from_the_registry(reg):
+    for node in ("a", "b", "c"):
+        make_node_log(reg, node, "classic")
+    register(reg, "m1", "classic", ["a", "b", "c"], log_dir=str(reg / "logs"), duration=3600)
+    w = watcher()
+    w.tests[0].rec["started"] = time.time() - 600
+    frac, label = watch.progress_of(w.tests[0])
+    assert 0.15 < frac < 0.18 and "0/3 nodes done" in label and re.search(r"~(49|50):\d\d left", label)
+    assert "~" in watch.progress_of(w.tests[0], short=True)[1] and "nodes" not in watch.progress_of(w.tests[0], short=True)[1]
+    wide = "\n".join(lines_of(w, 160))
+    assert "LEFT" in wide and "hottest" in wide and "⏱" in wide
+    assert "LEFT" not in "\n".join(lines_of(w, 100))
+
+
+def test_overrunning_multi_test_says_finishing_and_ended_one_says_finished(reg):
+    for node in ("a", "b"):
+        make_node_log(reg, node, "classic")
+    register(reg, "m1", "classic", ["a", "b"], log_dir=str(reg / "logs"), duration=100)
+    w = watcher()
+    w.tests[0].rec["started"] = time.time() - 500
+    assert "finishing" in watch.progress_of(w.tests[0])[1] and watch.timing_of(w.tests[0])["left"] == 0
+    for r in w.tests[0].readers.values():
+        r.ended = "Test completed"
+    assert watch.timing_of(w.tests[0])["state"] == "finished" and "finished" in watch.timing_row(w.tests[0], False)
+
+
+def test_planned_test_has_no_timing_and_cooldown_is_reported(reg):
+    path = make_node_log(reg, "n1", "classic", samples=3, extra=[sample(3, cool=True), sample(4, cool=True)])
+    register(reg, "c1", "classic", ["n1"], log=str(path), duration=120, cooldown=60)
+    w = watcher()
+    t = watch.timing_of(w.tests[0])
+    assert t["state"] == "cooldown" and t["left"] == 55 and "cooldown" in watch.timing_row(w.tests[0], False)
+    w.tests[0].rec["scheduled_at"] = time.time() + 600
+    assert watch.timing_of(w.tests[0]) is None and watch.timing_row(w.tests[0], False) == ""
+
+
+def test_stats_row_shows_peak_margin_average_cpu_and_power(reg):
+    path = make_node_log(reg, "n1", "classic", samples=13)                # temp 45..57, CPU 20..56, 20.5 W
+    register(reg, "c1", "classic", ["n1"], log=str(path), duration=120)
+    row = watch.stats_row(watcher().tests[0].readers["n1"], False)
+    assert "peak 57° (28° below the stop)" in row and "avg CPU 38 %" in row and re.search(r"avg power 2[01] W", row)
+    assert "peak" in "\n".join(lines_of(watcher(), 160)) and "peak" not in "\n".join(lines_of(watcher(), 80))
+
+
+@pytest.mark.parametrize("cols", [30, 40, 59, 60, 90, 91, 130, 160, 220])
+def test_timing_rows_keep_every_width_aligned(reg, cols):
+    for node in ("a", "b", "c"):
+        make_node_log(reg, node, "classic")
+    register(reg, "m1", "classic", ["a", "b", "c"], log_dir=str(reg / "logs"), duration=3600)
+    out = lines_of(watcher(), cols, 50)
+    assert len({ui.visible_len(x) for x in out}) == 1
+
+
 # ---------------- keys and stop ---------------------------------------------------------------------------------------------
 
 def make_screen(reg):

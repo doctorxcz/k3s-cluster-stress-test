@@ -87,7 +87,7 @@ def _scan_one(kube: Kubectl, node, timeout: int) -> NodeScan:
         from .manifests import gpu_scan_pod
         names = PodNames.new()
         try:
-            kube.apply_image_pod(lambda: gpu_scan_pod(node.name, names), names.hw, "tools")
+            kube.apply_image_pod(lambda: gpu_scan_pod(node.name, names), names.hw, "tools", node=node.name)
             end = time.monotonic() + timeout
             phase = ""
             while time.monotonic() < end:
@@ -138,7 +138,7 @@ def prepull(kube: Kubectl, names: list, image: str, emit: Callable[[str], None] 
         pod = PodNames.new()
         ok = False
         try:
-            kube.apply_image_pod(lambda: image_pull_pod(name, pod, image if kind is None else images.image(kind)), pod.hw, kind)
+            kube.apply_image_pod(lambda: image_pull_pod(name, pod, image if kind is None else images.image(kind, name)), pod.hw, kind, node=name)
             end = time.monotonic() + timeout
             while time.monotonic() < end:
                 phase = kube.pod_phase(pod.hw)

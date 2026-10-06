@@ -5,6 +5,7 @@ import ipaddress
 import re
 from typing import Optional, Sequence
 
+from . import images
 from .models import NodeInfo, NodeWorkload, ProbeData, ToolPod, TopMetrics
 
 _SENSOR_LABELS = {
@@ -129,9 +130,21 @@ def parse_top(line: str) -> Optional[TopMetrics]:
                       mem_pct=parts[4], mem_mib=mem_mib)
 
 
+_NOT_CPU_SENSOR = re.compile(r"gpu|npu|ddr|nvme|battery|wifi|pmic|charger|disk|ssd", re.I)
+_CPU_SENSOR = re.compile(r"cpu|soc|core|x86_pkg|tctl|tdie|a53|a55|a72|a73|a76|a78", re.I)
+
+
 def label_for_sensor(hwmon_name: str) -> str:
-    """Translates a hwmon sensor name to a readable label (CPU, GPU, NVMe, HDD)."""
-    return _SENSOR_LABELS.get(hwmon_name, "HDD")
+    """Translates a hwmon sensor name to a readable label (CPU, GPU, NVMe, HDD).
+
+    The known names are listed; of the others, the ones that look like a CPU / SoC thermal zone (Raspberry Pi `cpu_thermal`, Rockchip `soc_thermal` /
+    `bigcore0_thermal`, `tz:cpu-thermal` from /sys/class/thermal) are the CPU. Everything else stays `HDD` as before."""
+    known = _SENSOR_LABELS.get(hwmon_name)
+    if known:
+        return known
+    if _CPU_SENSOR.search(hwmon_name) and not _NOT_CPU_SENSOR.search(hwmon_name):
+        return "CPU"
+    return "HDD"
 
 
 def parse_probe_output(text: str) -> ProbeData:
@@ -353,6 +366,7 @@ def node_from_json(data: dict) -> NodeInfo:
     )
     is_cp = ("node-role.kubernetes.io/control-plane" in labels
              or "node-role.kubernetes.io/master" in labels)
+    images.note_node(meta.get("name", ""), info.get("architecture", ""))          # pods of this node get an image for its architecture
     return NodeInfo(
         name=meta.get("name", "?"),
         ready=ready,

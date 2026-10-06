@@ -872,15 +872,16 @@ def cmd_list_nodes() -> int:
         try:
             node = kube.get_node(name)
         except KubectlError as exc:
-            rows.append((name, "?", f"({exc})"))
+            rows.append((name, "?", f"({exc})", ""))
             continue
-        rows.append((name, "master" if node.is_control_plane else "worker", "Ready" if node.ready else "NotReady"))
+        rows.append((name, "master" if node.is_control_plane else "worker", "Ready" if node.ready else "NotReady",
+                     images.normalize_arch(node.architecture) if images.normalize_arch(node.architecture) != "unknown" else node.architecture))
     if ui.adaptive():
-        for line in ui.table([("node", 0, "<"), ("role", 0, "<"), ("state", 0, "<")], [list(r) for r in rows], lead="  "):
+        for line in ui.table([("node", 0, "<"), ("role", 0, "<"), ("state", 0, "<"), ("arch", 0, "<")], [list(r) for r in rows], lead="  "):
             ui.emit(line)
     else:
-        for name, role, state in rows:
-            ui.emit(f"  {name:<38} ? {state}" if role == "?" else f"  {name:<38} {role:<7} {state}")
+        for name, role, state, arch in rows:
+            ui.emit(f"  {name:<38} ? {state}" if role == "?" else f"  {name:<38} {role:<7} {state:<9} {arch}")
     return 0
 
 

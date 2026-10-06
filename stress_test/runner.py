@@ -223,7 +223,8 @@ class StressRunner:
         if self.hw_privileged:
             self.out("⚠️  Hardware is detected by a PRIVILEGED pod (--hw-privileged).")
         self.out("⏳ Detecting node hardware...")
-        self.kube.apply_image_pod(lambda: hw_pod(self.node.name, self.names, privileged=self.hw_privileged), self.names.hw, "tools", self.out)
+        self.kube.apply_image_pod(lambda: hw_pod(self.node.name, self.names, privileged=self.hw_privileged), self.names.hw, "tools", self.out,
+                                   node=self.node.name)
         phase = ""
         for _ in range(90):
             phase = self.kube.pod_phase(self.names.hw)
@@ -240,7 +241,7 @@ class StressRunner:
         if not self.cfg.smart:
             return
         self.out("⚠️  Reading disk health (SMART) with a PRIVILEGED pod (--smart).")
-        self.kube.apply_image_pod(lambda: smart_pod(self.node.name, self.names), self.names.hw, "tools", self.out)
+        self.kube.apply_image_pod(lambda: smart_pod(self.node.name, self.names), self.names.hw, "tools", self.out, node=self.node.name)
         phase = ""
         for _ in range(90):
             phase = self.kube.pod_phase(self.names.hw)
@@ -276,6 +277,9 @@ class StressRunner:
 
     def _check_gpu(self, hardware: str) -> None:
         """GPU test preflight: the node must offer nvidia.com/gpu (driver, toolkit, runtime and device plugin)."""
+        arch = images.normalize_arch(self.node.architecture)
+        if arch not in ("amd64", "unknown"):
+            raise RunnerError(f"The GPU test supports NVIDIA cards on amd64 nodes only (gpu-burn is built for x86); {self.node.name} is {arch}.")
         state, message = gpumod.gpu_state(hardware, self.node.gpu_count, hw_skipped=self.skip_hw)
         if state != "ok":
             raise RunnerError(message)
@@ -316,7 +320,7 @@ class StressRunner:
             self._log("CPU load: none (network test)")
         elif c.gpu:
             self._log(f"Profile: gpu - gpu-burn {c.gpu_mem_pct} % of the GPU memory"
-                      f"{', double precision' if c.gpu_double else ''}, image {c.gpu_image or images.image("gpu")}")
+                      f"{', double precision' if c.gpu_double else ''}, image {c.gpu_image or images.image("gpu", self.node.name)}")
             self._log(f"GPU temperature limit: {c.gpu_max_temp}°C (2 readings in a row), warning from {c.gpu_max_temp - gpumod.GPU_WARN_MARGIN}°C")
             self._log("CPU load: none (GPU test)")
         elif c.disk:
@@ -415,7 +419,8 @@ class StressRunner:
         self.out("-" * 52)
 
     def _start_probe(self) -> None:
-        self.kube.apply_image_pod(lambda: probe_pod(self.node.name, self.names, self.deadline), self.names.probe, "probe", self.out)
+        self.kube.apply_image_pod(lambda: probe_pod(self.node.name, self.names, self.deadline), self.names.probe, "probe", self.out,
+                                   node=self.node.name)
         if not self.kube.wait_ready(self.names.probe, 60):
             raise RunnerError("The temperature probe (temp-probe) did not come up.")
         self._resolve_watch()
@@ -521,7 +526,8 @@ class StressRunner:
             self.cfg.net_rate = netmod.NET_RATE_CAP_MASTER
             self.out(f"ℹ️  The master takes part: TCP tests capped at {netmod.NET_RATE_CAP_MASTER} Mbit/s.")
         self.out(f"⏳ Starting the iperf3 server on {peer.name} ({self.cfg.net_mode} network)...")
-        self.kube.apply_image_pod(lambda: net_server_pod(peer.name, self.names, self.deadline, self.net_port, host), self.names.hw, "tools", self.out)
+        self.kube.apply_image_pod(lambda: net_server_pod(peer.name, self.names, self.deadline, self.net_port, host), self.names.hw, "tools", self.out,
+                                   node=peer.name)
         if not self.kube.wait_ready(self.names.hw, 120):
             raise RunnerError("The iperf3 server pod timed out while starting.")
         for _ in range(90):
@@ -561,19 +567,19 @@ class StressRunner:
         kind = None if (gpu and self.cfg.gpu_image) else "gpu" if gpu else "tools"      # a custom --gpu-image has no fallback
         self.kube.apply_image_pod(lambda: stress_pod(self.node.name, self.names, self.deadline, cmd, limit,
                                    package="" if gpu else "fio" if disk else netmod.packages(self.cfg.net_extra) if self.cfg.net else "stress-ng",
-                                   image=(self.cfg.gpu_image or images.image("gpu")) if gpu else "",
+                                   image=(self.cfg.gpu_image or images.image("gpu", self.node.name)) if gpu else "",
                                    gpu=gpu, setup=gpumod.build_gpu_setup(self.cfg.gpu_mem_pct) if gpu else "",
                                    scratch_mib=self.cfg.disk_size + 256 if disk else 0,
                                    host_network=self.cfg.net and self.cfg.net_mode == "host",
                                    gate_seconds=(self.gate_timeout + POD_DEADLINE_MARGIN + (GPU_DEADLINE_EXTRA if self.cfg.gpu else 0))
                                    if self.gate_wait else 0),
-                                   self.names.stress, kind, self.out)
+                                   self.names.stress, kind, self.out, node=self.node.name)
         self.out("⏳ Waiting for the pod to start...")
         if self.cfg.gpu:
             self.out("⏳ The first time a node pulls the GPU image it can take several minutes (the prebuilt one is about 1.2 GB, the fallback CUDA image 3 GB)...")
-        elif kind and images.active(kind):
+        elif kind and images.active(kind, self.node.name):
             self.out("ℹ️  The tools are in the prebuilt image: pulled once per node (about 200 MB), later tests start at once.")
-        if not self.kube.wait_ready(self.names.stress, 900 if self.cfg.gpu else 300 if (kind and images.active(kind)) else 120):
+        if not self.kube.wait_ready(self.names.stress, 900 if self.cfg.gpu else 300 if (kind and images.active(kind, self.node.name)) else 120):
             raise RunnerError("The stress-test pod timed out while starting." + (
                 " Is the GPU free (nvidia.com/gpu), is the image pullable, does runtime 'nvidia' exist? "
                 f"Check: kubectl describe pod {self.names.stress}" if self.cfg.gpu else ""))

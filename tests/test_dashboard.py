@@ -109,6 +109,40 @@ def test_wider_screens_show_more_columns():
     assert count(100) <= count(140) <= count(200) <= count(260) and count(260) == 8
 
 
+def test_running_test_shows_progress_time_left_and_numbers_in_the_dashboard():
+    view = cluster()
+    view.running = [{"run_id": "r1", "node": "cluster", "title": "CPU 1 h · 3 nodes"}]
+    view.live = [{"id": "r1", "icon": "⚡", "name": "CPU", "where": "cluster", "frac": 0.25, "label": "0/3 nodes done · ~45:00 left",
+                  "timing": "⏱ started 10:00 · running 15:00 · ~45:00 left · ends ~11:00",
+                  "info": "🌡 hottest worker-1 79° · margin 6° to 85 · peak 79°"}]
+    text = "\n".join(lines_of(view, 330, 45))
+    for word in ("▸ tests", "25%", "~45:00 left", "ends ~11:00", "hottest worker-1 79°"):
+        assert word in text, word
+    narrow = "\n".join(lines_of(view, 70, 30))
+    assert "~45:00" in narrow or "running" in narrow                                  # the header line stays aligned and short
+
+
+def test_running_test_without_live_data_still_shows_the_old_line():
+    view = cluster()
+    view.running = [{"run_id": "r2", "node": "worker-1", "title": "CPU 2 min"}]
+    assert "CPU 2 min" in "\n".join(lines_of(view, 330, 45))
+
+
+def test_collector_builds_live_data_from_the_registry_and_survives_errors(fake, monkeypatch, tmp_path):
+    from stress_test import background
+    monkeypatch.setenv("STRESS_TEST_RUNNING_DIR", str(tmp_path / "running"))
+    background.register("lv1", "cluster", 600, None, "", title="CPU 10 min", extra={"kind": "background", "profile": "classic", "nodes": ["a", "b"], "log_dir": str(tmp_path)})
+    c = collector()
+    c.start()
+    try:
+        view = c.refresh()
+        assert [x["id"] for x in view.live] == ["lv1"] and "left" in view.live[0]["label"] and view.live[0]["timing"].startswith("⏱")
+        monkeypatch.setattr("stress_test.watch.live_summary", lambda w: 1 / 0)
+        assert c.refresh().live == []
+    finally:
+        c.stop()
+
+
 def test_alerts_for_notready_pressure_hot_and_bad_pods():
     v = cluster()
     v.nodes[1].ready = False

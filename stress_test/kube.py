@@ -126,12 +126,13 @@ class Kubectl:
         return next((r for r in out.split() if r in images.PULL_ERRORS), "")
 
     def apply_image_pod(self, build, name: str, kind: Optional[str], say=None, grace: float = 25.0, sleep=time.sleep,
-                        clock=time.monotonic) -> bool:
+                        clock=time.monotonic, node: str = "") -> bool:
         """Applies the pod that `build()` makes (it must read `images.image(kind)` when it is CALLED). When the prebuilt image of this kind
         cannot be pulled within `grace` seconds the pod is replaced by one on the fallback image (plain Ubuntu / busybox, tools installed by apt -
-        slower, but it works) and every later pod of that kind does the same. True = the fallback was used. kind None = a custom image, no fallback."""
+        slower, but it works) and every later pod of that kind on nodes of the same architecture does the same. `node` = the node the pod runs on: a node
+        whose architecture has no prebuilt image (arm64) starts from the fallback at once. True = the fallback was used. kind None = a custom image, no fallback."""
         self.apply(build())
-        if kind is None or not images.active(kind):
+        if kind is None or not images.active(kind, node):
             return False
         end = clock() + grace
         while clock() < end:
@@ -142,7 +143,7 @@ class Kubectl:
                         "and apt (slower). `--no-prebuilt` skips the attempt, `--registry` points at your own registry.")
                 log.warning("prebuilt image %s unavailable (%s): fallback %s", images.prebuilt_ref(kind), reason, images.FALLBACK[kind])
                 self.delete_pods(name)
-                images.mark_unavailable(kind)
+                images.mark_unavailable(kind, node)
                 self.apply(build())
                 return True
             if self.pod_phase(name) in ("Running", "Succeeded", "Failed"):

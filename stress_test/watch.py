@@ -57,6 +57,12 @@ class LogReader:
         self.limits: list = []
         self._partial = ""
         self._first_test_clock: Optional[int] = None
+        self._first_cool_clock: Optional[int] = None
+        self.peak_temp: Optional[int] = None                   # running statistics of what this screen has read
+        self.cpu_sum = 0.0
+        self.cpu_n = 0
+        self.power_sum = 0.0
+        self.power_n = 0
 
     @property
     def last(self):
@@ -74,6 +80,17 @@ class LogReader:
             return None
         span = test[-1] - self._first_test_clock
         return span + 86400 if span < 0 else span
+
+    def cooldown_elapsed(self) -> Optional[int]:
+        if self._first_cool_clock is None or not self.samples:
+            return None
+        span = self.samples[-1][0] - self._first_cool_clock
+        return span + 86400 if span < 0 else span
+
+    def test_seconds(self) -> Optional[int]:
+        """The planned length of the test of this node, from its header ("1 h (3600 s)"), if the log says it."""
+        found = re.search(r"\((\d+) s\)", self.header.get("Test duration", ""))
+        return int(found.group(1)) if found else None
 
     def poll(self) -> None:
         try:
@@ -119,6 +136,17 @@ class LogReader:
             self.samples.append((clock, sample))
             if sample.phase == "test" and self._first_test_clock is None:
                 self._first_test_clock = clock
+            if sample.phase == "cooldown" and self._first_cool_clock is None:
+                self._first_cool_clock = clock
+            if sample.phase == "test":
+                if sample.cpu_temp is not None and (self.peak_temp is None or sample.cpu_temp > self.peak_temp):
+                    self.peak_temp = sample.cpu_temp
+                if sample.cpu_pct is not None:
+                    self.cpu_sum += sample.cpu_pct
+                    self.cpu_n += 1
+                if sample.power_w is not None:
+                    self.power_sum += sample.power_w
+                    self.power_n += 1
             return
         stage = _STAGE_RE.search(line)
         if stage:
@@ -231,6 +259,21 @@ class Watcher:
         self.stamp = now
 
 
+def live_summary(w: Watcher) -> list:
+    """Plain data about the running tests for the dashboard (no colours, no references to the readers):
+    [{"id", "icon", "name", "where", "frac", "label", "timing", "info"}]. Built where the logs are read, so the screen thread
+    never touches a deque that is being filled."""
+    out = []
+    for tv in w.tests:
+        frac, label = progress_of(tv)
+        reader = next(iter(tv.readers.values()), None) if not tv.multi else None
+        info = hottest_row(tv, False) if tv.multi else (stats_row(reader, False) if reader is not None else "")
+        out.append({"id": tv.id, "icon": _icon(tv), "name": NAMES.get(tv.profile, tv.profile),
+                    "where": "cluster" if tv.multi else (tv.nodes[0] if tv.nodes else "?"),
+                    "frac": frac, "label": label, "timing": timing_row(tv, False), "info": info})
+    return out
+
+
 # ================================================================ drawing =================================================
 def _kv(label: str, value: str, on: bool) -> str:
     return f"{ui.paint(label, ui.GREY, on)} {value}"
@@ -240,8 +283,109 @@ def _icon(tv: TestView) -> str:
     return ICONS.get(tv.profile, "🧪")
 
 
-def progress_of(tv: TestView) -> tuple:
-    """(fraction 0..1, label) of a test."""
+def _clock_len(seconds) -> str:
+    """H:MM:SS (or M:SS) - a length that reads at a glance and does not jump in width."""
+    seconds = max(0, int(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, sec = divmod(rest, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _hhmm(epoch: float) -> str:
+    return time.strftime("%H:%M", time.localtime(epoch))
+
+
+def timing_of(tv: TestView, now: Optional[float] = None) -> Optional[dict]:
+    """When a test started, how long it has been running, and (approximately) when it will end.
+
+    {"started", "elapsed", "left" (None = unknown), "end" (epoch or None), "approx" (a plan, not a measurement),
+     "state" (running / cooldown / finished)}. A planned test that has not started yet has no timing."""
+    now = time.time() if now is None else now
+    rec = tv.rec
+    started = rec.get("started") or 0
+    if not started or (rec.get("scheduled_at") or 0) > now:
+        return None
+    info = {"started": started, "elapsed": max(0, int(now - started)), "left": None, "end": None, "approx": True, "state": "running"}
+    duration = int(rec.get("duration") or 0)
+    cooldown = int(rec.get("cooldown") or 0)
+    if not tv.multi:
+        reader = next(iter(tv.readers.values()), None)
+        if reader is not None and reader.ended:
+            info.update(state="finished", left=0)
+            return info
+        if reader is not None and reader.phase == "cooldown":
+            done = reader.cooldown_elapsed()
+            info["state"] = "cooldown"
+            if done is not None and cooldown:
+                info.update(left=max(0, cooldown - done), approx=False)
+        elif duration:
+            elapsed_test = reader.elapsed_test() if reader is not None else None
+            if elapsed_test is not None:
+                info.update(left=max(0, duration - elapsed_test) + cooldown, approx=False)
+            else:                                              # the node is still being prepared: the length of the test is all we know
+                info["left"] = duration + cooldown
+    elif duration:
+        info["left"] = max(0, int(started + duration - now))
+        if tv.readers and all(r.ended for r in tv.readers.values()):
+            info.update(state="finished", left=0)
+        elif tv.readers and all(r.phase in ("cooldown", "ended") for r in tv.readers.values()):
+            info["state"] = "cooldown"
+    if info["left"] is not None and info["state"] != "finished":
+        info["end"] = now + info["left"]
+    return info
+
+
+def timing_row(tv: TestView, on: bool, short: bool = False) -> str:
+    """One line for the detail: ⏱ started 10:23 · running 5:12 · ~54:48 left · ends ~11:28."""
+    t = timing_of(tv)
+    if t is None:
+        return ""
+    if t["state"] == "finished":
+        return f"⏱ {_kv('started', _hhmm(t['started']), on)} · {_kv('ran', _clock_len(t['elapsed']), on)} · finished"
+    approx = "~" if t["approx"] else ""
+    parts = [_kv("started", _hhmm(t["started"]), on), _kv("running", _clock_len(t["elapsed"]), on)]
+    if t["left"] is None:
+        parts.append(ui.paint("cooldown" if t["state"] == "cooldown" else "end unknown", ui.CYAN if t["state"] == "cooldown" else ui.GREY, on))
+    else:
+        left_txt = _clock_len(t["left"]) if t["left"] or t["state"] == "cooldown" else "finishing"
+        parts.append(ui.paint(f"{approx}{left_txt} left" + (" (cooldown)" if t["state"] == "cooldown" else ""),
+                              ui.CYAN if t["state"] == "cooldown" else ui.GREEN, on))
+        if t["end"] and not short:
+            parts.append(_kv("ends", f"{approx}{_hhmm(t['end'])}", on))
+    return "⏱ " + " · ".join(parts)
+
+
+def hottest_row(tv: TestView, on: bool) -> str:
+    """The hottest node of a multi-node test and how far it is from its limit."""
+    best = None
+    for node, r in tv.readers.items():
+        s = r.last
+        if s is not None and s.cpu_temp is not None and (best is None or s.cpu_temp > best[1]):
+            best = (node, s.cpu_temp, r.limits[0] if r.limits else 85, r.peak_temp)
+    if best is None:
+        return ""
+    node, temp, limit, peak = best
+    return (f"🌡 {_kv('hottest', f'{node} {temp}°', on)} · {_kv('margin', f'{limit - temp}° to {limit}', on)}"
+            + (f" · {_kv('peak', f'{peak}°', on)}" if peak is not None else ""))
+
+
+def stats_row(reader: LogReader, on: bool) -> str:
+    """What the screen has seen so far in the test phase: the peak temperature and its margin, average CPU and power."""
+    if reader.peak_temp is None and not reader.cpu_n:
+        return ""
+    limit = reader.limits[0] if reader.limits else 85
+    parts = []
+    if reader.peak_temp is not None:
+        parts.append(_kv("peak", f"{reader.peak_temp}° ({limit - reader.peak_temp}° below the stop)", on))
+    if reader.cpu_n:
+        parts.append(_kv("avg CPU", f"{reader.cpu_sum / reader.cpu_n:.0f} %", on))
+    if reader.power_n:
+        parts.append(_kv("avg power", f"{reader.power_sum / reader.power_n:.0f} W", on))
+    return "📊 " + " · ".join(parts)
+
+
+def progress_of(tv: TestView, short: bool = False) -> tuple:
+    """(fraction 0..1, label) of a test. `short` = the label for a narrow list row."""
     rec = tv.rec
     if tv.profile == "selftest" and rec.get("phases"):
         done = (rec.get("phase_no", 1) - 1) / rec["phases"]
@@ -249,13 +393,18 @@ def progress_of(tv: TestView) -> tuple:
     if tv.multi:
         ended = sum(1 for r in tv.readers.values() if r.ended)
         total = max(1, len(tv.nodes))
-        left = [r for r in tv.readers.values() if not r.ended]
-        part = 0.0
-        for r in left:
-            e, d = r.elapsed_test(), rec.get("duration") or 0
-            if e is not None and d:
-                part += min(1.0, e / max(1, d / max(1, len(tv.nodes))))
-        return min(1.0, (ended + part / max(1, len(left) or 1) * (1 if left else 0)) / total), f"{ended}/{total} nodes done"
+        t = timing_of(tv)
+        duration = rec.get("duration") or 0
+        frac = min(1.0, t["elapsed"] / duration) if t is not None and duration else ended / total
+        if ended == total:
+            frac = 1.0
+        count = f"{ended}/{total}" + ("" if short else " nodes done")
+        if t is not None and t["state"] == "running" and t["left"] is not None:
+            left = f"~{_clock_len(t['left'])} left" if t["left"] else "finishing"
+            return frac, f"{left} · {count}" if short else f"{count} · {left}"     # narrow: the time first, it must not be cut off
+        if t is not None and t["state"] == "cooldown":
+            return frac, f"cooldown · {count}" if short else f"{count} · cooldown"
+        return frac, count
     reader = next(iter(tv.readers.values()), None)
     if reader is None:
         return 0.0, "starting"
@@ -267,14 +416,16 @@ def progress_of(tv: TestView) -> tuple:
         return 1.0, "cooldown"
     if elapsed is None or not duration:
         return 0.0, "preparing the node"
-    return min(1.0, elapsed / duration), f"{format_duration(max(0, duration - elapsed))} left"
+    t = timing_of(tv)
+    ends = f" · ends {_hhmm(t['end'])}" if t is not None and t["end"] and not short else ""
+    return min(1.0, elapsed / duration), f"{_clock_len(max(0, duration - elapsed))} left{ends}"
 
 
 def _list_rows(w: Watcher, sel: int, on: bool, width: int) -> list:
     rows = []
     bar_w = 10 if width < 100 else 16
     for i, tv in enumerate(w.tests):
-        frac, label = progress_of(tv)
+        frac, label = progress_of(tv, short=width < 100)
         mark = ui.paint("▸", ui.YELLOW, on) if i == sel else " "
         where = "cluster" if tv.multi else (tv.nodes[0] if tv.nodes else "?")
         phase = tv.rec.get("phase", "") if tv.profile == "selftest" else ""
@@ -336,6 +487,9 @@ def _node_rows(reader: LogReader, tv: TestView, on: bool, width: int, node: str)
                                                                                    if drop >= 15 else "steady"), on))
     if reader.stage:
         rows.append(f"🎯 stage {reader.stage}")
+    stats = stats_row(reader, on)
+    if stats and wide:
+        rows.append(stats)
     return rows
 
 
@@ -356,13 +510,25 @@ def _events_rows(reader: LogReader, on: bool, limit: int, width: int) -> list:
     return [ui.paint(e, ui.GREY, on) for e in list(reader.events)[-limit:]]
 
 
+def _node_left(reader: LogReader, tv: TestView) -> str:
+    if reader.ended:
+        return "–"
+    if reader.phase == "cooldown":
+        done, cooldown = reader.cooldown_elapsed(), int(tv.rec.get("cooldown") or 0)
+        return _clock_len(max(0, cooldown - done)) + "c" if done is not None and cooldown else "cool"
+    total, elapsed = reader.test_seconds() or int(tv.rec.get("duration") or 0), reader.elapsed_test()
+    return _clock_len(max(0, total - elapsed)) if total and elapsed is not None else ""
+
+
 def _multi_table(tv: TestView, state: "UiState", on: bool, width: int) -> list:
-    rows = [ui.paint(_row(["NODE", "STATE", "CPU", "TEMP", "RAM", "GPU", "CLOCK"], [26, 10, 11, 5, 11, 12, 8]), ui.GREY, on)]
+    left_col = width >= 110
+    widths = [26, 10, 11, 5, 11, 12, 8] + ([8] if left_col else [])
+    rows = [ui.paint(_row(["NODE", "STATE", "CPU", "TEMP", "RAM", "GPU", "CLOCK"] + (["LEFT"] if left_col else []), widths), ui.GREY, on)]
     for i, node in enumerate(tv.nodes):
         reader = tv.readers.get(node)
         mark = ui.paint("▸", ui.YELLOW, on) if i == state.node else " "
         if reader is None:
-            rows.append(f"{mark} {_row([node, ui.paint('waiting', ui.GREY, on), '', '', '', '', ''], [26, 10, 11, 5, 11, 12, 8])}")
+            rows.append(f"{mark} {_row([node, ui.paint('waiting', ui.GREY, on), '', '', '', '', ''] + (([''] if left_col else [])), widths)}")
             continue
         s = reader.last
         state_txt = (ui.paint("done", ui.GREEN, on) if reader.ended and "completed" in reader.ended.lower() else
@@ -372,7 +538,9 @@ def _multi_table(tv: TestView, state: "UiState", on: bool, width: int) -> list:
         cells = [node, state_txt, f"{_bar(s.cpu_pct, 5, on)} {_pct(s.cpu_pct)}" if s else "", _temp(s.cpu_temp, on) if s else "",
                  f"{_bar(s.mem_used_pct, 5, on, 80, 95)} {_pct(s.mem_used_pct)}" if s else "", gpu,
                  f"{s.freq_mhz}MHz" if s is not None and s.freq_mhz is not None else ""]
-        rows.append(f"{mark} {_row(cells, [26, 10, 11, 5, 11, 12, 8])}")
+        if left_col:
+            cells.append(_node_left(reader, tv))
+        rows.append(f"{mark} {_row(cells, widths)}")
     return rows
 
 
@@ -480,6 +648,9 @@ def render_compact(w: Watcher, state: UiState, columns: int, lines: int, on: boo
         bar = max(6, min(20, room - 12))
         out.append(f"  {ui.paint('█' * round(bar * frac) + '░' * (bar - round(bar * frac)), ui.GREEN, on)} {100 * frac:.0f} %")
         out += _wrapped(label, room)
+        for extra in (timing_row(tv, on, short=True), hottest_row(tv, on) if tv.multi else ""):
+            if extra:
+                out += _wrapped(extra, room)
         if tv.profile == "selftest":
             out += _wrapped(clean_text(tv.rec.get("phase", "starting"), 100), room)
         if tv.multi:
@@ -553,6 +724,9 @@ def render_compact(w: Watcher, state: UiState, columns: int, lines: int, on: boo
 def _detail_section(sel: TestView, state: UiState, tiers: int, on: bool, width: int) -> list:
     """The detail block of one test (title, the table of nodes or the measurements)."""
     detail = [ui.paint(f"▸ {sel.title}", ui.BOLD, on)]
+    for extra in (timing_row(sel, on), hottest_row(sel, on) if sel.multi else ""):
+        if extra:
+            detail.append(extra)
     if sel.multi:
         detail += _multi_table(sel, state, on, width)
         if sel.profile == "selftest":

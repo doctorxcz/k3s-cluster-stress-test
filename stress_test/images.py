@@ -18,9 +18,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from . import __version__
-
 REGISTRY_DEFAULT = "ghcr.io/doctorxcz"
+IMAGE_TAG = "1.19.0"                         # the tag of the images in the registry (see tag())
+KIND_TAGS = {"gpu": "1.18.0"}                # an image that was not rebuilt for IMAGE_TAG keeps the tag it was published under (the GPU image is amd64 only, 1.18.0)
 NAMES = {"tools": "k3s-stress-tools", "gpu": "k3s-stress-gpu", "probe": "k3s-stress-probe"}
 # the fallback of every kind (what the tool used before the prebuilt images): started from scratch, tools installed by apt
 FALLBACK = {"tools": "ubuntu:24.04", "probe": "busybox:1.36", "gpu": "nvidia/cuda:12.9.1-devel-ubuntu24.04"}
@@ -28,7 +28,11 @@ FALLBACK = {"tools": "ubuntu:24.04", "probe": "busybox:1.36", "gpu": "nvidia/cud
 # version: `name:tag@sha256:...` always pulls exactly the bytes that were tested, even if the tag were moved. A version without an entry, or a custom
 # `--registry` (a copy may have another manifest), uses the plain tag. Update after every publication (amd64 only; a multi-arch publication has an index digest).
 DIGESTS: dict = {
-    "1.18.0": {
+    "1.19.0": {                                  # multi-arch INDEXES (amd64 + arm64), published 2026-10-06
+        "probe": "sha256:e7c2b461f942a35c99ad36ba3475c7bcbd000d39a2d795f73ed94750f478ebd2",
+        "tools": "sha256:c0aa3a771579c280a0cb9b38ecf4a6998f29f9bd68ed9e101d48b034b3f805c8",
+    },
+    "1.18.0": {                                  # single-platform amd64 manifests
         "probe": "sha256:d7accbf2d2dd2318a0d7083d92140a9c971367ed261ce29170a084a9dc61236a",
         "tools": "sha256:08308640ee6fa04141c609ace7ee5b072f842a5d57641a1d5251efd3b78850ee",
         "gpu": "sha256:7a23baa1227071df9b08ddf767dce3f7f8a9da8cc7c5e42b5d78f6427d27e4b5",
@@ -40,12 +44,44 @@ PULL_ERRORS = ("ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImage
 
 _REGISTRY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}$")
 
-_state = {"registry": REGISTRY_DEFAULT, "prebuilt": True, "unavailable": set()}
+# The CPU architectures the prebuilt images are published for: tools and probe 1.19.0 are multi-arch (amd64 + arm64), gpu 1.18.0 is amd64 only (gpu-burn and
+# the NVIDIA runtime are built for x86 cards). A node of an architecture without a prebuilt image (e.g. armv7) starts from the multi-arch fallback images and
+# installs the tools with apt. After a new publication (deploy/images/publish.sh) update IMAGE_TAG, DIGESTS (the digests of the INDEXES) and this table:
+# `deploy/images/check_published.py` prints all three.
+PUBLISHED = {"tools": {"amd64", "arm64"}, "probe": {"amd64", "arm64"}, "gpu": {"amd64"}}
+
+_state = {"registry": REGISTRY_DEFAULT, "prebuilt": True, "unavailable": set()}      # unavailable: {(kind, architecture)}
+_NODE_ARCH: dict = {}                                                                # node name -> normalised architecture (filled by parsing.node_from_json)
+
+_ARCH_ALIASES = {"amd64": "amd64", "x86_64": "amd64", "x86-64": "amd64", "arm64": "arm64", "aarch64": "arm64", "arm64/v8": "arm64",
+                 "arm": "armv7", "armv7": "armv7", "armv7l": "armv7", "armhf": "armv7", "armv6l": "armv6", "riscv64": "riscv64", "ppc64le": "ppc64le",
+                 "s390x": "s390x", "386": "386", "i386": "386", "i686": "386"}
 
 
-def tag() -> str:
-    """The image tag = the version of the tool (the images are built from the same release)."""
-    return __version__
+def normalize_arch(raw: str) -> str:
+    """'amd64' / 'x86_64' -> 'amd64', 'arm64' / 'aarch64' -> 'arm64', 'arm' / 'armv7l' -> 'armv7'; anything unknown (or '?') -> 'unknown'."""
+    return _ARCH_ALIASES.get((raw or "").strip().lower(), "unknown")
+
+
+def note_node(name: str, architecture: str) -> None:
+    """Remembers the architecture of a node, so that its pods get an image that can run there."""
+    if name:
+        _NODE_ARCH[name] = normalize_arch(architecture)
+
+
+def node_arch(node: str = "") -> str:
+    """The architecture of a node ('' / a node that was never read = amd64: what this tool ran on before the multi-arch support)."""
+    return _NODE_ARCH.get(node) or "amd64"
+
+
+def forget_nodes() -> None:
+    _NODE_ARCH.clear()
+
+
+def tag(kind: str = "") -> str:
+    """The tag of the published image of this kind. It is NOT the version of the tool: the tool can be released (1.19.1, 1.20.0 ...) without publishing new
+    images; change IMAGE_TAG (with DIGESTS and PUBLISHED) only when images are published under a new tag. KIND_TAGS lists the kinds that keep an older tag."""
+    return KIND_TAGS.get(kind, IMAGE_TAG)
 
 
 def configure(registry: str = "", prebuilt: bool = True) -> None:
@@ -77,24 +113,26 @@ def prebuilt_enabled() -> bool:
 
 def prebuilt_ref(kind: str) -> str:
     """`ghcr.io/doctorxcz/k3s-stress-tools:1.18.0` (with `@sha256:...` when the digest is known)."""
-    name = f"{registry()}/{NAMES[kind]}:{tag()}"
-    digest = DIGESTS.get(tag(), {}).get(kind) if registry() == REGISTRY_DEFAULT else None
+    name = f"{registry()}/{NAMES[kind]}:{tag(kind)}"
+    digest = DIGESTS.get(tag(kind), {}).get(kind) if registry() == REGISTRY_DEFAULT else None
     return f"{name}@{digest}" if digest else name
 
 
-def active(kind: str) -> bool:
-    """True while pods of this kind use the prebuilt image (not switched off, and no earlier pull of it failed)."""
-    return prebuilt_enabled() and kind not in _state["unavailable"]
+def active(kind: str, node: str = "") -> bool:
+    """True while pods of this kind on this node use the prebuilt image: not switched off, published for the node's architecture, and no earlier
+    pull of it failed on that architecture (a failure on a Raspberry Pi must not switch the prebuilt image off for the amd64 nodes)."""
+    arch = node_arch(node)
+    return prebuilt_enabled() and arch in PUBLISHED.get(kind, set()) and (kind, arch) not in _state["unavailable"]
 
 
-def image(kind: str) -> str:
-    """The image to put into a pod of this kind now."""
-    return prebuilt_ref(kind) if active(kind) else FALLBACK[kind]
+def image(kind: str, node: str = "") -> str:
+    """The image to put into a pod of this kind, running on `node`, now."""
+    return prebuilt_ref(kind) if active(kind, node) else FALLBACK[kind]
 
 
-def mark_unavailable(kind: str) -> None:
-    """A prebuilt image could not be pulled: from now on this kind starts from the fallback image (apt)."""
-    _state["unavailable"].add(kind)
+def mark_unavailable(kind: str, node: str = "") -> None:
+    """A prebuilt image could not be pulled: from now on this kind starts from the fallback image (apt) on nodes of the same architecture."""
+    _state["unavailable"].add((kind, node_arch(node)))
 
 
 def is_prebuilt(image_ref: str) -> bool:

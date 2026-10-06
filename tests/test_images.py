@@ -16,17 +16,16 @@ from test_integration import FAKE, ROOT, run_tool
 # ---------------- names, registry, state ------------------------------------------------------------------------------------
 
 def test_default_images_are_the_three_prebuilt_ones_with_the_tool_version():
-    from stress_test import __version__
     for kind, name in (("tools", "k3s-stress-tools"), ("gpu", "k3s-stress-gpu"), ("probe", "k3s-stress-probe")):
         ref = images.image(kind)
-        assert ref.startswith(f"ghcr.io/doctorxcz/{name}:{__version__}@sha256:")                    # pinned by the digest of the tested image
+        assert ref.startswith(f"ghcr.io/doctorxcz/{name}:{images.tag(kind)}@sha256:")                    # pinned by the digest of the tested image
     assert images.active("tools") and images.prebuilt_enabled()
     assert "latest" not in images.image("tools")                       # pinned, never "latest"
 
 
 def test_registry_override_and_validation():
     images.configure("registry.local:5000/team/tools-mirror/")
-    assert images.image("tools") == f"registry.local:5000/team/tools-mirror/k3s-stress-tools:{images.tag()}"       # no digest for a copy
+    assert images.image("tools") == f"registry.local:5000/team/tools-mirror/k3s-stress-tools:{images.tag('tools')}"       # no digest for a copy
     assert images.cli_args() == ["--registry", "registry.local:5000/team/tools-mirror"]
     for bad in ("a b", "ghcr.io/../x", "x//y", "bad;rm -rf", "$(id)", "", "-x/y"[:0] + "http://x"):
         if bad == "":
@@ -55,10 +54,10 @@ def test_a_failed_pull_switches_only_that_kind_to_the_fallback():
 
 
 def test_digest_pins_the_exact_image(monkeypatch):
-    monkeypatch.setitem(images.DIGESTS, images.tag(), {"tools": "sha256:" + "a" * 64})
-    assert images.image("tools") == f"ghcr.io/doctorxcz/k3s-stress-tools:{images.tag()}@sha256:" + "a" * 64
+    monkeypatch.setitem(images.DIGESTS, images.tag("tools"), {"tools": "sha256:" + "a" * 64})
+    assert images.image("tools") == f"ghcr.io/doctorxcz/k3s-stress-tools:{images.tag('tools')}@sha256:" + "a" * 64
     assert images.is_prebuilt(images.image("tools")) and not images.is_prebuilt("ubuntu:24.04")
-    assert "@" not in images.image("probe") or images.DIGESTS[images.tag()].get("probe")           # a kind without a digest uses the tag
+    assert "@" not in images.image("probe") or images.DIGESTS[images.tag("probe")].get("probe")           # a kind without a digest uses the tag
 
 
 def test_published_digests_are_valid_and_only_used_for_the_default_registry(monkeypatch):
@@ -67,13 +66,13 @@ def test_published_digests_are_valid_and_only_used_for_the_default_registry(monk
         assert set(kinds) <= set(images.NAMES), version
         assert all(re.fullmatch(r"sha256:[0-9a-f]{64}", d) for d in kinds.values()), version
     # the tag of this version has digests for all three images (a release must be pinned)
-    assert set(images.DIGESTS.get(images.tag(), {})) == {"tools", "probe", "gpu"}
+    assert all(images.DIGESTS.get(images.tag(kind), {}).get(kind) for kind in ("tools", "probe", "gpu"))
     for kind in images.NAMES:
         assert images.image(kind).count("@sha256:") == 1
     images.configure("registry.local:5000/lab")
     assert all("@" not in images.image(k) for k in images.NAMES)                                    # a copy in another registry: the tag
     images.configure()
-    monkeypatch.setattr(images, "tag", lambda: "9.9.9")
+    monkeypatch.setattr(images, "tag", lambda kind="": "9.9.9")
     assert all("@" not in images.image(k) for k in images.NAMES)                                    # a version without an entry: the tag
 
 

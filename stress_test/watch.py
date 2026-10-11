@@ -4,7 +4,7 @@ It reads only local files - the registry of running tests (.logs/running/) and t
 fills with a measurement every few seconds - so it asks the cluster for nothing and loads nothing. What it shows depends on the
 test: a GPU test shows the GPU, a CPU test the CPU / RAM / clock, a disk or network test its jobs and results, a multi-node or
 FULL test one row per node and the phase. The width decides how much (up to 90 / 91-160 / wider columns, like the dashboard).
-Keys: ↑↓ select, Tab node, Enter log tail, x stop the test, +/- interval, p pause, q back.
+Keys: ↑↓ select, Tab node, Enter log tail, x stop the test, w new window, +/- interval, p pause, q back.
 """
 from __future__ import annotations
 
@@ -554,6 +554,7 @@ class UiState:
     scroll: int = 0                           # first visible body line of the narrow (card) layout
     confirm_stop: str = ""                    # run id waiting for y / n
     message: str = ""
+    window_pick: list = field(default_factory=list)   # the kinds offered after key w (the next key chooses)
 
 
 def tail_rows(path: str, count: int, on: bool) -> list:
@@ -757,7 +758,7 @@ def render(w: Watcher, state: UiState, columns: int, lines: int, on: bool) -> li
     state.selected = max(0, min(state.selected, n - 1)) if n else 0
     title = (f"🔭 STATUS · {n} test{'s' if n != 1 else ''} running" + (f" · {len(w.plans)} planned" if w.plans else "")
              + (f" · {ui.paint('PAUSED', ui.YELLOW, on)}" if state.paused else "") + f" · {state.interval:g} s · {time.strftime('%H:%M:%S')}")
-    keys = ui.paint("↑↓ test  Tab node  Enter log  x stop  e screen  +/- interval  p pause  q back" if tiers > 1 else "↑↓  Tab  Enter log  x stop  e  +/-  q", ui.GREY, on)
+    keys = ui.paint("↑↓ test  Tab node  Enter log  x stop  e screen  w window  +/- interval  p pause  q back" if tiers > 1 else "↑↓  Tab  Enter log  x stop  e  w  +/-  q", ui.GREY, on)
     head = [ui.paint(state.message, ui.YELLOW, on)] if state.message else []
     if state.confirm_stop:
         head = [ui.paint(f"Stop test {state.confirm_stop}? (y = stop it, anything else = no)", ui.RED, on)]
@@ -817,8 +818,18 @@ class Screen:
     def draw(self) -> None:
         columns, lines = self._size()
         frame = render(self.w, self.state, columns, lines, ui.color_enabled())[:max(10, lines - 1)]
+        if self.state.window_pick:                                   # the question of key w replaces the screen until it is answered
+            from . import notify
+            frame = notify.pick_lines(self.state.window_pick, ui.color_enabled(), max(40, min(columns - 1, 100)))
         self._frame, self._size_seen = frame, (columns, lines)
         self.canvas.draw(frame)
+
+    def _open_window(self, kind: str) -> bool:
+        from . import notify
+        if notify.open_window([sys.executable, "-m", "stress_test", "--status", "--live"], keep_open=False, kind=kind):
+            return True
+        self.state.message = "The window could not be opened. STRESS_TERMINAL=\"kitty\" chooses a terminal."
+        return False
 
     def handle(self, key: str) -> bool:
         s, tests = self.state, self.w.tests
@@ -830,7 +841,22 @@ class Screen:
             else:
                 s.message = "not stopped"
             return True
+        if s.window_pick:                                                    # the answer to "Open in: 1 … 2 … Esc"
+            from . import notify
+            kinds, s.window_pick, s.message = s.window_pick, [], ""
+            kind = notify.kind_of_key(key, kinds)
+            return not (kind and self._open_window(kind))
         s.message = ""
+        if key in ("w", "W"):                                                # the screen moves to a new window
+            from . import notify
+            plan = notify.plan_window()
+            if not plan["kinds"]:
+                s.message = "No window can be made here (not in tmux, no display, no known terminal). STRESS_TERMINAL=\"kitty\" chooses one."
+            elif plan["preset"]:
+                return not self._open_window(plan["preset"])
+            else:
+                s.window_pick = plan["kinds"]
+            return True
         if key in ("q", "Q", "esc"):
             if s.log_view:
                 s.log_view = False

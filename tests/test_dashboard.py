@@ -298,12 +298,82 @@ def test_probe_pods_are_safe_and_do_not_look_like_a_test(fake):
         assert pod["metadata"]["labels"]["app"] == "stress-test-dashboard"             # NOT the tool's test label
         assert '"privileged"' not in text and "hostNetwork" not in text and "hostPID" not in text
         assert pod["spec"]["automountServiceAccountToken"] is False and pod["spec"]["activeDeadlineSeconds"] == d.POD_DEADLINE
-        assert pod["spec"]["containers"][0]["resources"]["limits"]["memory"]
+        assert pod["spec"]["containers"][0]["resources"]["limits"] == {"memory": "256Mi", "cpu": "1000m"}
     gpu_pod = next(p for p in manifests if p["metadata"]["labels"]["role"] == "dashboard-gpu")
     assert gpu_pod["spec"]["runtimeClassName"] == "nvidia" and "nvidia.com/gpu" not in json.dumps(gpu_pod["spec"]["containers"][0]["resources"])
     assert "hostPath" not in json.dumps(gpu_pod)
     probe = next(p for p in manifests if p["metadata"]["labels"]["role"] == "dashboard-probe")
-    assert [v["hostPath"]["path"] for v in probe["spec"]["volumes"]] == ["/sys"] and probe["spec"]["containers"][0]["volumeMounts"][0]["readOnly"]
+    assert [v["hostPath"]["path"] for v in probe["spec"]["volumes"] if "hostPath" in v] == ["/sys"] and probe["spec"]["containers"][0]["volumeMounts"][0]["readOnly"]
+
+
+def test_probe_pods_are_hardened_and_have_a_reserve(fake):
+    c = collector()
+    c.start()
+    for pod in (json.loads(p.read_text()) for p in fake.glob("manifest-dash-*.json")):
+        box = pod["spec"]["containers"][0]
+        assert pod["spec"]["restartPolicy"] == "OnFailure" and pod["spec"]["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+        assert box["securityContext"] == {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"], "add": ["NET_RAW"]}, "readOnlyRootFilesystem": True}
+        assert box["resources"]["requests"] == {"memory": "64Mi", "cpu": "100m"}
+        assert {"name": "tmp", "mountPath": "/tmp"} in box["volumeMounts"]
+        tol = pod["spec"]["tolerations"]
+        assert {"operator": "Exists"} not in tol and any(t["effect"] == "NoExecute" and t["tolerationSeconds"] == 300 for t in tol)
+
+
+def test_start_without_waiting_returns_at_once_and_the_probes_arrive(fake):
+    c = collector()
+    c.start(wait=False)
+    deadline = time.time() + 10
+    while set(c.pods) != {"gpu1", "w2", "m1"} and time.time() < deadline:
+        time.sleep(0.05)
+    assert set(c.pods) == {"gpu1", "w2", "m1"}
+
+
+def _wait_for(check, seconds=10):
+    end = time.time() + seconds
+    while not check() and time.time() < end:
+        time.sleep(0.05)
+    return check()
+
+
+def test_a_probe_that_keeps_failing_is_replaced_by_a_new_pod(fake, monkeypatch):
+    c = collector()
+    c.start()
+    old = c.pods["w2"]
+    real = c.kube.exec
+
+    def flaky(pod, script, timeout=30):
+        if pod == old[0]:
+            from stress_test.kube import KubectlError
+            raise KubectlError("gone")
+        return real(pod, script, timeout)
+    monkeypatch.setattr(c.kube, "exec", flaky)
+    for _ in range(d.FAILS_TO_RENEW):
+        c.refresh()
+    assert _wait_for(lambda: c.pods["w2"] != old)
+    assert c.pods["w2"][0] != old[0]
+    assert {n.name: n for n in c.refresh().nodes}["w2"].probe_ok
+
+
+def test_a_probe_near_its_deadline_is_replaced(fake):
+    now = [1000.0]
+    c = d.Collector(Kubectl(str(FAKE)), None, clock=lambda: now[0])
+    c.start()
+    old = c.pods["m1"]
+    c.refresh()
+    assert c.pods["m1"] == old
+    now[0] += d.RENEW_AFTER + 1
+    c.refresh()
+    assert _wait_for(lambda: c.pods["m1"] != old)
+
+
+def test_stop_also_removes_the_replaced_pods(fake):
+    c = collector()
+    c.start()
+    c._renew("w2", "test")
+    assert _wait_for(lambda: not c._renewing and len(c._created) > 4)
+    created = list(c._created)
+    c.stop()
+    assert not c.pods and "app=stress-test-dashboard" in (fake / "deleted-by-label").read_text() and len(created) == 5
 
 
 def test_stop_removes_the_pods_and_the_leftovers(fake):
@@ -355,7 +425,8 @@ def test_cli_dashboard_needs_a_terminal(fake):
     assert res.returncode != 0 and "needs a terminal" in res.stdout
 
 
-def test_dashboard_is_a_key_with_an_icon_not_a_numbered_entry(monkeypatch, capsys):
+def test_dashboard_is_a_key_with_an_icon_not_a_numbered_entry(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("STRESS_TEST_MENU_STATE", str(tmp_path / "state.json"))      # never the real settings (probe pods may be kept there)
     from stress_test import menu
     for cols in (50, 80, 130):
         text = "\n".join(menu.menu_lines("c", [], False, cols=cols))

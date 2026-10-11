@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import images, ui
+from . import background, images, ui, viewer
 from . import gpu as gpumod
 from .disk import jobs as disk_jobs
 from .kube import Kubectl, KubectlError
@@ -202,14 +202,19 @@ def confirm(args: argparse.Namespace, ask: Callable, phases: list[Phase], level:
     on = ui.color_enabled()
     print("\n" + "\n".join(warning_box(on)))
     print("\n" + "\n".join(plan_box(phases, level, nodes, on)) + "\n")
-    if not (args.yes or ask("I understand: the cluster will be fully loaded and unusable meanwhile (y/n)", "n").lower() in ("y", "yes")):
-        return False
+    if not args.yes:
+        ui.show_question("I understand: the cluster will be fully loaded and unusable meanwhile", False, warning=True)
+        understood = ask("y/n", "n").strip().lower() in ("y", "yes")
+        ui.answered("I understand: the cluster will be fully loaded and unusable meanwhile", understood)
+        if not understood:
+            return False
     if getattr(args, "self_test_ack", False):
         return True
     if args.non_interactive:
         ui.emit(f"❌ Non-interactive start needs --self-test-ack (second confirmation).")
         return False
-    return ask(f"Second confirmation - type {ACK_WORD} to begin", "").strip() == ACK_WORD
+    ui.show_input(f"Second confirmation: type {ACK_WORD} to begin", None, f"the word {ACK_WORD} in capitals, anything else cancels", warning=True)
+    return ask(f"Type {ACK_WORD}", "").strip() == ACK_WORD
 
 
 # --- temperatures and the cooling pause ---------------------------------------------------------
@@ -602,7 +607,8 @@ def _plan_run(args: argparse.Namespace, cli, level: str, chosen: list, subset: b
     run_id = secrets.token_hex(3)
     console = str(directory / "selftest-console.txt")
     total = sum(p.seconds for p in phases)
-    pid = background.detach(console)
+    with viewer.child_environment(console):              # the live screens are drawn into the console too (--attach / key A)
+        pid = background.detach(console)
     if pid:                                              # PARENT: prints the info and ends
         cli._print_background_info(names, f"about {human(total)} in total", run_id, pid, str(directory), console, args.schedule)
         sys.stdout.flush()
@@ -611,6 +617,34 @@ def _plan_run(args: argparse.Namespace, cli, level: str, chosen: list, subset: b
                              extra={"kind": "background", "profile": "selftest", "nodes": [n.name for n in chosen],
                                     "log_dir": str(directory), "phase": "starting"})
     args._selftest_run_id = run_id                          # the child goes on: its record already exists
+    return None
+
+
+def title_of(level: str, chosen: list) -> str:
+    return f"FULL self-test ({level}) · {len(chosen)} node(s)"
+
+
+def _run_watched(args, directory, phases, chosen, level: str, title: str) -> Optional[int]:
+    """The foreground self-test as a detached process with a viewer (see viewer.py). The PARENT returns the exit code once the watch
+    ends (q: 0 - the test goes on); the CHILD gets None and carries on with the run (its record is made here)."""
+    import secrets
+    run_id = secrets.token_hex(3)
+    console = viewer.console_for(run_id)
+    saved = viewer.saved_environment()
+    with viewer.child_environment(console):
+        pid = background.detach(console)
+    if pid:
+        viewer.restore_environment(saved)
+        if getattr(args, "test_window", False) and viewer.open_window(run_id):
+            for line in viewer.background_message(run_id, console, pid, window=True):
+                ui.emit(line)
+            return 0
+        outcome = viewer.run_attached(console, pid, run_id)
+        return 0 if outcome["result"] in ("background", "window") else int(outcome["code"] or 0)
+    background.register(run_id, "cluster", sum(p.seconds for p in phases), str(directory), console, title=title,
+                       extra={"kind": "background", "profile": "selftest", "nodes": [n.name for n in chosen],
+                              "log_dir": str(directory), "phase": "starting"})
+    args._selftest_run_id = run_id
     return None
 
 
@@ -648,9 +682,13 @@ def run(args: argparse.Namespace, kube: Optional[Kubectl] = None, ask: Optional[
     if subset:
         with_master = bool(masters)
     elif masters:
-        with_master = bool(args.include_master) or (not args.non_interactive and ask(
-            f"Test the master ({masters[0].name}) too? It is the API of the cluster; it runs last, capped at "
-            f"{MASTER_CPU_CAP} % CPU (y/n)", "n").strip().lower() in ("y", "yes"))
+        with_master = bool(args.include_master)
+        if not with_master and not args.non_interactive:
+            text = (f"Test the master ({masters[0].name}) too? (It is the API of the cluster; it runs last, capped at "
+                    f"{MASTER_CPU_CAP} % CPU)")
+            ui.show_question(text, False)
+            with_master = ask("y/n", "n").strip().lower() in ("y", "yes")
+            ui.answered(text, with_master)
     chosen = workers + (masters if with_master else [])
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
     directory = make_private_dir(user_log_dir(args.log_dir) / f"selftest-{stamp}")
@@ -667,6 +705,11 @@ def run(args: argparse.Namespace, kube: Optional[Kubectl] = None, ask: Optional[
             return planned
     started = time.time()
     run_id = getattr(args, "_selftest_run_id", "")
+    if not run_id and viewer.wanted(args):                  # in a terminal: runs detached and is only watched (q sends it to the background)
+        watched = _run_watched(args, directory, phases, chosen, level, title_of(level, chosen))
+        if watched is not None:
+            return watched
+        run_id = args._selftest_run_id
     if not run_id:                                           # in the foreground: the status screen of another terminal can see it
         import secrets
         from . import background as _bg

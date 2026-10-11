@@ -23,7 +23,7 @@ from .net import (MAX_NET_TIME, MIN_NET_TIME, NET_MODES, NET_TIME_DEFAULT, net_d
                   normalize_extras)
 from .export import EXPORT_CHOICES, write_exports
 from .logparse import read_log
-from .models import (COOLDOWN_DEFAULT, COOLDOWN_MAX, DEFAULT_MAX_TEMP, MASTER_CPU_CAP,
+from .models import (COOLDOWN_DEFAULT, COOLDOWN_MAX, DEFAULT_MAX_TEMP, MASTER_CPU_CAP, MAX_RAM_PCT,
                      MAX_MAX_TEMP, MAX_NODE_BUSY_PCT, MAX_SPIKE_PHASE_TIME, MIN_MAX_TEMP,
                      MIN_SPIKE_PHASE_TIME, MIN_STEP_TIME, PROFILE_CLASSIC, PROFILE_DISK, PROFILE_GPU, PROFILE_NET, PROFILE_SPIKE,
                      PROFILE_STEPPED, SPIKE_LOW_PCT, SPIKE_PHASE_TIME_DEFAULT, SPIKE_TARGETS,
@@ -31,6 +31,7 @@ from .models import (COOLDOWN_DEFAULT, COOLDOWN_MAX, DEFAULT_MAX_TEMP, MASTER_CP
 from .parsing import (clean_text, describe_duration, describe_steps, format_workload, is_node_name,
                       parse_duration, parse_steps)
 from .paths import make_private_dir, migrate_to_daily, open_private, user_log_dir, user_log_root
+from . import viewer
 from .runner import EXIT_ERROR, EXIT_INTERRUPTED, GATE_TIMEOUT, RunnerError, StressRunner
 
 YES = {"y", "yes"}
@@ -127,6 +128,7 @@ examples:
   ./stress.sh --stop worker-3             stop a test running in the background
   ./stress.sh --compare worker-1       compare the two latest tests of a node
   ./stress.sh --list-nodes                     list the cluster's nodes and exit
+  ./stress.sh --nodes-view                     one screen per node with everything known about it (menu 8; Tab switches the node)
   ./stress.sh --list-gpus                      scan the nodes for GPUs: which have a usable NVIDIA card
   ./stress.sh --profile gpu --node worker-1 --time 2m
                                                GPU burn (gpu-burn) of one node; menu "2 GPU" scans and asks
@@ -143,6 +145,8 @@ examples:
   ./stress.sh --node worker-1 --time 20m --schedule "2026-10-03 02:00" --persistent
                                                on a date, as a systemd timer (survives a restart)
   ./stress.sh --scheduled                      list the planned tests (cancel: --stop ID)
+  ./stress.sh --doctor [--doctor-load]         health check of the whole cluster with advice (read-only; --doctor-load adds a 50 % mini load test, asks first)
+  ./stress.sh --dashboard --keep-probes [H]    same, probe pods stay up to H hours (default 24) and are reused; --cleanup-probes removes them
   ./stress.sh --dashboard                      live overview of every node (menu key D; 3 widths, read-only)
   ./stress.sh --node worker-1 --time 10m --allow-busy-node
                                                start even on a node the preflight finds busy
@@ -152,9 +156,6 @@ preflight (checks before EVERY test, including --quick):
   2) node usage (kubectl top, CPU/RAM) above --max-busy-pct -> --allow-busy-node / --no-capacity-check
   3) CPU temperature above --max-temp already BEFORE the load -> let the node cool down, or
      --allow-no-sensor only handles a missing sensor, not a high temperature
-
-language (root ~/cluster-testing/stress.sh only):
-  --cz / --eng as the FIRST switch, or the variable STRESS_LANG=CZ|ENG (default CZ)
 
 environment variables:
   FORCE=1        same as --force
@@ -421,6 +422,40 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--live", action="store_true",
                    help="with --status: the live screen (menu key W) - every running and planned test, refreshed every "
                         "second, with the details of its kind (GPU, CPU, disk, network, FULL self-test); x stops a test")
+    g.add_argument("--nodes-view", action="store_true",
+                   help="NODES screen (menu 8): the information of one node at a time - hardware, Kubernetes, history, pods, "
+                        "problems - Tab / arrows switch the node; adapts to the window; --nodes A,B limits it (--list-nodes prints a plain table)")
+    g.add_argument("--keep-probes", nargs="?", const=24, default=0, type=int, metavar="HOURS",
+                   help="with --dashboard / --nodes-view: leave the probe pods running for HOURS (1-72, default 24) after the "
+                        "program closes and reuse them next time (the master's probe is always removed)")
+    g.add_argument("--attach", metavar="ID",
+                   help="join a test that runs in the background (run id, node or PID): its live screen is shown again; q leaves it running, "
+                        "Ctrl-C asks whether to stop it")
+    g.add_argument("--attach-wait", type=float, default=0.0, help=argparse.SUPPRESS)
+    g.add_argument("--test-window", action="store_true",
+                   help="show the live view of a test in a NEW terminal window (tmux window, or a known terminal emulator) instead of this "
+                        "terminal; this terminal gets the prompt back at once (menu S ▸ 6 sets it for good)")
+    g.add_argument("--no-detach", action="store_true",
+                   help="the classic foreground: the test runs in this terminal process and q cannot send it to the background "
+                        "(otherwise an interactive test runs detached and is only watched, so q / Ctrl-C can hand it over)")
+    g.add_argument("--doctor", action="store_true",
+                   help="a thorough, read-only health check of the whole cluster with advice what to fix or improve (probe pods are "
+                        "removed at the end); the report is saved in logs/doctor/; --nodes A,B limits it; the exit code is 1 on a FAIL")
+    g.add_argument("--doctor-load", action="store_true",
+                   help="with --doctor: also the mini load test (every worker at once at 50 %% CPU and RAM for a minute, the master "
+                        "is never loaded) with the responsiveness of the nodes measured before and during it; asks for your OK")
+    g.add_argument("--doctor-load-ok", action="store_true",
+                   help="with --doctor-load: the OK is given in advance (used by a plan or by the menu after its own question)")
+    g.add_argument("--doctor-last", action="store_true",
+                   help="show the newest saved cluster check (what the window of the regular check shows)")
+    g.add_argument("--doctor-every", type=int, metavar="DAYS",
+                   help="run the cluster check regularly: every DAYS days (7, 14, 30 ...) at --doctor-at; a detached process waits for "
+                        "the date, runs the check, shows a notification and a window with the report; listed in --scheduled, "
+                        "stopped with --stop ID; it ends when the computer restarts")
+    g.add_argument("--doctor-at", default="03:00", metavar="HH:MM",
+                   help="with --doctor-every: the time of day of the check (default 03:00)")
+    g.add_argument("--cleanup-probes", action="store_true",
+                   help="list and delete the probe pods that --keep-probes left in the cluster, then exit")
     g.add_argument("--dashboard", action="store_true",
                    help="live cluster DASHBOARD (menu key D): every node at a glance - CPU, temperature, clock, RAM, power, GPU, "
                         "network, pods, events; three widths (up to 90 / 91-160 / wider); read-only probes that exist only while "
@@ -468,36 +503,97 @@ def build_parser() -> argparse.ArgumentParser:
 # --- questions ------------------------------------------------------------------
 def ask(prompt: str, default: Optional[str] = None) -> str:
     try:
-        answer = input(ui.prompt(prompt, default)).strip()
+        answer = input(ui.prompt(prompt, default, key=False)).strip()
     except EOFError:
         raise SystemExit("\nInput ended.")
     return answer or (default or "")
 
 
-def ask_int(prompt: str, default: int) -> int:
+# A Czech keyboard layout gives "+ ě š č ř ž ý á í é" on the number row without Shift: the menus take them as 1 2 3 4 5 6 7 8 9 0.
+CZECH_DIGITS = {"+": "1", "ě": "2", "š": "3", "č": "4", "ř": "5", "ž": "6", "ý": "7", "á": "8", "í": "9", "é": "0"}
+
+
+def ask_key(prompt: str, default: Optional[str] = None) -> str:
+    """Like ask(), for questions answered by ONE key (the menus): the key is taken as soon as it is pressed, no Enter. Enter alone gives
+    the default, Esc gives "0" (back), Ctrl-C / Ctrl-D end the question like in ask(). Without a terminal it is plain ask()."""
+    import re as _re
+    import termios
+    import tty
+    if os.environ.get("STRESS_NO_KEYS") or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return ask(prompt, default)                                   # "Enter everywhere" (SETTINGS) or no terminal
+    try:
+        old = termios.tcgetattr(0)
+    except (termios.error, OSError, ValueError):
+        return ask(prompt, default)
+    sys.stdout.write(_re.sub(r"[\x01\x02]", "", ui.prompt(prompt, default, key=True)))
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(0)
+        while True:
+            data = os.read(0, 8)
+            if not data:
+                raise SystemExit("\nInput ended.")
+            text = data.decode("utf-8", "ignore")
+            if text in ("\r", "\n"):
+                answer = default or ""
+                break
+            if text == "\x03":
+                raise KeyboardInterrupt
+            if text == "\x04":
+                raise SystemExit("\nInput ended.")
+            if text == "\x1b":
+                answer = "0"
+                break
+            if text[:1].isprintable() and not text.startswith("\x1b"):
+                answer = CZECH_DIGITS.get(text[0], text[0])
+                break                                     # arrows, function keys and the like are ignored
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+    sys.stdout.write(answer + "\n")
+    sys.stdout.flush()
+    return answer
+
+
+ask.key = ask_key                                          # the menus look for it (menu._pick)
+
+
+def ask_int(prompt: str, default: int, low: Optional[int] = None, high: Optional[int] = None) -> int:
+    """A whole number; with low / high the range is checked HERE, at the question (not later, after the other questions)."""
+    ranged = low is not None and high is not None
+    ui.show_input(prompt, str(default), f"a whole number {low}-{high}" if ranged else "a whole number")
     while True:
-        raw = ask(prompt, str(default))
+        raw = ask(ui.split_question(prompt)[0], str(default))
         try:
-            return int(raw)
+            value = int(raw)
         except ValueError:
             ui.warn("Enter a whole number.")
+            continue
+        if (low is not None and value < low) or (high is not None and value > high):
+            ui.warn(f"The value must be {low}-{high}." if ranged else f"The value must be at least {low}." if low is not None else f"The value must be at most {high}.")
+            continue
+        ui.answered_value(prompt, str(value))
+        return value
 
 
 def ask_duration(prompt: str, default: str) -> int:
+    ui.show_input(prompt, default, "seconds or with a unit: 90, 2m, 1h")
     while True:
-        raw = ask(prompt, default)
+        raw = ask(ui.split_question(prompt)[0], default)
         try:
             seconds = parse_duration(raw)
         except ValueError as exc:
             ui.warn(str(exc))
             continue
-        ui.info(describe_duration(seconds))
+        ui.answered_value(prompt, describe_duration(seconds))
         return seconds
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
-    raw = ask(f"{prompt} (y/n)", "y" if default else "n")
-    return raw.lower() in YES
+    ui.show_question(prompt, default)
+    raw = ask("y/n", "y" if default else "n")                       # y/n is confirmed with Enter (only the menus take a bare key)
+    yes = raw.lower() in YES
+    ui.answered(prompt, yes)
+    return yes
 
 
 def ask_scope() -> str:
@@ -507,7 +603,7 @@ def ask_scope() -> str:
         ("2", "all workers", "without the master"),
         ("3", "whole cluster", f"workers, the master last with a CPU cap of {MASTER_CPU_CAP} %")])
     while True:
-        raw = ask("Choose", "1")
+        raw = ask_key("Choose", "1")
         if raw in ("1", "2", "3"):
             return {"1": "single", "2": "workers", "3": "cluster"}[raw]
         ui.warn("Invalid choice.")
@@ -523,7 +619,7 @@ def ask_profile() -> str:
         ("5", "network", "iperf3 + ping to another node: MB/s, latency, MTU; always logged"),
         ("6", "gpu", "NVIDIA GPU burn (gpu-burn): temperature, clocks, throttling; always logged")])
     while True:
-        raw = ask("Choose", "1")
+        raw = ask_key("Choose", "1")
         if raw in ("1", "2", "3", "4", "5", "6"):
             return {"1": PROFILE_CLASSIC, "2": PROFILE_STEPPED, "3": PROFILE_SPIKE,
                     "4": PROFILE_DISK, "5": PROFILE_NET, "6": PROFILE_GPU}[raw]
@@ -539,7 +635,7 @@ def ask_spike_target() -> int:
         (key, f"{key}/4", f"{pct} %" + (" (default)" if pct == SPIKE_TARGETS[-1] else ""))
         for key, pct in SPIKE_TARGET_CHOICES.items()])
     while True:
-        raw = ask("Choose", "4")
+        raw = ask_key("Choose", "4")
         if raw in SPIKE_TARGET_CHOICES:
             return SPIKE_TARGET_CHOICES[raw]
         ui.warn("Invalid choice.")
@@ -554,7 +650,7 @@ def ask_net_mode() -> str:
         ("1", "nodes' network", "the real NICs and cables (default)"),
         ("2", "pod network", "what workloads really use: flannel / CNI")])
     while True:
-        raw = ask("Choose", "1")
+        raw = ask_key("Choose", "1")
         if raw in ("1", "2"):
             return "host" if raw == "1" else "pod"
         ui.warn("Invalid choice.")
@@ -675,14 +771,14 @@ def build_config(args: argparse.Namespace, node_name: str,
         if args.duration is not None:
             ui.emit("ℹ️  For the network test the time is set with --net-time, --time is ignored.")
     elif gpu:
-        gpu_max_temp = pick(args.gpu_max_temp, lambda: ask_int("GPU temperature for automatic stop (50-95 °C)", GPU_MAX_TEMP_DEFAULT),
+        gpu_max_temp = pick(args.gpu_max_temp, lambda: ask_int("GPU temperature for automatic stop (50-95 °C)", GPU_MAX_TEMP_DEFAULT, 50, 95),
                             GPU_MAX_TEMP_DEFAULT)
         duration = pick(args.duration,
                         lambda: ask_duration(f"GPU test duration ({MIN_GPU_TIME}-{MAX_GPU_TIME} s, e.g. 60, 5m)", "2m"), 120)
     elif disk:
         disk_size = pick(args.disk_size,
                          lambda: ask_int(f"Test file size in MiB ({MIN_DISK_SIZE}-{MAX_DISK_SIZE})",
-                                         DISK_SIZE_DEFAULT), DISK_SIZE_DEFAULT)
+                                         DISK_SIZE_DEFAULT, MIN_DISK_SIZE, MAX_DISK_SIZE), DISK_SIZE_DEFAULT)
         disk_job_time = pick(args.disk_job_time,
                              lambda: ask_duration(f"Length of one fio job ({MIN_DISK_JOB_TIME}-"
                                                   f"{MAX_DISK_JOB_TIME} s, e.g. 15, 30s)",
@@ -722,12 +818,12 @@ def build_config(args: argparse.Namespace, node_name: str,
         max_temp = pick(args.max_temp,
                         lambda: ask_int(
                             f"CPU temperature for automatic stop "
-                            f"({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C)", DEFAULT_MAX_TEMP),
+                            f"({MIN_MAX_TEMP}–{MAX_MAX_TEMP} °C)", DEFAULT_MAX_TEMP, MIN_MAX_TEMP, MAX_MAX_TEMP),
                         DEFAULT_MAX_TEMP)
     # the network / disk tests do not heat the CPU: no cooldown unless it was asked for explicitly
     cooldown = (args.cooldown or 0) if (net or disk) else pick(args.cooldown, ask_cooldown, COOLDOWN_DEFAULT)
     cpu_load = 100 if (stepped or spike or disk or net or gpu) else pick(args.cpu_load,
-                                                     lambda: ask_int("CPU load in %", 100), 100)
+                                                     lambda: ask_int("CPU load in %", 100, 1, 100), 100)
 
     ram_pct = args.ram_pct
     hdd = args.hdd
@@ -740,7 +836,7 @@ def build_config(args: argparse.Namespace, node_name: str,
     elif not master_mode:   # on the master RAM and disk are not used anyway
         if ram_pct is None and interactive:
             if ask_yes_no("Stress RAM?"):
-                ram_pct = ask_int("How many % of FREE RAM to allocate", 80)
+                ram_pct = ask_int("How many % of FREE RAM to allocate", 80, 1, MAX_RAM_PCT)
         if hdd is None and interactive:
             hdd = ask_yes_no("Stress disk / IO?")
 
@@ -1037,11 +1133,59 @@ def _run_extra(cfg: StressConfig, kind: str, nodes: list, log_dir: str = "") -> 
             "gpu_max_temp": cfg.gpu_max_temp if cfg.gpu else None, "cooldown": cfg.cooldown}
 
 
-def _run_registered(runner, run_id: str, node: str, duration: int, log_path, title: str, extra: dict, enabled: bool = True) -> int:
+def _screen_in_window(args, flags: list, name: str) -> bool:
+    """--test-window (or SETTINGS ▸ 6 "a new window") for a live screen: it is started in a new terminal window and this terminal is free.
+    False = not asked for, or no window could be opened (the screen then runs here)."""
+    if not getattr(args, "test_window", False):
+        return False
+    from . import notify
+    argv = [sys.executable, "-m", "stress_test", *flags]
+    if args.nodes:
+        argv += ["--nodes", args.nodes]
+    if getattr(args, "keep_probes", 0):
+        argv += ["--keep-probes", str(args.keep_probes)]
+    if notify.open_window(argv, keep_open=False):
+        ui.emit(f"🪟 {name} is shown in a new terminal window; this terminal is free.")
+        return True
+    ui.emit("ℹ️  No terminal window could be opened here (no display or no known terminal emulator) - showing it in this terminal.")
+    return False
+
+
+def _run_attached(runner, run_id: str, node: str, duration: int, log_path, title: str, extra: dict, args=None) -> int:
+    """A test started in the terminal runs DETACHED (like -b) and this process only watches it (viewer.py): q sends it to the background, Ctrl-C
+    asks, a quick second Ctrl-C stops it. Everything the test prints (the live frames too) goes through its console file."""
+    console = viewer.console_for(run_id)
+    saved = viewer.saved_environment()
+    with viewer.child_environment(console):
+        pid = background.detach(console)
+    if pid:                                                        # PARENT: watches; the child does the work and the cleanup
+        viewer.restore_environment(saved)
+        log.info("Test %s runs detached (PID %s) and is watched; console %s", run_id, pid, console)
+        if args is not None and getattr(args, "test_window", False):
+            if viewer.open_window(run_id):                             # the live view is in a new terminal window; this terminal is free
+                for line in viewer.background_message(run_id, console, pid, window=True):
+                    ui.emit(line)
+                return 0
+            ui.emit("ℹ️  No terminal window could be opened here (no display or no known terminal emulator) - watching in this terminal.")
+        outcome = viewer.run_attached(console, pid, run_id)
+        return 0 if outcome["result"] in ("background", "window") else int(outcome["code"] or 0)
+    log.info("Child detached from the terminal (PID %s)", os.getpid())
+    background.register(run_id, node, duration, log_path, console, title=title, extra={**extra, "kind": "background"})
+    try:
+        return runner.run()
+    finally:
+        background.unregister(run_id)
+
+
+def _run_registered(runner, run_id: str, node: str, duration: int, log_path, title: str, extra: dict, enabled: bool = True,
+                    args=None) -> int:
     """Runs a test in the foreground and keeps its record in the registry, so that the status screen of another
-    terminal sees it (a parallel subprocess does not register: its series does)."""
+    terminal sees it (a parallel subprocess does not register: its series does). In an interactive terminal the test runs detached with
+    a viewer (see _run_attached) so that it can be sent to the background with q."""
     if not enabled:
         return runner.run()
+    if args is not None and viewer.wanted(args):
+        return _run_attached(runner, run_id, node, duration, log_path, title, extra, args)
     background.register(run_id, node, duration, log_path, "", title=title, extra=extra)
     try:
         return runner.run()
@@ -1118,7 +1262,8 @@ def _print_background_info(node_label: str, duration_text: str, run_id: str, pid
         ("Test duration", duration_text),
         ("Run id / PID", f"{run_id} / {pid}"),
         ("Results", log_path),
-        ("Live output", f"tail -f {console_path}"),
+        ("Live screen", f"./stress.sh --attach {run_id}   (menu key A; q leaves it, w opens a window)"),
+        ("Raw output", f"tail -f {console_path}"),
         ("Status", "python3 -m stress_test --status   (or ./stress.sh --status)"),
         ("Stop / cancel", f"python3 -m stress_test --stop {run_id}"),
         *([("Planned tests", "python3 -m stress_test --scheduled   (menu 9 SCHEDULE)")] if start_at else []),
@@ -1266,13 +1411,14 @@ def _run_series(args: argparse.Namespace, kube: Kubectl, scope: str) -> int:
         _wait_until(args.schedule)
         return _run_registered(runner, secrets.token_hex(3), "cluster", series.estimate_total(template, nodes, run_parallel), log_path,
                                _plan_title(template, f"{len(nodes)} nodes"),
-                               _run_extra(template, "foreground", [n.name for n in nodes], str(directory)))
+                               _run_extra(template, "foreground", [n.name for n in nodes], str(directory)), args=args)
 
     # --- in the background: the whole series runs in a detached process
     console_path = log_path[:-4] + ".console.txt"
     run_id = secrets.token_hex(3)
     total = series.estimate_total(template, nodes, run_parallel)
-    pid = background.detach(console_path)
+    with viewer.child_environment(console_path):       # the live screens are drawn into the console too: --attach / key A shows them
+        pid = background.detach(console_path)
     if pid:                                       # PARENT: prints the info and exits
         log.info("Series moved to the background: run_id=%s, PID=%s", run_id, pid)
         _print_background_info(f"cluster ({len(nodes)} nodes: " + ", ".join(n.name for n in nodes)
@@ -1347,6 +1493,8 @@ def _main(args: argparse.Namespace) -> int:
         return cmd_migrate_logs()
     if args.status:
         if args.live:
+            if _screen_in_window(args, ["--status", "--live"], "The live status"):
+                return 0
             from . import watch
             return watch.run()
         return cmd_status()
@@ -1366,9 +1514,38 @@ def _main(args: argparse.Namespace) -> int:
         return cmd_list_nodes()
     if args.list_gpus:
         return cmd_list_gpus()
-    if args.dashboard:
+    if args.cleanup_probes:
         from . import dashboard
-        return dashboard.run([x.strip() for x in args.nodes.split(",") if x.strip()] if args.nodes else None)
+        return dashboard.cleanup_probes(Kubectl())
+    if args.attach:
+        return viewer.attach(args.attach, args.attach_wait)
+    if args.doctor:
+        from . import doctor
+        return doctor.run(args)
+    if args.doctor_last:
+        from . import doctor
+        return doctor.show_last(args)
+    if args.doctor_every:
+        from . import health_plan
+        try:
+            health_plan.normalize_at(args.doctor_at)
+        except ValueError as exc:
+            ui.emit(f"❌ {exc}")
+            return 2
+        return health_plan.start(args.doctor_every, args.doctor_at, args.doctor_load_ok, args.nodes, args.log_dir)
+    if args.keep_probes and not 1 <= args.keep_probes <= 72:
+        ui.emit("❌ --keep-probes takes 1-72 hours.")
+        return 2
+    if args.nodes_view:
+        if _screen_in_window(args, ["--nodes-view"], "The NODES screen"):
+            return 0
+        from . import nodes_screen
+        return nodes_screen.run([x.strip() for x in args.nodes.split(",") if x.strip()] if args.nodes else None, args.keep_probes)
+    if args.dashboard:
+        if _screen_in_window(args, ["--dashboard"], "The dashboard"):
+            return 0
+        from . import dashboard
+        return dashboard.run([x.strip() for x in args.nodes.split(",") if x.strip()] if args.nodes else None, args.keep_probes)
     if args.self_test:
         if shutil.which(os.environ.get("KUBECTL", "kubectl")) is None:
             ui.emit("❌ Error: 'kubectl' was not found.")
@@ -1481,12 +1658,13 @@ def _main(args: argparse.Namespace) -> int:
             _wait_until(args.schedule)
             return _run_registered(runner, runner.names.run_id, node.name, cfg.total_duration, log_path, _plan_title(cfg, node.name),
                                    _run_extra(cfg, "foreground", [node.name], str(Path(log_path).parent) if log_path else ""),
-                                   enabled=args.concurrent <= 1)
+                                   enabled=args.concurrent <= 1, args=args)
 
         # --- in the background: quick checks first, we want to see errors right away in the terminal
         runner.preflight()
         console_path = log_path[:-4] + ".console.txt"
-        pid = background.detach(console_path)
+        with viewer.child_environment(console_path):   # the live screen is drawn into the console too: --attach / key A shows it
+            pid = background.detach(console_path)
         if pid:                                   # PARENT: prints the info and exits
             log.info("Test moved to the background: run_id=%s, child PID=%s, output=%s",
                      runner.names.run_id, pid, console_path)
@@ -1536,6 +1714,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else EXIT_ERROR)
         log.info("SystemExit(%r)", exc.code)
         raise
+    except KeyboardInterrupt:                   # Ctrl-C at a question (a running test handles its own Ctrl-C)
+        ui.emit("\n🛑 Interrupted.")
+        code = 130
+        return code
     except Exception as exc:                    # unexpected error -> traceback to the log
         log.exception("Unexpected error")
         ui.emit(f"❌ Unexpected error: {exc}")

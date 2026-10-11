@@ -1,6 +1,7 @@
 """Pod definitions as Python dictionaries (no manual assembling of JSON strings)."""
 from __future__ import annotations
 
+import json
 from typing import Optional, Sequence
 
 from . import images
@@ -272,14 +273,64 @@ def smart_pod(node: str, names: PodNames, deadline: int = 300) -> dict:
 DASHBOARD_LABEL = "stress-test-dashboard"          # NOT the tool's test label: a dashboard never blocks a test
 
 
-def dashboard_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
-    """The dashboard's probe: unprivileged busybox, /sys read-only (like the test probe), removed when the dashboard closes."""
-    pod = probe_pod(node, PodNames(run_id, name, name, name), deadline)
-    pod["metadata"]["labels"] = {"app": DASHBOARD_LABEL, "run-id": run_id, "role": "dashboard-probe"}
+DASH_LIMITS = {"memory": "256Mi", "cpu": "1000m"}      # user's choice 2026-10-08: 256 MB RAM, one full core (1000 millicores)
+DASH_REQUESTS = {"memory": "64Mi", "cpu": "100m"}      # a reserve: the probe must answer even when the node is busy with a test
+
+
+def _harden_dashboard(pod: dict) -> dict:
+    """What the dashboard's pods share: restart a crashed container, tolerate taints only as long as it is useful, no capabilities,
+    the default seccomp filter, a read-only root file system (the probe writes nothing; /tmp is a small memory volume)."""
+    spec = pod["spec"]
+    spec["restartPolicy"] = "OnFailure"                  # an OOM-killed probe comes back by itself (activeDeadlineSeconds still ends the pod)
+    # NoSchedule taints do not matter for a pod bound by nodeName; a NoExecute taint (node down / unreachable / drained) removes the pod after 5 min
+    spec["tolerations"] = [{"operator": "Exists", "effect": "NoSchedule"}, {"operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300}]
+    spec["securityContext"] = {"seccompProfile": {"type": "RuntimeDefault"}}
+    box = spec["containers"][0]
+    # NET_RAW is the one capability kept: busybox ping opens a raw socket ("permission denied" without it - the ping between nodes was lost)
+    box["securityContext"] = {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"], "add": ["NET_RAW"]}, "readOnlyRootFilesystem": True}
+    box["resources"]["requests"] = dict(DASH_REQUESTS)
+    box["resources"]["limits"] = dict(DASH_LIMITS)
+    box.setdefault("volumeMounts", []).append({"name": "tmp", "mountPath": "/tmp"})
+    spec["volumes"] = [*spec["volumes"], {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "8Mi"}}]
     return pod
 
 
-def dashboard_gpu_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
+SPEC_ANNOTATION = "stress-test/spec"
+KEEP_LABEL = "persist"                                    # "1" = the pod is meant to outlive the program (--keep-probes)
+
+
+def _finish_dashboard(pod: dict, keep: bool) -> dict:
+    """Hardens the pod and marks it: a hash of its spec (a kept pod is reused only while it equals what this version would make)
+    and, for a pod that outlives the program, the persist label."""
+    _harden_dashboard(pod)
+    pod["metadata"].setdefault("annotations", {})[SPEC_ANNOTATION] = spec_hash(pod)
+    if keep:
+        pod["metadata"]["labels"][KEEP_LABEL] = "1"
+    return pod
+
+
+def spec_hash(pod: dict) -> str:
+    """Hash of the pod's spec without its deadline (a pod kept for 24 h and one kept for 2 h are the same pod)."""
+    import hashlib
+    spec = {k: v for k, v in pod["spec"].items() if k != "activeDeadlineSeconds"}
+    return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def expected_spec_hash(node: str, gpu: bool) -> str:
+    """What the hash of a fresh probe (or GPU probe) pod for this node is - a kept pod with another hash is outdated."""
+    make = dashboard_gpu_pod if gpu else dashboard_pod
+    return make(node, "x", "x", 1)["metadata"]["annotations"][SPEC_ANNOTATION]
+
+
+def dashboard_pod(node: str, name: str, run_id: str, deadline: int, keep: bool = False) -> dict:
+    """The dashboard's probe: unprivileged busybox, /sys read-only (like the test probe), removed when the dashboard closes
+    (or, with keep, left running until its deadline so the next start can reuse it)."""
+    pod = probe_pod(node, PodNames(run_id, name, name, name), deadline)
+    pod["metadata"]["labels"] = {"app": DASHBOARD_LABEL, "run-id": run_id, "role": "dashboard-probe"}
+    return _finish_dashboard(pod, keep)
+
+
+def dashboard_gpu_pod(node: str, name: str, run_id: str, deadline: int, keep: bool = False) -> dict:
     """Only runs nvidia-smi: the nvidia runtime + NVIDIA_VISIBLE_DEVICES=all, WITHOUT a `nvidia.com/gpu` limit, so it never
     takes the GPU away from a test (read-only monitoring). Unprivileged, no hostPath."""
     pod = _base_pod(name, node, deadline, run_id, "dashboard-gpu")
@@ -293,7 +344,7 @@ def dashboard_gpu_pod(node: str, name: str, run_id: str, deadline: int) -> dict:
         "env": [{"name": "NVIDIA_VISIBLE_DEVICES", "value": "all"}, {"name": "NVIDIA_DRIVER_CAPABILITIES", "value": "utility"}],
         "resources": {"requests": {"memory": "16Mi"}, "limits": {"memory": "128Mi"}},
     }]
-    return pod
+    return _finish_dashboard(pod, keep)
 
 
 def gpu_scan_pod(node: str, names: PodNames, deadline: int = 240) -> dict:

@@ -89,7 +89,7 @@ def test_cluster_line_survives_a_broken_cluster():
     (("7", "3", "some.log"), ["--export-log", "some.log"]),
     (("8", "1"), ["--status", "--live"]),
     (("8", "2", "abc123"), ["--stop", "abc123"]),
-    (("8", "3"), ["--list-nodes"]),
+    (("8", "3"), ["--nodes-view"]),
 ])
 def test_build_action(answers, expected):
     ask = scripted(*answers[1:])
@@ -120,7 +120,7 @@ def test_loop_runs_actions_and_returns_to_the_menu(capsys):
     ask = scripted("1", "1", "w", "", "8", "3", "", "0")      # CPU classic +watch, Enter, list nodes, Enter, quit
     code = menu.run_menu(ask=ask, run=lambda o: ran.append(o) or 0, cluster=lambda: "cluster: test")
     assert code == 0
-    assert ran == [["--profile", "classic", "--net-watch"], ["--list-nodes"]]
+    assert ran == [["--profile", "classic", "--net-watch"], ["--nodes-view"]]
     out = capsys.readouterr().out
     assert out.count("K3S·STRESS") == 3 and "cluster: test" in out       # the menu came back after each run
     assert "▶ ./stress.sh --profile classic --net-watch" in out
@@ -137,7 +137,7 @@ def test_loop_reports_exit_code_and_survives_errors(capsys):
 
 
 def test_loop_invalid_choice_and_end_of_input(capsys):
-    ask = scripted("a", "")                                    # invalid, then the input ends
+    ask = scripted("x", "")                                    # invalid, then the input ends
     assert menu.run_menu(ask=ask, run=lambda o: 0, cluster=lambda: "c") == 0
     assert "Invalid choice." in capsys.readouterr().out
 
@@ -183,7 +183,7 @@ def test_menu_end_to_end_lists_nodes_and_quits(tmp_path):
                          input="8\n3\n\n0\n", capture_output=True, timeout=60)
     assert res.returncode == 0, res.stdout + res.stderr
     assert "cluster: 1 nodes (1 workers + 0 master), all Ready" in res.stdout
-    assert "▶ ./stress.sh --list-nodes" in res.stdout and "fake-node" in res.stdout
+    assert "▶ ./stress.sh --nodes-view" in res.stdout and "needs a terminal" in res.stdout
     assert res.stdout.count("K3S·STRESS") == 2
 
 

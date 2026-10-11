@@ -4,7 +4,8 @@
 
 # Kubernetes stress test (Python)
 
-> **Version 1.19.0 (English)** (**runs on amd64 and arm64 - Raspberry Pi and other ARM boards**, multi-arch prebuilt images, time to the end in the live status and the
+> **Version 1.20.0 (English)** (**NODES screen, probe pods that outlive the program, cluster doctor with a regular check, `q` sends a test to the background, new windows, single-key menus**,
+> **runs on amd64 and arm64 - Raspberry Pi and other ARM boards**, multi-arch prebuilt images, time to the end in the live status and the
 > dashboard, cluster dashboard with graphs, live status of the running tests, scheduling, height-aware screens, GPU test, FULL self-test - see
 > [`CHANGELOG.md`](CHANGELOG.md)). New here? Start with [`HELPDESK.md`](HELPDESK.md) — a step-by-step
 > installation and troubleshooting guide. **What does it look like?** See the [Gallery](#gallery---what-every-screen-looks-like). Quick start: `./stress.sh --list-nodes`, then
@@ -19,7 +20,7 @@ dependencies, only the standard library and `kubectl`).
 Run `./stress.sh` with no options in a terminal:
 ```
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━ github.com/doctorxcz/k3s-cluster-stress-test ━┓
-┃ ◖●▲●◗ K3S·STRESS                                               v1.17.0 ┃
+┃ ◖●▲●◗ K3S·STRESS                                               v1.20.0 ┃
 ┃ › cluster: 5 nodes (4 workers + 1 master), all Ready                   ┃
 ┃ 🔥 last measured max 71 °C (worker-1)                                  ┃
 ┃ 🔁 last: ./stress.sh --profile stepped · 2026-10-01 10:40              ┃
@@ -34,11 +35,11 @@ Run `./stress.sh` with no options in a terminal:
 ┃ CLUSTER                                                                ┃
 ┃ 6 ▸ 🧪 FULL      self-test of the whole cluster · one report           ┃
 ┃ 7 ▸ 📊 DATA      compare · baseline · export                           ┃
-┃ 8 ▸ 🔧 ADMIN     what runs · stop · nodes                              ┃
+┃ 8 ▸ 🔧 ADMIN     what runs · stop · nodes · doctor                     ┃
 ┃ 9 ▸ 🕒 SCHEDULE  planned tests · plan · cancel                         ┃
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 ┃ 🔁 R ▸ repeat   🧰 S ▸ settings   ⏰ T ▸ start time   📺 D ▸ dashboard ┃
-┃ 🔭 W ▸ watch   ❓ ? ▸ help   🚪 Q ▸ quit                               ┃
+┃ 📋 N ▸ nodes   🔭 W ▸ watch   🔗 A ▸ join   ❓ ? ▸ help   🚪 Q ▸ quit  ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 Each entry (some open a submenu) only picks WHAT to do; the program then asks the usual questions (node, duration, ...). The chosen
@@ -49,10 +50,12 @@ are back in the menu. The menu is skipped when you give any option, when the inp
 |---|---|
 | `1`-`9` | open the entry (CPU, GPU, DISK, NET, QUICK, FULL, DATA, ADMIN, SCHEDULE) |
 | 📺 **D** | the live cluster dashboard (every node at a glance, graphs, pods, logs) |
+| 📋 **N** | the NODES screen: every node with all its information (hardware, Kubernetes, pods, history, problems); `Tab` switches the node |
+| 🔗 **A** | join a test that runs in the background (the only one, or pick from a list): its live screen again; `q` leaves it running |
 | 🔭 **W** | the live status of the running and planned tests (refreshed every second, details by the kind of the test) |
 | **T** | start time of the NEXT test: in a time (`2h`), at a clock time (`22:30`) or on a date (`2026-10-03 02:00`); the test you pick afterwards is planned |
 | `R` | repeat the last action exactly as it ran (shown in the header line `last:`) |
-| `S` | settings: default node, temperature limit, live frames on/off (kept in `.logs/menu-state.json`) |
+| `S` | settings (kept in `.logs/menu-state.json`): default node, temperature limit, live frames, probe pods (temporary or kept for hours), the regular cluster check, where the running test is shown (terminal / new window / classic), single-key menus on/off, where new windows open, reset |
 | `?` | help: what every entry does, in pages that fit a small terminal, with the links to this README and `HELPDESK.md` |
 | `Q` (or `0`) | quit |
 
@@ -142,6 +145,28 @@ for several nodes an estimate from the plan, marked `~`), the progress bar of se
 `LEFT` column (from 110 columns). A multi-node test also shows the **hottest node and its margin to the stop limit** (`🌡 hottest dell-9020 79° · margin 6° to 85 · peak 79°`), a CPU test
 the **peak temperature, average CPU load and average power** seen so far (`📊 peak 79° (6° below the stop) · avg CPU 100 % · avg power 20 W`). The same progress, time left and numbers
 appear in the **running tests block of the cluster dashboard** (wide window; a narrow one keeps one line in the header).
+
+## NODES screen (key `N`, `--nodes-view`)
+A node bar on top (`Tab` / arrows switch the node) and everything about the selected node below it: hardware, Kubernetes, pods, history sparklines and problems, in 1, 2 or 3
+columns by the width of the window. It uses the same read-only probe pods as the dashboard. `--list-nodes` stays a plain table for scripts. Also in the menu as `8 ▸ list nodes`.
+
+**Probe pods that outlive the program.** By default the probes of the dashboard and the NODES screen are removed when you leave. `S` ▸ probe pods (or `--keep-probes [HOURS]`,
+1-72 h) keeps them running: the next start finds them by label and shows data at once. A kept pod is replaced shortly before its deadline, the master's probe is never kept,
+limits are 256 Mi RAM and 1000 m CPU. `--cleanup-probes` (menu `8 ▸ 4`) lists and deletes them.
+
+## Cluster doctor and the regular check (`8 ▸ doctor`, `--doctor`)
+A thorough **read-only** check of the whole cluster (API, nodes, temperatures, throttling, clocks, restarts, network, DNS, versions) with a score per node and advice what to
+fix or improve. The report is saved in `logs/doctor/` (`.json` and `.md`) and compared with the previous one. With `--doctor-load` (asked for first, every time) a mini load test
+puts every **worker** at 50 % CPU and RAM for a minute - the master is never loaded - and the responsiveness of the nodes is compared with the last check and with older full-load logs.
+`S` ▸ scheduled check (or `--doctor-every DAYS --doctor-at HH:MM`) repeats the check on its own: a detached process waits for the date, runs it, shows a desktop notification and a
+window with the report, and the menu shows a banner next time. It lives as long as the computer runs (a date missed while it was off is skipped), is listed in `--scheduled` and
+stopped with `--stop ID`.
+
+## Test in the terminal, in the background, in a window
+An interactive test runs detached and the terminal only **watches** it: `q` sends it to the background (it keeps running, `--attach` or menu `A` joins it again), `Ctrl-C` asks
+whether to stop it and a second `Ctrl-C` within a second stops it at once. `--no-detach` is the classic foreground. In the live screens (test view, `D`, `N`, `W`) the key `w`
+opens the same screen in a NEW window - by default a tmux window (tab); `S` ▸ new windows can ask every time, split the pane or open a terminal window. Menus take a key without
+Enter; every question says how to answer (`press a key` or `type, then Enter ⏎`), y/n always needs Enter. `S` ▸ menu keys switches the single-key mode off.
 
 ## Scheduling tests for later (`9 SCHEDULE`, key `T`)
 Any test - CPU, GPU, disk, network, quick and the FULL self-test - can be planned:
@@ -245,7 +270,7 @@ adapts to the width **and the height** of the window.
 ### Main menu
 ```text
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━ github.com/doctorxcz/k3s-cluster-stress-test ━┓
-┃ ◖●▲●◗ K3S·STRESS                                               v1.17.0 ┃
+┃ ◖●▲●◗ K3S·STRESS                                               v1.20.0 ┃
 ┃ › cluster: 5 nodes (4 workers + 1 master), all Ready                   ┃
 ┃ 🔥 last measured max 71 °C (worker-1)                                  ┃
 ┃ 🔁 last: ./stress.sh --profile stepped · 2026-10-01 10:40              ┃
@@ -260,11 +285,11 @@ adapts to the width **and the height** of the window.
 ┃ CLUSTER                                                                ┃
 ┃ 6 ▸ 🧪 FULL      self-test of the whole cluster · one report           ┃
 ┃ 7 ▸ 📊 DATA      compare · baseline · export                           ┃
-┃ 8 ▸ 🔧 ADMIN     what runs · stop · nodes                              ┃
+┃ 8 ▸ 🔧 ADMIN     what runs · stop · nodes · doctor                     ┃
 ┃ 9 ▸ 🕒 SCHEDULE  planned tests · plan · cancel                         ┃
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 ┃ 🔁 R ▸ repeat   🧰 S ▸ settings   ⏰ T ▸ start time   📺 D ▸ dashboard ┃
-┃ 🔭 W ▸ watch   ❓ ? ▸ help   🚪 Q ▸ quit                               ┃
+┃ 📋 N ▸ nodes   🔭 W ▸ watch   🔗 A ▸ join   ❓ ? ▸ help   🚪 Q ▸ quit  ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 <details>
@@ -272,7 +297,7 @@ adapts to the width **and the height** of the window.
 
 ```text
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ github.com/doctorxcz/k3s-cluster-stress-test ━┓
-┃ ◖●▲●◗ K3S·STRESS                                                                                                        v1.17.0 ┃
+┃ ◖●▲●◗ K3S·STRESS                                                                                                        v1.20.0 ┃
 ┃ › cluster: 5 nodes (4 workers + 1 master), all Ready                                                                            ┃
 ┃ 🔥 last measured max 71 °C (worker-1)                                                                                           ┃
 ┃ 🔁 last: ./stress.sh --profile stepped · 2026-10-01 10:40                                                                       ┃
@@ -299,8 +324,8 @@ adapts to the width **and the height** of the window.
 ┃ · A test in a terminal is one live frame; FULL asks twice      │                                                                ┃
 ┃   before it starts.                                            │                                                                ┃
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-┃ 🔁 R ▸ repeat the last action   🧰 S ▸ settings   ⏰ T ▸ start time   📺 D ▸ dashboard   🔭 W ▸ watch tests                     ┃
-┃ ❓ ? ▸ help and docs   🚪 Q ▸ quit (0 works too)                                                                                ┃
+┃ 🔁 R ▸ repeat   🧰 S ▸ settings   ⏰ T ▸ start time   📺 D ▸ dashboard   📋 N ▸ nodes   🔭 W ▸ watch   🔗 A ▸ join              ┃
+┃ ❓ ? ▸ help   🚪 Q ▸ quit                                                                                                       ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
@@ -334,7 +359,7 @@ adapts to the width **and the height** of the window.
 
 ```text
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━ github.com/doctorxcz/k3s-cluster-stress-test ━┓
-┃ ◖●▲●◗ K3S·STRESS                                               v1.17.0 ┃
+┃ ◖●▲●◗ K3S·STRESS                                               v1.20.0 ┃
 ┃ › cluster: 5 nodes (4 workers + 1 master), all Ready                   ┃
 ┃ 🔥 last measured max 71 °C (worker-1)                                  ┃
 ┃ 🔁 last: ./stress.sh --profile stepped · 2026-10-01 10:40              ┃
@@ -349,7 +374,7 @@ adapts to the width **and the height** of the window.
 ┃ CLUSTER                                                                ┃
 ┃ 6 ▸ 🧪 FULL      self-test of the whole cluster · one report           ┃
 ┃ 7 ▸ 📊 DATA      compare · baseline · export                           ┃
-┃ 8 ▸ 🔧 ADMIN     what runs · stop · nodes                              ┃
+┃ 8 ▸ 🔧 ADMIN     what runs · stop · nodes · doctor                     ┃
 ┃ 9 ▸ 🕒 SCHEDULE  planned tests · plan · cancel                         ┃
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 ┃ TIPS                                                                   ┃
@@ -368,7 +393,7 @@ adapts to the width **and the height** of the window.
 ┃ 💻 gpu-worker-1  worker  Ready                                         ┃
 ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 ┃ 🔁 R ▸ repeat   🧰 S ▸ settings   ⏰ T ▸ start time   📺 D ▸ dashboard ┃
-┃ 🔭 W ▸ watch   ❓ ? ▸ help   🚪 Q ▸ quit                               ┃
+┃ 📋 N ▸ nodes   🔭 W ▸ watch   🔗 A ▸ join   ❓ ? ▸ help   🚪 Q ▸ quit  ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
@@ -1483,6 +1508,16 @@ python3 -m stress_test --help
 | `--scheduled` | list the planned tests (waiting processes and systemd timers) and exit; cancel with `--stop ID` |
 | `--dry-run` | only show what would be started (node, settings) and exit; nothing runs on the cluster |
 | `--list-nodes` | list the cluster's nodes (role, state) and exit |
+| `--nodes-view` | live node screen (menu 8 ▸ list nodes): node bar, Tab / arrows switch the node, adapts to the window; needs a terminal |
+| `--keep-probes [HOURS]` | with `--dashboard` / `--nodes-view`: the probe pods stay running for HOURS (1-72, default 24) after you close the screen and are reused next time (instant start); the master's probe is always removed. Menu: `S` ▸ probe pods |
+| `--cleanup-probes` | list and delete the probe pods that `--keep-probes` left (menu 8 ▸ 4) |
+| `--attach ID` | join a test that runs in the background (run id, node or PID): its live screen is shown again from the newest frame; `q` leaves it running, `Ctrl-C` asks whether to stop it |
+| `--no-detach` | the classic foreground: the test runs in this terminal process (by default an interactive test runs detached and is only watched, so that `q` can send it to the background) |
+| `--test-window` | show the live view of a test in a NEW terminal window (a tmux window, `STRESS_TERMINAL`, or a known terminal emulator); this terminal gets the prompt back at once (menu `S` ▸ 6 sets it for good); also for `--dashboard`, `--nodes-view` and `--status --live` (key `w` inside those screens moves them to a new window) |
+| `--doctor` | a thorough, read-only health check of the whole cluster (API, nodes, temperatures, throttling, clocks, network, DNS, versions) with a score and advice what to fix or improve; probe pods are removed at the end; the report is saved in `logs/doctor/` and compared with the previous one; the exit code is 1 on a FAIL (menu 8 ▸ 5) |
+| `--doctor-load` | with `--doctor`: also a mini load test (every worker at once at 50 % CPU and RAM for a minute, the master is never loaded); the responsiveness of the nodes before and during it is compared with the last check and with older full-load logs; asks for your OK first |
+| `--doctor-last` | show the newest saved cluster check (what the window of the regular check shows) |
+| `--doctor-every DAYS` `--doctor-at HH:MM` | run the cluster check regularly (7, 14, 30 ... days, default time 03:00): a detached process waits for the date, runs `--doctor`, shows a desktop notification and a terminal window with the report and plans the next date; a date missed while the computer was off is skipped; listed in `--scheduled`, stopped with `--stop ID`; menu `S` ▸ 5 sets it and `--doctor-load-ok` allows the mini load test in advance |
 | `--list-gpus` | scan every node for graphics cards (read-only pods) and show which have a usable dedicated NVIDIA GPU, then exit |
 | `--no-background` | run in the foreground (the opposite of `-b`) |
 | `--steps 25,50,75,100` | stages of the stepped test in % |
@@ -1876,6 +1911,11 @@ stress_test/
   dashboard.py  the cluster dashboard (menu key D): collector (read-only probes), three width tiers, keys, sort / filter / views, pods and logs
   graph.py      the fine graphs of the dashboard (key g): blocks / Braille, windows, cursor, text report and CSV / JSON
   watch.py      the live status of the running tests (menu key W, --status --live)
+  nodes_screen.py  the NODES screen (menu key N, --nodes-view)
+  doctor.py     the cluster doctor: findings, scores, reports, comparison, mini load test (--doctor)
+  health_plan.py the regular cluster check: its own scheduler (--doctor-every)
+  notify.py     desktop notifications and new windows (tmux window / split, terminal)
+  viewer.py     the terminal as a viewer of a detached test: q to background, --attach, w for a window
   catalog.py    the numbered lists of nodes, logs, running tests (menu 7 DATA, stop, settings, planner)
   schedule.py   planned tests: start times, waiting processes, systemd timers, list and cancel
   gpuscan.py    GPU scan of all nodes (--list-gpus, menu 2), node choice, the multi-node table (GpuBoard), image pre-pull
@@ -1892,6 +1932,8 @@ tests/
   test_net_udp_light.py, test_selftest.py, test_daily_logs.py, test_gpu.py, test_gpu_profile.py,
   test_gpuscan.py, test_gpu_board.py, test_schedule.py, test_dashboard.py, test_gpu_fan.py, test_width_modes.py, test_responsive.py,
   test_watch.py, test_images.py, test_multiarch.py, test_platforms.py (+ platform_matrix.py: the measurement of amd64 / arm64 platforms),
+  test_keep_probes.py, test_keep_pty.py, test_nodes_screen.py, test_doctor.py, test_health_plan.py, test_notify.py, test_viewer.py,
+  test_menu_keys.py, test_question_frames.py,
   test_image_publishing.py   unit tests
 deploy/
   nvidia-device-plugin-k3s.yaml, gpu-smoke-test.yaml   manifests for the GPU node setup (see HELPDESK.md)

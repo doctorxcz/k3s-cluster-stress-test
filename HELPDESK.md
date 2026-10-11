@@ -213,6 +213,22 @@ master/control-plane nodes are protected automatically.
 - **`ping` says "Operation not permitted" when I try the image with rootless podman**: `ping` needs the `NET_RAW` capability, which pods in k3s have by default; add
   `--cap-add=NET_RAW` for a local test.
 
+### NODES screen and probe pods (key `N`, `--nodes-view`, `--keep-probes`, `--cleanup-probes`)
+- `N` in the menu opens every node with all its information; `Tab` switches the node. It starts small read-only probe pods (256 Mi RAM, 1000m CPU) - **temporary** by default.
+  `S` ▸ probe pods keeps them for 1-72 hours so the next start is instant; `./stress.sh --cleanup-probes` deletes them. If a node shows no data, check that it can pull the probe image
+  (or use `--registry` / `--no-prebuilt`) and that no taint blocks the pod.
+
+### Cluster doctor and the regular check (`--doctor`, menu `8 ▸ doctor`)
+- Read-only; the report is in `logs/doctor/` (`.md` and `.json`), `./stress.sh --doctor-last` shows the newest one. The optional mini load test asks first and never loads the master.
+- The regular check (`S` ▸ scheduled check, or `--doctor-every DAYS --doctor-at HH:MM`) runs as a detached process: it ends when the computer restarts (the menu says so), a date missed
+  while the computer was off is skipped, and `./stress.sh --scheduled` / `--stop ID` list and cancel it. The desktop notification needs `notify-send` (Linux) or works on macOS by itself.
+- **Ping between nodes shows `-`?** An older version dropped the capability the ping needs; 1.20.0 gives the probe `NET_RAW` back. Old kept probe pods are replaced automatically.
+
+### Test in the terminal, in the background, in a window
+- `q` while a test runs sends it to the background (it keeps running); `./stress.sh --attach ID` or menu `A` joins it again; `Ctrl-C` asks, a second one within a second stops it at once.
+- `w` in a live screen opens it in a new **tmux window** (tab) - this needs you to be inside tmux (typical over SSH); without tmux or a display a notice says why. `S` ▸ new windows changes the kind.
+- Menus take a key without Enter; `S` ▸ menu keys turns that off (e.g. for a terminal that sends keys slowly). y/n questions always need Enter.
+
 ### Planned tests (`9 SCHEDULE`, `--schedule`)
 - **The plan is gone after a restart:** a plain plan is a waiting process and does not survive a restart of the computer. Plan with *"survive a restart"*
   (menu `T` asks when systemd is available) or `--schedule … --persistent`: it becomes a systemd **user** timer (`~/.config/systemd/user/stress-test-<id>.timer`).

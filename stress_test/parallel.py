@@ -551,7 +551,7 @@ class ParallelSeriesRunner(SeriesRunner):
             announced: set[str] = set()
             begun: set[str] = set()
             interval = float(os.environ.get("STRESS_TEST_TABLE_INTERVAL", "30"))
-            table = LiveTable(opts.out, sys.stdout.isatty(), interval)
+            table = LiveTable(opts.out, ui.live_tty(), interval)
             guard = ApiGuard(self.api_limit)
             api_every = float(os.environ.get("STRESS_TEST_API_INTERVAL", API_INTERVAL))
             next_api = time.monotonic() + api_every

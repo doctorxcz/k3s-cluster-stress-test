@@ -1,5 +1,6 @@
 """The whole flow against the fake kubectl (without a cluster)."""
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -626,7 +627,7 @@ def test_interrupt_during_test_prints_summary_without_cooldown(tmp_path):
                        env_extra={"FAKE_RUN": "60"})
         assert res.returncode == 0, res.stdout + res.stderr
         assert wait_for(lambda: any(
-            "CPU: 100%" in f.read_text(encoding="utf-8") for f in console_files(tmp_path)))
+            re.search(r"CPU:? 100%", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", f.read_text(encoding="utf-8"))) for f in console_files(tmp_path)))   # -b draws the live screen too
         run_tool(tmp_path, "--stop", "fake-node")
         assert wait_for(lambda: any(
             "TEST SUMMARY" in f.read_text(encoding="utf-8") for f in console_files(tmp_path)))

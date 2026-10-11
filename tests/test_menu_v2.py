@@ -120,11 +120,12 @@ def test_repeat_ignores_later_setting_changes_only_for_new_actions():
 
 # ---------------- S settings -------------------------------------------------------------------------------
 
-def test_settings_persist_and_apply(isolated_state):
+def test_settings_persist_and_apply(isolated_state, monkeypatch):
+    monkeypatch.setattr(menu, "_NODES_CACHE", [("worker-7", False, True)])           # the default node must be a node of the cluster
     code, ran = run(["S", "1", "worker-7", "2", "80", "0", "5", "", "", "0"])
     assert ran == [["--quick", "--node", "worker-7", "--max-temp", "80"]]
     saved = json.loads(isolated_state.read_text())
-    assert saved["settings"] == {"node": "worker-7", "max_temp": 80, "live": True}
+    assert saved["settings"] == {"node": "worker-7", "max_temp": 80, "live": True, "keep_hours": 0, "view": "terminal", "keys": True, "window": "auto"}
     # a new menu session reads them again
     code, ran = run(["1", "1", "", "", "0"])
     assert ran == [["--profile", "classic", "--node", "worker-7", "--max-temp", "80"]]
@@ -142,13 +143,14 @@ def test_apply_settings_only_for_profile_and_quick():
     assert menu.apply_settings(["--quick"], {"node": "", "max_temp": 0, "live": True}) == ["--quick"]
 
 
-def test_settings_repeat_does_not_add_twice():
+def test_settings_repeat_does_not_add_twice(monkeypatch):
+    monkeypatch.setattr(menu, "_NODES_CACHE", [("n1", False, True)])
     code, ran = run(["S", "1", "n1", "0", "5", "", "", "R", "", "0"])
     assert ran[0] == ran[1] == ["--quick", "--node", "n1"]
 
 
 def test_settings_invalid_values_and_keys(isolated_state, capsys):
-    code, ran = run(["S", "2", "500", "2", "abc", "9", "1", "  ", "0", "0"])
+    code, ran = run(["S", "2", "500", "2", "abc", "x", "1", "  ", "0", "0"])
     out = capsys.readouterr().out
     assert "Invalid choice." in out
     assert menu.settings_of(json.loads(isolated_state.read_text()))["max_temp"] == 0
@@ -160,8 +162,8 @@ def test_settings_live_toggle_and_reset(isolated_state, monkeypatch):
     run(["S", "3", "0", "0"])
     assert menu.settings_of(json.loads(isolated_state.read_text()))["live"] is False
     assert os.environ.get("STRESS_NO_LIVE") == "menu"
-    run(["S", "4", "0", "0"])
-    assert menu.settings_of(json.loads(isolated_state.read_text())) == {"node": "", "max_temp": 0, "live": True}
+    run(["S", "9", "0", "0"])
+    assert menu.settings_of(json.loads(isolated_state.read_text())) == {"node": "", "max_temp": 0, "live": True, "keep_hours": 0, "view": "terminal", "keys": True, "window": "auto"}
     assert "STRESS_NO_LIVE" not in os.environ
 
 
@@ -193,7 +195,7 @@ def test_injected_run_does_not_persist_last(isolated_state):
 
 
 def test_settings_of_defaults():
-    assert menu.settings_of({}) == {"node": "", "max_temp": 0, "live": True}
+    assert menu.settings_of({}) == {"node": "", "max_temp": 0, "live": True, "keep_hours": 0, "view": "terminal", "keys": True, "window": "auto"}
     assert menu.settings_of({"settings": {"node": "x"}})["node"] == "x"
 
 
@@ -205,7 +207,7 @@ def test_settings_of_defaults():
     ("4", ["2"], ["--net-matrix"]),
     ("5", [""], ["--quick"]),
     ("7", ["3", "a.log"], ["--export-log", "a.log"]),
-    ("8", ["3"], ["--list-nodes"]),
+    ("8", ["3"], ["--nodes-view"]),
     ("6", [], ["--self-test"]),
 ])
 def test_keys_1_to_8_build_the_same_options(key, answers, expected):

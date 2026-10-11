@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -26,24 +27,25 @@ MENU_ITEMS = [
     ("5", "QUICK", "one node, 10 min, few questions"),
     ("6", "FULL", "self-test of the whole cluster · one report"),
     ("7", "DATA", "compare · baseline · export"),
-    ("8", "ADMIN", "what runs · stop · nodes"),
+    ("8", "ADMIN", "what runs · stop · nodes · doctor"),
     ("9", "SCHEDULE", "planned tests · plan · cancel"),
 ]
 ICONS = {"1": "⚡", "3": "💾", "4": "📡", "5": "🚀", "7": "📊", "8": "🔧", "6": "🧪", "2": "🎮", "9": "🕒"}
 SECTIONS = (("TESTS", ("1", "2", "3", "4", "5")), ("CLUSTER", ("6", "7", "8", "9")))      # the order on the screen (keys of MENU_ITEMS)
 # the keys row: (key, name, icon) - the icon tells at a glance what a key does (all of them are emoji of a safe width)
 KEYS = [("R", "repeat", "🔁"), ("S", "settings", "🧰"), ("T", "start time", "⏰"), ("D", "dashboard", "📺"),
-        ("W", "watch", "🔭"), ("?", "help", "❓"), ("Q", "quit", "🚪")]                                                                   # 0 quits as well
+        ("N", "nodes", "📋"), ("W", "watch", "🔭"), ("A", "join", "🔗"), ("?", "help", "❓"), ("Q", "quit", "🚪")]                                                                   # 0 quits as well
 KEYS_COMPACT = KEYS
 KEYS_WIDE = [("R", "repeat the last action", "🔁"), ("S", "settings", "🧰"), ("T", "start time", "⏰"),
-             ("D", "dashboard", "📺"), ("W", "watch tests", "🔭"), ("?", "help and docs", "❓"), ("Q", "quit (0 works too)", "🚪")]
+             ("D", "dashboard", "📺"), ("N", "nodes: all info", "📋"), ("W", "watch tests", "🔭"), ("A", "join a running test", "🔗"), ("?", "help and docs", "❓"),
+             ("Q", "quit (0 works too)", "🚪")]
 WIDE_HINTS = {
     "1": "classic · stepped 25/50/75/100 % · spike: temperatures, clock, throttling",
     "3": "fio benchmark (MB/s, IOPS, latency) · SMART health of the disks",
     "4": "iperf3 + ping to a peer · matrix of every node pair · MTU, DNS, internet",
     "5": "one node, 10 min, 100 % CPU, few questions: a fast health check",
     "7": "compare two tests · set a baseline · export a log to JSON / CSV",
-    "8": "what is running · stop a test · list nodes (role, state)",
+    "8": "what is running · stop a test · browse the nodes (all information, Tab switches)",
     "2": "NVIDIA GPU burn (gpu-burn): GPU temperature, clocks, throttling · stop limit selectable",
     "9": "planned tests: list what waits for its start, plan a test for later (in 2 h / at 22:30 / on a date), cancel a plan",
     "6": "whole cluster: network → disks → CPU → RAM, cooling pauses, one report (~35 min)",
@@ -81,12 +83,27 @@ def cluster_line(kube=None) -> str:
     return f"cluster: {len(nodes)} nodes ({workers} workers + {masters} master), {state}"
 
 
+def _pick(ask: Callable) -> Callable:
+    """The reader for a question answered by one key: the real terminal question takes the key at once (no Enter), anything else
+    (tests, pipes) is the ordinary line question."""
+    return getattr(ask, "key", None) or ask
+
+
+def _yes_no(ask: Callable, text: str, default: bool, warning: bool = False) -> bool:
+    """A y/n question as a frame (red for a warning); the answer is typed and confirmed with Enter."""
+    ui.show_question(text, default, warning=warning)
+    yes = ask("y/n", "y" if default else "n").strip().lower() in ("y", "yes")
+    ui.answered(text, yes)
+    return yes
+
+
 def _choose(ask: Callable, title: str, entries: list, back_label: str = "Back") -> Optional[int]:
     """Prints a numbered list and returns the index of the choice, None for back/quit."""
     ui.show_choices(title.upper(), [(str(i), label, hint) for i, (label, hint) in enumerate(entries, 1)],
                     back=back_label)
+    pick = _pick(ask) if len(entries) <= 9 else ask             # ten or more entries need two digits: a line
     while True:
-        raw = ask("Choice", BACK).strip()
+        raw = pick("Choice", BACK).strip()
         if raw == BACK or raw == "":
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(entries):
@@ -106,23 +123,27 @@ def _extras(ask: Callable, allow_smart: bool = True) -> list:
 
 
 def _ask_number(ask: Callable, question: str, default: int, low: int, high: int) -> int:
+    ui.show_input(question, str(default), f"a whole number {low}-{high}")
     while True:
-        raw = ask(f"{question} ({low}-{high})", str(default)).strip()
+        raw = ask(ui.split_question(question)[0], str(default)).strip()
         if raw.isdigit() and low <= int(raw) <= high:
+            ui.answered_value(question, raw)
             return int(raw)
         ui.warn(f"Enter a whole number {low}-{high}.")
 
 
 def _ask_seconds(ask: Callable, question: str, default: str, low: int, high: int) -> int:
     from .parsing import parse_duration
+    ui.show_input(question, default, f"{low}-{high} s; seconds or with a unit: 90, 2m, 1h")
     while True:
-        raw = ask(question, default).strip()
+        raw = ask(ui.split_question(question)[0], default).strip()
         try:
             seconds = parse_duration(raw)
         except ValueError as exc:
             ui.warn(str(exc))
             continue
         if low <= seconds <= high:
+            ui.answered_value(question, raw)
             return seconds
         ui.warn(f"The time must be {low}-{high} s.")
 
@@ -167,8 +188,7 @@ def gpu_dialog(ask: Callable, scanner: Optional[Callable] = None) -> Optional[li
     raw = ask("Cooldown: measure the cooling after the load, in seconds (0 = none, max 600)", "60").strip()
     cooldown = int(raw) if raw.isdigit() and int(raw) <= 600 else 60
     image = ask(f"Image of the load pod (Enter = {GPU_IMAGE_DEFAULT}; one with gpu_burn skips the build)", "").strip()
-    prepull = ask("Pre-pull the CUDA image on the chosen nodes first? (y/n; seconds when it is already cached)", "y").strip().lower() \
-        not in ("n", "no")
+    prepull = _yes_no(ask, "Pre-pull the CUDA image on the chosen nodes first? (seconds when it is already cached)", True)
     extras = _extras(ask)
     options = [*gpuscan.options_for(nodes), "--profile", "gpu", "--time", str(seconds), "--gpu-max-temp", str(max_temp), "--gpu-mem-pct", str(mem),
                "--cooldown", str(cooldown)]
@@ -210,8 +230,7 @@ def start_time_dialog(ask: Callable, now: Optional[float] = None) -> Optional[di
             ui.warn(str(exc))
     persistent = False
     if schedule.systemd_available():
-        persistent = ask("Should the plan survive a restart of this computer? (y/n - kept as a systemd timer; n = a waiting "
-                         "process)", "n").strip().lower() in ("y", "yes")
+        persistent = _yes_no(ask, "Should the plan survive a restart of this computer? (kept as a systemd timer; no = a waiting process)", False)
     ui.emit(f"🕒 The next test starts {schedule.describe_when(epoch, now)}" + (" (systemd timer)" if persistent else "") + ".")
     return {"epoch": epoch, "persistent": persistent}
 
@@ -333,7 +352,9 @@ def build_action(choice: str, ask: Callable) -> Optional[list]:
         i = _choose(ask, "Management", [
             ("what is running", "tests in the background and the tool's pods"),
             ("stop a test", "by run id, node or PID"),
-            ("list nodes", "role and state")])
+            ("list nodes", "every node: hardware, Kubernetes, pods (Tab switches)"),
+            ("probe pods", "show and delete the probe pods kept by SETTINGS ▸ probe pods"),
+            ("doctor", "thorough read-only health check of the cluster, with advice what to fix or improve")])
         if i is None:
             return None
         if i == 0:
@@ -344,7 +365,14 @@ def build_action(choice: str, ask: Callable) -> Optional[list]:
             print("\n" + "\n".join(catalog.running_lines(recs, ui.color_enabled(), ui.panel_width())))
             target = catalog.pick(ask("Number from the list, run id, node or PID", ""), [r["run_id"] for r in recs])
             return ["--stop", target] if target else None
-        return ["--list-nodes"]
+        if i == 3:
+            return ["--cleanup-probes"]
+        if i == 4:
+            if _yes_no(ask, "Also run the mini load test? (every worker at 50 % CPU and RAM for a minute, the master is not loaded; the "
+                            "responsiveness of the nodes is measured before and during it)", False, warning=True):
+                return ["--doctor", "--doctor-load", "--doctor-load-ok"]          # this question is the explicit OK
+            return ["--doctor"]
+        return ["--nodes-view"]
     return None
 
 
@@ -377,16 +405,52 @@ def save_state(state: dict) -> None:
         pass                                              # the menu works without it
 
 
+def join_choice(ask: Callable) -> Optional[str]:
+    """Key A: the run id of the test to join - the only one that runs, or one picked from a list; None when nothing can be joined."""
+    from . import background
+    try:
+        recs = [r for r in background.list_running() if r.get("console") and not (r.get("scheduled_at") or 0) > time.time()]
+    except Exception:                                    # noqa: BLE001
+        recs = []
+    if not recs:
+        ui.warn("No test is running that can be joined (./stress.sh --status lists them).")
+        return None
+    if len(recs) == 1:
+        return recs[0]["run_id"]
+    entries = [(r.get("title") or r.get("node", "?"), f"run id {r['run_id']}") for r in recs]
+    i = _choose(ask, "Join which test", entries, back_label="Back")
+    return None if i is None else recs[i]["run_id"]
+
+
 def settings_of(state: dict) -> dict:
-    return {"node": "", "max_temp": 0, "live": True, **(state.get("settings") or {})}
+    return {"node": "", "max_temp": 0, "live": True, "keep_hours": 0, "view": "terminal", "keys": True,
+            "window": "auto", **(state.get("settings") or {})}
+
+
+def _valid_node(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", str(name)))
+
+
+SCREEN_FLAGS = ("--dashboard", "--nodes-view")
+TEST_FLAGS = ("--profile", "--quick", "--workers", "--cluster")           # the options that start a test (and so can be shown in a window)
 
 
 def apply_settings(options: list, settings: dict) -> list:
     """Adds the saved default node / temperature limit to a single-node test that has none of its own."""
     options = list(options)
+    if any(flag in options for flag in TEST_FLAGS) and "--test-window" not in options and "--no-detach" not in options:
+        if settings.get("view") == "window":
+            options += ["--test-window"]
+        elif settings.get("view") == "classic":
+            options += ["--no-detach"]
+    elif settings.get("view") == "window" and "--test-window" not in options and (
+            any(flag in options for flag in SCREEN_FLAGS) or ("--status" in options and "--live" in options)):
+        options += ["--test-window"]                                          # the live screens (D, W, NODES) in a new window too
+    if settings.get("keep_hours") and ("--dashboard" in options or "--nodes-view" in options) and "--keep-probes" not in options:
+        options += ["--keep-probes", str(settings["keep_hours"])]
     if "--profile" in options or "--quick" in options:
-        if settings.get("node") and "--node" not in options and "--nodes" not in options:
-            options += ["--node", settings["node"]]
+        if settings.get("node") and _valid_node(settings["node"]) and "--node" not in options and "--nodes" not in options:
+            options += ["--node", settings["node"]]                  # a saved name that is not a node name would break every test
         if settings.get("max_temp") and "--max-temp" not in options:
             options += ["--max-temp", str(settings["max_temp"])]
     return options
@@ -425,7 +489,7 @@ def status_rows(state: dict, kube=None, on: bool = False) -> list:
         from .kube import Kubectl
         busy = [p for p in (kube or Kubectl()).list_tool_pods() if p.phase not in ("Succeeded", "Failed")]
         if busy:
-            rows.append(ui.paint(f"🟡 a test is running now ({len(busy)} pods of the tool) - 8 ▸ ADMIN shows it", ui.YELLOW, on))
+            rows.append(ui.paint(f"🟡 a test is running now ({len(busy)} pods of the tool) - A joins it, 8 ▸ ADMIN shows it", ui.YELLOW, on))
     except Exception:                                    # noqa: BLE001
         pass
     try:
@@ -433,6 +497,16 @@ def status_rows(state: dict, kube=None, on: bool = False) -> list:
         if temp:
             rows.append(f"🔥 {ui.paint('last measured', ui.GREY, on)} max {ui.paint(f'{temp[1]} °C', ui.temp_code(temp[1]), on)}"
                         f" {ui.paint('(' + temp[0] + ')', ui.GREY, on)}")
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        from . import doctor, health_plan
+        line = doctor.banner()
+        if line:
+            rows.append(ui.paint(line, ui.YELLOW if "NEW" in line else ui.GREY, on))
+        hint = health_plan.overdue_hint((state.get("settings") or {}).get("doctor") or {})
+        if hint:
+            rows.append(ui.paint(f"🩺 {hint} - S ▸ 5 starts it again", ui.YELLOW, on))
     except Exception:                                    # noqa: BLE001
         pass
     last = state.get("last")
@@ -447,12 +521,17 @@ def status_rows(state: dict, kube=None, on: bool = False) -> list:
 # an entry is a text, or (label, text): the text is wrapped under the label
 HELP_PAGES = [
     ("KEYS", [
+        ("A", "join a test that runs in the background (the only one, or pick from a list): its live screen again; q leaves it running, w opens "
+              "a new window, Ctrl-C asks whether to stop it."),
+        "Every prompt says how to answer: 'press a key' = the key counts at once, no Enter; 'type, then Enter ⏎' = type the answer and confirm it "
+        "with Enter. Menus take a key at once (S ▸ 7 switches that off), y/n questions and typed values always need Enter.",
         "1-9: open the entry. It only builds the usual command line (printed as ▶ ./stress.sh ...) and runs the "
         "normal program, which asks the rest.",
         ("R", "repeat the last action exactly as it ran."),
         ("S", "settings: default node, temperature limit, live frames."),
         ("T", "start time of the NEXT test (in 2 h, at 22:30, on a date); the test you choose afterwards is planned."),
         ("D", "the live cluster dashboard (every node at a glance, three widths)."),
+        ("N", "the NODES screen: every node with all its info (hardware, Kubernetes, pods; Tab switches)."),
         ("W", "watch the running tests: a live screen (every second) with the details of each kind - GPU, CPU, disk, network, FULL; x stops one."),
         ("?", "this help.     Q = quit (0 works too).     Ctrl+C stops a running test safely (its pods are deleted)."),
         "Everything the menu does can also be typed as options: ./stress.sh --help",
@@ -500,7 +579,7 @@ HELP_PAGES = [
         "of the selected node, wider the whole screen with history graphs and panels; resizing the window redraws it.",
         ("keys", "↑↓ select · Tab detail (overview / pods / events) · Enter detail page · +/- refresh interval · p pause · r refresh · q back."),
         ("read-only", "one tiny unprivileged probe pod per node (and one for nvidia-smi on a GPU node) exists only while the dashboard "
-                      "is open and is removed when you leave; nothing is loaded."),
+                      "is open and is removed when you leave (S ▸ probe pods can keep them 1-72 h so the next start is instant; the master's probe never stays); nothing is loaded."),
     ]),
     ("🕒 9 SCHEDULE", [
         "Planned tests. Press T first (or use 9 ▸ 1) to set WHEN the next test starts: in a given time (30m, 2h), at a clock time "
@@ -520,6 +599,9 @@ HELP_PAGES = [
         ("running", "background tests and the tool's pods in the cluster."),
         ("stop", "a test by run id, node or PID (its pods are deleted)."),
         ("nodes", "role and state of every node."),
+        ("probe pods", "the dashboard / NODES probes kept after closing (S ▸ probe pods sets the hours); 8 ▸ 4 lists and deletes them."),
+        ("doctor", "8 ▸ 5: a thorough read-only check of the whole cluster (API, nodes, temperatures, clocks, network, DNS, versions) with a score "
+                   "and advice; optionally a 50 % mini load test with the responsiveness of the nodes. The report is saved in logs/doctor/."),
     ]),
     ("MORE", [
         "Full README (every option) and HELPDESK (troubleshooting, firewall):",
@@ -586,13 +668,56 @@ def show_help(ask: Callable, size: Optional[tuple] = None) -> None:
         print()
         print("\n".join(ui.box(f"HELP {number}/{len(pages)}", [body], on, width)))
         if number < len(pages):
-            if ask("Enter = next page, 0 = back", "").strip() == BACK:
+            if _pick(ask)("Enter = next page, 0 = back", "").strip() == BACK:
                 return
         else:
-            ask("Enter = back to the menu", "")
+            _pick(ask)("Enter = back to the menu", "")
 
 
 # --- settings ---------------------------------------------------------------------------------
+
+VIEW_TEXT = {"terminal": "this terminal (q sends the test to the background)", "window": "a new terminal window",
+             "classic": "classic (the test cannot be handed over)"}
+
+
+def _doctor_plan_text(cfg: dict) -> str:
+    plan = cfg.get("doctor") or {}
+    if not plan.get("enabled"):
+        return "off (S ▸ 5 sets a regular cluster check)"
+    return f"every {plan.get('every_days', 14)} days at {plan.get('at', '03:00')}" + (", with the mini load test" if plan.get("load_ok") else "")
+
+
+def _stop_doctor_plan() -> None:
+    try:
+        from . import health_plan
+        health_plan.stop_running()
+    except Exception:                                    # noqa: BLE001 - the settings must work without it
+        pass
+
+
+def _doctor_plan_dialog(ask: Callable, current: dict) -> dict:
+    """S ▸ 5: the regular cluster check - on/off, every how many days, at what time, the mini load test allowed in advance."""
+    from . import health_plan
+    if not _yes_no(ask, "Run the cluster check regularly? (a background process waits for the date, runs the check, shows a notification "
+                        "and a window with the report; it ends when the computer restarts)", bool(current.get("enabled"))):
+        _stop_doctor_plan()
+        return {"enabled": False}
+    days = _ask_number(ask, "Check every how many days (7, 14 or 30 are usual)", int(current.get("every_days") or health_plan.DEFAULT_DAYS),
+                       1, health_plan.MAX_DAYS)
+    ui.show_input("Time of day of the check", current.get("at") or health_plan.DEFAULT_AT, "HH:MM, e.g. 03:00 (a night hour is best)")
+    while True:
+        raw = ask("Time of day", current.get("at") or health_plan.DEFAULT_AT).strip()
+        try:
+            at = health_plan.normalize_at(raw)
+            break
+        except ValueError as exc:
+            ui.warn(str(exc))
+    load_ok = _yes_no(ask, "Include the mini load test in every check? (every worker at 50 % CPU and RAM for a minute, the master is not loaded; "
+                           "saying yes here is your OK for all the checks of this plan)", bool(current.get("load_ok")), warning=True)
+    plan = {"enabled": True, "every_days": days, "at": at, "load_ok": load_ok}
+    health_plan.start(days, at, load_ok)
+    return plan
+
 
 def settings_screen(ask: Callable, state: dict) -> None:
     """S: default node, temperature limit, live frames on/off (kept between runs)."""
@@ -602,9 +727,15 @@ def settings_screen(ask: Callable, state: dict) -> None:
         entries = [("1", f"default node", cfg["node"] or "ask every time"),
                    ("2", "temperature limit", f"{cfg['max_temp']} °C" if cfg["max_temp"] else "default (85 °C)"),
                    ("3", "live frames", "on" if cfg["live"] else "off (plain text output)"),
-                   ("4", "reset", "back to the defaults")]
+                   ("4", "probe pods", f"kept {cfg['keep_hours']} h after the dashboard / NODES screen closes" if cfg["keep_hours"] else "temporary (removed when you leave)"),
+                   ("5", "scheduled check", _doctor_plan_text(cfg)),
+                   ("6", "running test view", VIEW_TEXT.get(cfg.get("view"), VIEW_TEXT["terminal"])),
+                   ("7", "menu keys", "a key is taken at once in the menus (y/n and typed answers still need Enter)" if cfg.get("keys", True)
+                    else "Enter after every answer, also in the menus"),
+                   ("8", "new windows", WINDOW_TEXT.get(cfg.get("window"), WINDOW_TEXT["auto"])),
+                   ("9", "reset", "back to the defaults")]
         ui.show_choices("SETTINGS", entries, back="Back")
-        raw = ask("Choice", BACK).strip()
+        raw = _pick(ask)("Choice", BACK).strip()
         if raw in (BACK, ""):
             return
         if raw == "1":
@@ -613,20 +744,73 @@ def settings_screen(ask: Callable, state: dict) -> None:
             shown = catalog.nodes_lines(list(_NODES_CACHE), None, on, ui.panel_width())
             if shown:
                 print("\n" + "\n".join(shown))
-            cfg["node"] = catalog.pick(ask("Default node: number from the list or a name (Enter = ask every time)", cfg["node"]), names)
+            wanted = catalog.pick(ask("Default node: number from the list or a name (Enter = ask every time)", cfg["node"]), names)
+            if wanted and (wanted not in names if names else not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", wanted)):
+                ui.warn(f"'{wanted}' is not a node of this cluster" + (f" (known: {', '.join(names)})." if names else " name."))
+            else:
+                cfg["node"] = wanted
         elif raw == "2":
             value = ask("Temperature limit in °C (40-95, 0 = default)", str(cfg["max_temp"])).strip()
             cfg["max_temp"] = int(value) if value.isdigit() and (value == "0" or 40 <= int(value) <= 95) else cfg["max_temp"]
         elif raw == "3":
             cfg["live"] = not cfg["live"]
         elif raw == "4":
-            cfg = {"node": "", "max_temp": 0, "live": True}
+            value = ask("Keep the probe pods of the dashboard / NODES screen for how many hours (1-72, 0 = temporary)", str(cfg["keep_hours"] or 0)).strip()
+            cfg["keep_hours"] = int(value) if value.isdigit() and 0 <= int(value) <= 72 else cfg["keep_hours"]
+        elif raw == "5":
+            cfg["doctor"] = _doctor_plan_dialog(ask, cfg.get("doctor") or {})
+        elif raw == "6":
+            i = _choose(ask, "Where a running test is shown", [
+                ("this terminal", "q sends the test to the background, Ctrl-C asks (default)"),
+                ("a new window", "a new terminal window shows it; this terminal is free at once (tmux: a new window)"),
+                ("classic", "the test runs in this terminal process; q cannot hand it over")], back_label="Keep")
+            if i is not None:
+                cfg["view"] = ("terminal", "window", "classic")[i]
+        elif raw == "7":
+            cfg["keys"] = not cfg.get("keys", True)
+        elif raw == "8":
+            i = _choose(ask, "How a new window is made (key w, --test-window)", [
+                ("automatic", "a tmux window when you are in tmux, else a window of your terminal (default, no question)"),
+                ("ask", "when there is more than one way (tmux window / tmux split / terminal window) the screen asks"),
+                ("tmux window", "a new window (tab) in tmux"),
+                ("tmux split", "a split of the current tmux window, side by side"),
+                ("terminal window", "a window of a terminal emulator (a display and an emulator, or STRESS_TERMINAL)")], back_label="Keep")
+            if i is not None:
+                cfg["window"] = ("auto", "ask", "tmux-window", "tmux-split", "terminal")[i]
+        elif raw == "9":
+            _stop_doctor_plan()
+            cfg = {"node": "", "max_temp": 0, "live": True, "keep_hours": 0, "view": "terminal", "keys": True, "window": "auto"}
         else:
             ui.warn("Invalid choice.")
             continue
         state["settings"] = cfg
         save_state(state)
         _apply_live(cfg)
+        _apply_keys(cfg)
+        _apply_window(cfg)
+
+
+WINDOW_TEXT = {"auto": "automatic: a tmux window inside tmux, else a terminal window", "ask": "ask when there is more than one way",
+               "tmux-window": "always a tmux window", "tmux-split": "always a tmux split", "terminal": "always a terminal window"}
+
+
+def _apply_window(cfg: dict) -> None:
+    """SETTINGS ▸ 8: STRESS_WINDOW_KIND tells notify.plan_window which kind of window to use without asking."""
+    kind = cfg.get("window", "auto")
+    if kind in ("ask", "tmux-window", "tmux-split", "terminal"):
+        os.environ["STRESS_WINDOW_KIND"], os.environ["STRESS_WINDOW_KIND_FROM"] = kind, "menu"
+    elif os.environ.get("STRESS_WINDOW_KIND_FROM") == "menu":
+        os.environ.pop("STRESS_WINDOW_KIND", None)
+        os.environ.pop("STRESS_WINDOW_KIND_FROM", None)
+
+
+def _apply_keys(cfg: dict) -> None:
+    """SETTINGS ▸ 7: with the bare-key menus off every answer is confirmed with Enter (the key reader falls back to the line question)."""
+    if cfg.get("keys", True):
+        if os.environ.get("STRESS_NO_KEYS") == "menu":
+            os.environ.pop("STRESS_NO_KEYS", None)
+    elif not os.environ.get("STRESS_NO_KEYS"):
+        os.environ["STRESS_NO_KEYS"] = "menu"
 
 
 def _apply_live(cfg: dict) -> None:
@@ -685,7 +869,7 @@ def _tall_extra(on: bool, temps: Optional[dict], room: int, rows: int) -> list:
     out = [ui.paint("TIPS", ui.GREY, on)]
     for tip in ("R repeats the last action exactly as it ran.", "S saves a default node and a temperature limit.",
                 "T / 9 plan a test for later (a detached process or a systemd timer).",
-                "D live cluster dashboard · W live status of the running tests.",
+                "D live cluster dashboard · N all info about the nodes · W live status of the running tests.",
                 "? opens the help: every entry explained, links to README and HELPDESK."):
         out += [ui.paint(("· " if i == 0 else "  ") + part, ui.GREY, on) for i, part in enumerate(textwrap.wrap(tip, max(16, room - 2)))]
     if _NODES_CACHE:
@@ -733,6 +917,8 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
     cluster = cluster or cluster_line
     state = load_state()
     _apply_live(settings_of(state))
+    _apply_keys(settings_of(state))
+    _apply_window(settings_of(state))
     pending: dict = {}                                    # {"epoch", "persistent"}: the start time of the NEXT test (key T)
     while True:
         on = ui.color_enabled()
@@ -752,7 +938,7 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
                 temps = None
         print("\n".join(menu_lines(cluster(), extra, on, cols=cols, temps=temps)))
         try:
-            choice = ask("Choice", "q").strip()
+            choice = _pick(ask)("Choice", "q").strip()
             if choice in (BACK, "q", "Q"):
                 return 0
             if choice in ("?", "h", "H"):
@@ -769,6 +955,16 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
             if choice == "9":
                 planner(ask, run, pending)
                 continue
+            if choice in ("a", "A"):
+                target = join_choice(ask)
+                if target:
+                    options = ["--attach", target]
+                    ui.emit(f"\n▶ {command_text(options)}\n")
+                    try:
+                        run(options)
+                    except (SystemExit, KeyboardInterrupt):
+                        pass
+                continue
             if choice in ("w", "W"):
                 options = ["--status", "--live"]
                 ui.emit(f"\n▶ {command_text(options)}\n")
@@ -777,8 +973,16 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
                 except (SystemExit, KeyboardInterrupt):
                     pass
                 continue
+            if choice in ("n", "N"):
+                options = apply_settings(["--nodes-view"], settings_of(state))
+                ui.emit(f"\n▶ {command_text(options)}\n")
+                try:
+                    run(options)
+                except (SystemExit, KeyboardInterrupt):
+                    pass
+                continue
             if choice in ("d", "D"):
-                options = ["--dashboard"]
+                options = apply_settings(["--dashboard"], settings_of(state))
                 ui.emit(f"\n▶ {command_text(options)}\n")
                 try:
                     run(options)
@@ -820,7 +1024,7 @@ def run_menu(ask: Optional[Callable] = None, run: Optional[Callable] = None,
             code = 130
         print(f"\n(exit code {code})" if code else "")
         try:
-            ask("Enter = back to the menu", "")
+            _pick(ask)("Enter = back to the menu", "")
         except (KeyboardInterrupt, EOFError):
             print()
             return 0

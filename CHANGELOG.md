@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.20.0 - 2026-10-11
+**A new NODES screen, probe pods that can stay up between runs, and a faster start of the live screens.**
+
+### Added
+- **NODES screen** (`--nodes-view`, menu 8 ▸ list nodes): a node bar on top, Tab / arrows switch the node, the rest of the window shows everything about the selected node
+  (hardware, Kubernetes, pods, history sparklines, problems) in 1, 2 or 3 columns by the width of the window. `--list-nodes` stays a plain table for scripts.
+- **Probe pods that outlive the program** (`--keep-probes [HOURS]` with `--dashboard` / `--nodes-view`, 1-72 h, default 24; menu `S` ▸ probe pods). The next start finds them by label and
+  reuses them (Running, made by the same version, at least 10 minutes of life left; a GPU node needs both pods) - otherwise they are replaced. The master's probe is never kept.
+  A kept pod is replaced shortly before its own deadline. The screens show `probe  kept · made 2 h ago · 22 h left · reused` (or `temporary`).
+  `--cleanup-probes` (menu 8 ▸ 4) lists and deletes them. The default stays "temporary" (removed when you leave).
+
+- **A test in the terminal can be sent to the background with `q`.** An interactive test no longer runs inside the terminal process: it runs detached (the
+  mechanism of `-b`) and the terminal only watches it, so the live screen looks as before and a hint row says what the keys do. `q` stops watching - the test goes on
+  exactly as if it had been started with `-b` (listed in `--status`, stopped with `--stop ID`, survives closing the terminal). `Ctrl-C` asks (on the alternate
+  screen, the test is not disturbed): `s` stops the test, `q` / Enter keeps it running, Esc goes on watching; a second `Ctrl-C` within a second stops it at once.
+  `--attach ID` joins a running test again from its newest frame. Single-node tests, series (`--workers`, `--cluster`, `--parallel`) and the FULL self-test.
+  The detached process takes the size of the watching terminal (and follows a resized window). `--no-detach` keeps the classic foreground; `STRESS_NO_ATTACH=1` too.
+  Old console files are removed after 7 days (`.logs/attach/`).
+- **Default of `w`: no question.** `S` ▸ 8 "new windows" is "automatic" by default: a tmux window (tab) inside tmux, else a window of your terminal; "ask" turns the
+  question back on, or fix a kind (tmux window / tmux split / terminal window).
+- **Which window `w` makes:** inside tmux a **tmux window** or a **tmux split** (side by side), with a display a **terminal window**. With one possible way it is used at once; with
+  more the screen asks on one line (`Open in: 1 tmux window · 2 tmux split · 3 terminal window · Esc cancels`, a key is enough). `S` ▸ 8 "new windows" fixes one for good
+  (or `STRESS_WINDOW_KIND=tmux-window|tmux-split|terminal`); `STRESS_TERMINAL` names the emulator.
+- New windows get the environment they need (`PYTHONPATH`, `KUBECONFIG`, the `STRESS_*` settings) and start in the project folder; a window whose program ends with an
+  error stays open with the message (it used to flash and close).
+- **Key `w` in the dashboard (`D`), the NODES screen and the live status (`W`)** moves that screen to a NEW terminal window and closes it here (this terminal is free);
+  `S` ▸ 6 "a new window" (or `--test-window`) opens these screens straight in a new window. Without a possible window a notice says why and the screen stays.
+- **Tests started with `-b` (and the FULL self-test in the background) draw their live screen into the console too**, so `A` / `--attach` shows the framed live screen
+  instead of a plain log (the raw `tail -f` of the console is still there; it now contains the screen redraws).
+- **Menu key `A` joins a running test** (the only one that runs, or a pick from a list): its live screen again; `q` leaves it running, `w` opens a window. The menu header
+  says so when a test is running.
+- **Key `w` while watching a test (or after `--attach`)** opens the live view in a new terminal window (tmux window / emulator) and hands this terminal back - no
+  setting needed; without a possible window a notice says so and the watch goes on.
+- **Optional window for a running test:** `S` ▸ 6 "running test view" (this terminal / a new window / classic), or `--test-window` once: a tmux window or a terminal
+  emulator opens with the live view and the terminal you typed in is free at once. `STRESS_TERMINAL="kitty"` (or `"alacritty -e"`) chooses the emulator.
+- **Every prompt says how to answer.** The last part of the prompt line is a badge: `press a key` (the key counts at once, no Enter) or `type, then Enter ⏎`;
+  the question frames (y/n, numbers, times, warnings) end with `✎ type …, then press Enter ⏎`; the help (`?`, KEYS) explains it. An empty default no longer shows
+  `[]`. `S` ▸ 7 "menu keys" switches the bare-key menus off (Enter after every answer everywhere); y/n and typed answers always need Enter.
+- **Cluster doctor** (`--doctor`, menu 8 ▸ 5): a thorough, read-only health check - API speed, node conditions, pods and events, temperatures and
+  throttling, governor / turbo, RAM and swap, pressure stalls, network cards (duplex, errors, speed, MTU), ping between nodes, DNS in the cluster, clock
+  differences, version differences, requests against capacity - with a score per node and for the cluster, a verdict, and for every problem advice what to do
+  or improve. The report is saved in `logs/doctor/` (Markdown and JSON), compared with the previous one ("since the last check") and the exit code is 1 on a FAIL.
+  `--doctor-load` adds a mini load test (every worker at once at 50 % CPU and RAM for a minute, the master is never loaded) after an explicit OK: the
+  responsiveness of the nodes and of the API is measured before and during it and compared with the last check and with the logs of older full-load tests.
+- **Regular cluster check** (`--doctor-every DAYS`, `--doctor-at HH:MM`, menu `S` ▸ 5): the program's own scheduler (a detached process) runs the check on the date,
+  shows a desktop notification (`notify-send` / `osascript`) and opens a terminal window (tmux window or a known terminal emulator) with the report; the menu shows a
+  line about the last check ("NEW" until you have looked at it). A date missed while the computer was off is skipped; the plan ends with a restart of the computer
+  (the menu says so). `--doctor-load-ok` is the advance OK for the mini load test of the plan.
+- New `notify.py` (notification and terminal window, best effort).
+- **Menu key `N`** opens the NODES screen (all information about every node); `8 ▸ list nodes` stays.
+
+### Fixed
+- The doctor's reports (`logs/doctor/`) are written readable by the owner only, like the other logs.
+- The ping between nodes in the dashboard / NODES screen was lost since the pod hardening of 2026-10-08 (`drop ALL` took away the capability busybox ping needs);
+  `NET_RAW` is kept again. Found by the cluster doctor on the live cluster.
+
+### Changed
+- Probe pods of the dashboard / NODES screen: memory limit **256 MiB**, CPU limit **1000m** (requests stay 64 MiB / 100m), `restartPolicy: OnFailure`, taint tolerations only for `NoSchedule`
+  and `NoExecute` (300 s), default seccomp, no capabilities, read-only root file system. The probe pods are replaced in the background before their deadline or after three failed rounds.
+- The screens open at once: the look-up of nodes and kept pods runs in the background, the API part of a round runs side by side with the probes, the nodes are read in parallel.
+
 ## 1.19.0 - 2026-10-06
 **Runs on Raspberry Pi and other ARM boards (arm64), and shows how long a test still takes.**
 

@@ -28,7 +28,7 @@ from . import background, gpu as gpumod, schedule, ui
 from . import graph
 from .graph import GraphState
 from .kube import Kubectl, KubectlError
-from .manifests import PROBE_SCRIPT, dashboard_gpu_pod, dashboard_pod
+from .manifests import DASHBOARD_LABEL, KEEP_LABEL, PROBE_SCRIPT, SPEC_ANNOTATION, dashboard_gpu_pod, dashboard_pod, expected_spec_hash
 from .models import PodNames, ProbeData
 from .parsing import clean_text, cpu_percent, format_duration, node_from_json, parse_probe_output, power_watts
 
@@ -39,6 +39,11 @@ INTERVALS = (0.5, 1, 2, 5, 10, 30)
 HISTORY = 3600                                   # samples kept per node for the graphs (g): an hour at 1 s
 K8S_EVERY, EVENTS_EVERY = 10.0, 30.0            # s: nodes + pods, events
 POD_DEADLINE = 3600                              # the probe pods end by themselves after an hour even if the tool is killed
+RENEW_MARGIN = 420
+RENEW_AFTER = POD_DEADLINE - RENEW_MARGIN                 # s: a pod this old is replaced by a new one (made first, then the old one is removed) before its deadline
+MIN_KEEP_LEFT = 600                              # s: a kept pod with less life left than this is not reused
+MAX_KEEP_HOURS = 72
+FAILS_TO_RENEW, RENEW_RETRY = 3, 60              # a probe that fails this many rounds in a row is replaced; a failed replacement is tried again after this many s
 
 # What the probe adds to PROBE_SCRIPT: uptime, load, swap, CPU model / cores, thermal throttle counters, NICs, disks, peers.
 EXTRA_SCRIPT = r"""
@@ -108,6 +113,10 @@ class NodeView:
     gpu_alloc: int = 0
     # probe
     probe_ok: bool = False
+    probe_kept: bool = False                            # the probe pod outlives the program (--keep-probes)
+    probe_reused: bool = False                          # found from an earlier run, not made now
+    probe_born: float = 0.0                             # wall clock time the probe pod was created
+    probe_life: int = 0                                 # its deadline in s
     cpu_pct: Optional[float] = None
     temps: dict = field(default_factory=dict)
     freq_mhz: Optional[int] = None
@@ -323,12 +332,26 @@ def _quantity_mem_mib(text) -> int:
         return 0
 
 
+def _pod_age(created: str) -> Optional[float]:
+    """Seconds since an RFC 3339 creationTimestamp (None when it cannot be read)."""
+    import calendar
+    try:
+        return max(0.0, time.time() - calendar.timegm(time.strptime(created, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return None
+
+
 class Collector:
     """Gathers everything for the dashboard. `refresh()` does one round (the thread calls it every interval)."""
 
-    def __init__(self, kube: Kubectl, only: Optional[list] = None, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, kube: Kubectl, only: Optional[list] = None, clock: Callable[[], float] = time.monotonic, keep_hours: int = 0) -> None:
         self.kube = kube
         self.only = only
+        self.keep_hours = max(0, min(MAX_KEEP_HOURS, int(keep_hours or 0)))     # 0 = probe pods are removed when the program closes
+        self._probe_locks: dict = {}
+        self._starter: Optional[threading.Thread] = None
+        self._kept: set = set()                    # pod names that must survive stop() (the current pods of a keep-mode node)
+        self._life: dict = {}                      # node -> deadline (s) of its current pod
         self._clock = clock
         self.view = ClusterView()
         self.rid = PodNames.new().run_id
@@ -342,63 +365,219 @@ class Collector:
         self._watcher = None                       # reads the logs of the running tests (created on first use)
         self._lock = threading.RLock()
         self.status = "starting"
+        self._seq = 0                              # pod names are never reused (a replacement lives next to the old pod for a while)
+        self._created: list = []                   # every pod name this collector made (stop() removes them all)
+        self._born: dict = {}                      # node -> when its probe was made (monotonic clock)
+        self._fails: dict = {}                     # node -> failed rounds in a row
+        self._renewing: set = set()                # nodes whose probe is being replaced right now
+        self._retry_at: dict = {}                  # node -> earliest next replacement after a failed one
+        self._stopping = False
+        self._emit: Callable[[str], None] = lambda _t: None
 
     # --- probe pods (only while the dashboard is open) ---------------------------------------------------------------
-    def start(self, emit: Callable[[str], None] = lambda _t: None) -> None:
-        self._cleanup_leftovers()
+    def _names(self, with_gpu: bool) -> tuple:
+        with self._lock:
+            self._seq += 1
+            return f"dash-probe-{self.rid}-{self._seq}", (f"dash-gpu-{self.rid}-{self._seq}" if with_gpu else "")
+
+    def _provision(self, node: str, probe: str, gpu: str) -> bool:
+        """Makes the probe pod (and the GPU one) on the node and waits until they are Ready."""
+        keep = self._keeps(node)
+        life = self.keep_hours * 3600 if keep else POD_DEADLINE
+        with self._lock:
+            self._created += [x for x in (probe, gpu) if x]
+        try:
+            self.kube.apply_image_pod(lambda: dashboard_pod(node, probe, self.rid, life, keep), probe, "probe", log.warning, node=node)
+            if gpu:
+                self.kube.apply_image_pod(lambda: dashboard_gpu_pod(node, gpu, self.rid, life, keep), gpu, "tools", log.warning, node=node)
+            ok = bool(self.kube.wait_ready(probe, 90) and (not gpu or self.kube.wait_ready(gpu, 120)))
+        except KubectlError:
+            return False
+        with self._lock:
+            self._life[node] = life
+            view = self.nodes.get(node)
+            if view is not None:
+                view.probe_kept, view.probe_reused, view.probe_born, view.probe_life = keep, False, time.time(), life
+        return ok
+
+    def _keeps(self, node: str) -> bool:
+        """Keep mode never applies to the control plane (its probe is always removed when the program closes)."""
+        view = self.nodes.get(node)
+        return self.keep_hours > 0 and not (view is not None and view.master)
+
+    def _adopt(self, infos: dict) -> dict:
+        """Looks for probe pods left by an earlier run (label persist=1) that are Running, made by this version and have life left.
+        Returns {node: (probe, gpu)}; every other pod of the dashboard is deleted (the leftovers of a killed dashboard)."""
+        try:
+            items = self.kube.get_json("pods", "-l", f"app={DASHBOARD_LABEL}").get("items", [])
+        except (KubectlError, ValueError):
+            items = []
+        found: dict = {}
+        stale: list = []
+        for it in items:
+            meta, spec = it.get("metadata", {}), it.get("spec", {})
+            name, node = meta.get("name", ""), spec.get("nodeName", "")
+            role = (meta.get("labels") or {}).get("role", "")
+            if (meta.get("labels") or {}).get(KEEP_LABEL) != "1":
+                continue                                           # a temporary pod belongs to a dashboard that may be open right now: not ours to touch
+            info = infos.get(node)
+            age = _pod_age(meta.get("creationTimestamp", ""))
+            life = spec.get("activeDeadlineSeconds") or 0
+            good = (info is not None and info.ready and (meta.get("labels") or {}).get(KEEP_LABEL) == "1"
+                    and it.get("status", {}).get("phase") == "Running" and not meta.get("deletionTimestamp")
+                    and role in ("dashboard-probe", "dashboard-gpu") and age is not None and life - age >= MIN_KEEP_LEFT
+                    and (meta.get("annotations") or {}).get(SPEC_ANNOTATION) == expected_spec_hash(node, role == "dashboard-gpu")
+                    and not (info.is_control_plane))
+            if not good or found.get(node, {}).get(role):
+                stale.append(name)
+                continue
+            found.setdefault(node, {})[role] = (name, age, life)
+        pairs = {}
+        for node, roles in found.items():
+            probe = roles.get("dashboard-probe")
+            gpu = roles.get("dashboard-gpu")
+            if probe is None or (infos[node].gpu_count > 0) != (gpu is not None):          # an incomplete pair is not reused
+                stale += [r[0] for r in roles.values()]
+                continue
+            pairs[node] = (probe, gpu)
+        if stale:
+            self.kube.delete_pods(*stale)
+        return pairs
+
+    def start(self, emit: Callable[[str], None] = lambda _t: None, wait: bool = True) -> None:
+        """Makes a probe pod on every Ready node. wait=False returns at once (the screen opens with the data of the API and every node
+        gets its live values as soon as its probe is ready)."""
+        self._emit = emit
+        if wait:
+            self._start(emit, True)
+        else:                                          # even the look-up of the nodes and of the kept pods happens in the background
+            self._starter = threading.Thread(target=self._start, args=(emit, False), daemon=True)
+            self._starter.start()
+
+    def _start(self, emit: Callable[[str], None], wait: bool) -> None:
         names = [n for n in self.kube.list_node_names() if not self.only or n in self.only]
-        infos = {n: self.kube.get_node(n) for n in names}
+        infos: dict = {}
+        fetch = [threading.Thread(target=lambda n=n: infos.__setitem__(n, self.kube.get_node(n)), daemon=True) for n in names]
+        for t in fetch:
+            t.start()
+        for t in fetch:
+            t.join()
+        infos = {n: infos[n] for n in names if n in infos}
+        adopted = self._adopt(infos)
         threads = []
         for name, info in infos.items():
-            view = self.nodes.setdefault(name, NodeView(name))
+            if self._stopping:
+                return
+            with self._lock:
+                view = self.nodes.setdefault(name, NodeView(name))
             view.master, view.ready, view.gpu_alloc = info.is_control_plane, info.ready, info.gpu_count
             if not info.ready:
                 continue
-            probe, gpu = f"dash-probe-{self.rid}-{len(self.pods)}", ""
-            if info.gpu_count > 0:
-                gpu = f"dash-gpu-{self.rid}-{len(self.pods)}"
-            self.pods[name] = (probe, gpu)
+            if name in adopted:
+                (probe, _a, life), gpu_rec = adopted[name]
+                gpu = gpu_rec[0] if gpu_rec else ""
+                with self._lock:
+                    self._born[name] = self._clock() - _a
+                    self._life[name] = life
+                    self._kept |= {x for x in (probe, gpu) if x}
+                    self.pods[name] = (probe, gpu)
+                view.probe_ok, view.probe_kept, view.probe_reused = True, True, True
+                view.probe_born, view.probe_life = time.time() - _a, life
+                emit(f"♻️  {name}: probe reused (made {format_duration(_a)} ago)")
+                t = threading.Thread(target=self._safe_probe, args=(name,), daemon=True)      # the first sample: rates (CPU %) need two
+                t.start()
+                threads.append(t)
+                continue
+            probe, gpu = self._names(info.gpu_count > 0)
 
             def prepare(n=name, p=probe, g=gpu) -> None:
-                try:
-                    self.kube.apply_image_pod(lambda n=n, p=p: dashboard_pod(n, p, self.rid, POD_DEADLINE), p, "probe", log.warning, node=n)
-                    if g:
-                        self.kube.apply_image_pod(lambda n=n, g=g: dashboard_gpu_pod(n, g, self.rid, POD_DEADLINE), g, "tools", log.warning, node=n)
-                    ok = self.kube.wait_ready(p, 90) and (not g or self.kube.wait_ready(g, 120))
-                except KubectlError:
-                    ok = False
+                ok = self._provision(n, p, g)
+                with self._lock:
+                    self._born[n] = self._clock()
+                    if self._keeps(n):
+                        self._kept |= {x for x in (p, g) if x}
+                    self.pods[n] = (p, g)                      # only now: a round never probes a pod that is still being made
                 self.nodes[n].probe_ok = ok
                 emit(f"{'✅' if ok else '⚠️ '} {n}: {'probe ready' if ok else 'probe did not start (shown without live values)'}")
             t = threading.Thread(target=prepare, daemon=True)
             t.start()
             threads.append(t)
-        for t in threads:
-            t.join()
+        if wait:
+            for t in threads:
+                t.join()
 
     def _cleanup_leftovers(self) -> None:
-        self.kube.run("delete", "pod", "-l", "app=stress-test-dashboard", "--ignore-not-found", "--now", check=False, timeout=60)
+        """Deletes the temporary pods of THIS run (never those of another dashboard that is open at the same time, never a kept pod).
+        What a killed dashboard leaves behind ends by itself at its deadline (an hour); --cleanup-probes removes it at once."""
+        self.kube.run("delete", "pod", "-l", f"app={DASHBOARD_LABEL},run-id={self.rid},{KEEP_LABEL}!=1", "--ignore-not-found", "--now", check=False, timeout=60)
 
     def stop(self) -> None:
         """Removes every probe pod of this dashboard (also called from a signal handler / finally)."""
-        names = [n for pair in self.pods.values() for n in pair if n]
+        self._stopping = True
+        if self._starter is not None:
+            self._starter.join(timeout=30)             # it may be in the middle of making pods
+        names = sorted(({n for pair in self.pods.values() for n in pair if n} | set(self._created)) - self._kept)
         if names:
             self.kube.delete_pods(*names)
         self._cleanup_leftovers()
         self.pods.clear()
 
+    def _note_failure(self, name: str) -> None:
+        self._fails[name] = self._fails.get(name, 0) + 1
+        if self._fails[name] >= FAILS_TO_RENEW:
+            self._renew(name, "the probe does not answer")
+
+    def _renew(self, name: str, why: str) -> None:
+        """Replaces the probe of a node in the background: the new pod is made and Ready first, then the old one is removed."""
+        with self._lock:
+            if self._stopping or name in self._renewing or name not in self.pods or self._clock() < self._retry_at.get(name, 0.0):
+                return
+            self._renewing.add(name)
+        log.info("dashboard: replacing the probe of %s (%s)", name, why)
+
+        def work() -> None:
+            try:
+                old = self.pods.get(name, ("", ""))
+                probe, gpu = self._names(bool(old[1]))
+                if self._provision(name, probe, gpu) and not self._stopping:
+                    with self._lock:
+                        self.pods[name] = (probe, gpu)
+                        self._born[name], self._fails[name] = self._clock(), 0
+                    self.nodes[name].probe_ok = True
+                    with self._lock:
+                        self._kept -= set(old)
+                        if self._keeps(name):
+                            self._kept |= {x for x in (probe, gpu) if x}
+                    self.kube.delete_pods(*[x for x in old if x])
+                    self._emit(f"🔄 {name}: the probe was replaced ({why})")
+                else:
+                    self.kube.delete_pods(*[x for x in (probe, gpu) if x])
+                    self._retry_at[name] = self._clock() + RENEW_RETRY
+                    log.warning("dashboard: the new probe of %s did not start", name)
+            except Exception:                                          # noqa: BLE001 - the screen must go on
+                log.exception("dashboard: replacing the probe of %s failed", name)
+                self._retry_at[name] = self._clock() + RENEW_RETRY
+            finally:
+                self._renewing.discard(name)
+        threading.Thread(target=work, daemon=True).start()
+
     # --- one round -------------------------------------------------------------------------------------------------------
     def refresh(self) -> ClusterView:
         now = self._clock()
+        threads = []                                   # the slow API parts and the probes run side by side (the first round is as fast as the slowest)
         if now - self._k8s_at >= K8S_EVERY or not self._k8s_at:
-            self._guard(self._refresh_k8s, "nodes and pods")
+            threads.append(threading.Thread(target=self._guard, args=(self._refresh_k8s, "nodes and pods"), daemon=True))
             self._k8s_at = now
         if now - self._events_at >= EVENTS_EVERY or not self._events_at:
-            self._guard(self._refresh_events, "events")
+            threads.append(threading.Thread(target=self._guard, args=(self._refresh_events, "events"), daemon=True))
             self._events_at = now
         if now - self._tests_at >= 60 or not self._tests_at:
-            self._guard(self._refresh_tests, "last tests")
+            threads.append(threading.Thread(target=self._guard, args=(self._refresh_tests, "last tests"), daemon=True))
             self._tests_at = now
-        threads = [threading.Thread(target=self._safe_probe, args=(name,), daemon=True) for name in self.pods]
+        for name in list(self.pods):
+            if now - self._born.get(name, now) >= self._life.get(name, POD_DEADLINE) - RENEW_MARGIN:
+                self._renew(name, "its deadline is near")
+        threads += [threading.Thread(target=self._safe_probe, args=(name,), daemon=True) for name in list(self.pods)]
         for t in threads:
             t.start()
         for t in threads:
@@ -440,11 +619,16 @@ class Collector:
         except Exception:                                           # noqa: BLE001 - one node must not blank the others
             log.exception("dashboard probe of %s failed", name)
             self.nodes[name].probe_ok = False
+            self._note_failure(name)
 
     def _peers_env(self, name: str) -> str:
         return " ".join(f"{o.name}={o.ip}" for o in self.nodes.values() if o.name != name and o.ip and o.ready)
 
     def _probe(self, name: str) -> None:
+        with self._probe_locks.setdefault(name, threading.Lock()):         # one probe of a node at a time (the start-up sample and the first round)
+            self._probe_locked(name)
+
+    def _probe_locked(self, name: str) -> None:
         view = self.nodes[name]
         probe, gpu = self.pods[name]
         script = f'PEERS="{self._peers_env(name)}"\n' + PROBE_SCRIPT.rstrip().rsplit("exit 0", 1)[0] + EXTRA_SCRIPT
@@ -454,8 +638,10 @@ class Collector:
         except KubectlError as exc:
             log.warning("dashboard probe %s failed: %s", name, exc)
             view.probe_ok = False
+            self._note_failure(name)
             return
         view.probe_ok = True
+        self._fails[name] = 0
         data: ProbeData = parse_probe_output(text)
         extra = parse_extras(text)
         now = self._clock()                                       # after the exec: the rates are over the time the data really stand for
@@ -964,13 +1150,25 @@ def detail_rows(n: NodeView, on: bool, wide: bool = False) -> list:
     return rows
 
 
+def probe_row(n: NodeView, on: bool) -> list:
+    """How long the node's probe pod lives (kept: age and time left, temporary: removed on exit); nothing before the probe exists."""
+    if not n.probe_born:
+        return []
+    if not n.probe_kept:
+        return [_kv("probe", "temporary (removed when you leave)", on)]
+    left = max(0, n.probe_life - (time.time() - n.probe_born))
+    return [_kv("probe", f"kept · made {format_duration(round((time.time() - n.probe_born) / 60) * 60)} ago · "
+                         f"{format_duration(round(left / 60) * 60)} left" + (" · reused" if n.probe_reused else ""), on)]
+
+
 def pods_rows(n: NodeView, on: bool, limit: int) -> list:
     bad_first = sorted(n.pods, key=lambda p: (p["phase"] == "Running", -p["restarts"], p["ns"], p["name"]))
-    rows = []
-    for p in bad_first[:limit]:
+    rows = probe_row(n, on)
+    limit -= len(rows)
+    for p in bad_first[:max(0, limit)]:
         phase = ui.paint(p["phase"], ui.GREEN if p["phase"] == "Running" else ui.YELLOW, on)
         rows.append(f"{p['ns'][:14]:<14} {p['name'][:34]:<34} {phase:<{12 + (len(phase) - ui.visible_len(phase))}} ↻{p['restarts']}")
-    return rows or [ui.paint("no pods", ui.GREY, on)]
+    return rows if n.pods else [*rows, ui.paint("no pods", ui.GREY, on)]
 
 
 def events_rows(view: ClusterView, on: bool, limit: int, width: int) -> list:
@@ -1137,6 +1335,8 @@ def block_k8s(n: NodeView, on: bool) -> list:
 
 def block_pods(n: NodeView, on: bool, limit: int) -> list:
     rows = [_title(f"{n.name} · pods ({len(n.pods)})", on)]
+    rows += probe_row(n, on)
+    limit -= len(probe_row(n, on))
     ordered = sorted(n.pods, key=lambda p: (p["phase"] == "Running" and not p.get("reason", "").startswith(("CrashLoop", "ImagePull")),
                                             -p["restarts"], p["ns"], p["name"]))
     for p in ordered[:max(1, limit - 1)]:
@@ -1238,6 +1438,7 @@ def join_cols(left: list, right: list, left_w: int, right_w: int, on: bool) -> l
 
 @dataclass
 class UiState:
+    window_pick: list = field(default_factory=list)   # the kinds offered after key w (the next key chooses); [] = no question open
     selected: int = 0
     scroll: int = 0
     interval: float = 5
@@ -1326,7 +1527,8 @@ def _help_rows(on: bool) -> list:
             ("g", "graphs: the history of the selected node. Inside: [ ] window · ← → time · , . cursor · b Braille dots · a area · t save as text · s save CSV+JSON (in scr/graphs/) · x combined"),
             ("  x (in graphs)", "all lines in ONE chart, each scaled 0-100 % of its own range - to see what rises or falls at the same time (the numbers are in the legend)"),
             ("l", "pods of the selected node, Enter = the end of the log of the pod (read only)"),
-            ("e", "SCREEN: saves what you see as a text file to the folder scr/"), ("+ -", "refresh interval 0.5 · 1 · 2 · 5 · 10 · 30 s"),
+            ("e", "SCREEN: saves what you see as a text file to the folder scr/"), ("w", "WINDOW: this screen moves to a NEW terminal window (this terminal is free)"),
+            ("+ -", "refresh interval 0.5 · 1 · 2 · 5 · 10 · 30 s"),
             ("p", "pause"), ("r", "refresh now"), ("?", "this help"), ("q / Esc", "back (closes a page first)")]
     return rows
 
@@ -1393,8 +1595,8 @@ def render(view: ClusterView, state: UiState, columns: int, lines: int, on: bool
         head.append(ui.paint(status, ui.GREY, on))
     if view_line(state, on):
         head.append(view_line(state, on))
-    keys = ui.paint("↑↓ select  Tab detail  o sort  / filter  f show  v view  g graph  l logs  e screen  ? help  q back" if width >= 100 else
-                    "↑↓  Tab  o  /  f  v  g  l  e  ?  q" if t > 1 else "↑↓ Enter o / f v g l e ? q", ui.GREY, on)
+    keys = ui.paint("↑↓ select  Tab detail  o sort  / filter  f show  v view  g graph  l logs  e screen  w window  ? help  q back" if width >= 100 else
+                    "↑↓  Tab  o  /  f  v  g  l  e  w  ?  q" if t > 1 else "↑↓ Enter o / f v g l e w ? q", ui.GREY, on)
     if t == 1 and state.detail_page and nodes:                      # compact: the detail of the node instead of the table
         n = nodes[state.selected]
         tab = TABS[state.tab % len(TABS)]
@@ -1505,16 +1707,16 @@ def read_key(stream_fd: int, timeout: float) -> Optional[str]:
     text = data.decode("utf-8", "ignore")
     names = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left", "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
              "\x1b[H": "home", "\x1b[F": "end", "\x1b[1~": "home", "\x1b[4~": "end", "\x1bOH": "home", "\x1bOF": "end",
-             "\t": "tab", "\r": "enter", "\n": "enter", "\x1b": "esc", "\x03": "q"}
+             "\x1b[Z": "btab", "\t": "tab", "\r": "enter", "\n": "enter", "\x1b": "esc", "\x03": "q"}
     return names.get(text, text[:1])
 
 
 class Dashboard:
     """The live screen: a collector thread fills the data, the loop draws it and reacts to keys."""
 
-    def __init__(self, kube: Kubectl, only: Optional[list] = None, stream=None, keys: Optional[Callable] = None) -> None:
+    def __init__(self, kube: Kubectl, only: Optional[list] = None, stream=None, keys: Optional[Callable] = None, keep_hours: int = 0) -> None:
         self.kube = kube
-        self.collector = Collector(kube, only)
+        self.collector = Collector(kube, only, keep_hours=keep_hours)
         self.stream = stream or sys.stdout
         self.state = UiState()
         self.canvas = ui.Canvas(self.stream)
@@ -1545,6 +1747,42 @@ class Dashboard:
                     log.exception("dashboard refresh failed")
             self._wake.wait(max(0.05, self.state.interval - (time.monotonic() - started)))     # a round takes time: the interval is start to start
             self._wake.clear()
+
+    def window_argv(self) -> list:
+        """The command that shows this same screen in a new terminal window."""
+        argv = [sys.executable, "-m", "stress_test", "--dashboard"]
+        if self.collector.only:
+            argv += ["--nodes", ",".join(self.collector.only)]
+        if self.collector.keep_hours:
+            argv += ["--keep-probes", str(self.collector.keep_hours)]
+        return argv
+
+    def _open_window(self, kind: str) -> bool:
+        from . import notify
+        if notify.open_window(self.window_argv(), keep_open=False, kind=kind):
+            return True
+        self._say("❌ The window could not be opened. STRESS_TERMINAL=\"kitty\" chooses a terminal.", 8.0)
+        return False
+
+    def _w_key(self) -> bool:
+        """Key w: the screen goes to a new window. True = it did (the screen ends); a question shows when there is more than one way."""
+        from . import notify
+        plan = notify.plan_window()
+        if not plan["kinds"]:
+            self._say("❌ No window can be made here (not in tmux, no display, no known terminal). STRESS_TERMINAL=\"kitty\" chooses one.", 8.0)
+            return False
+        if plan["preset"]:
+            return self._open_window(plan["preset"])
+        self.state.window_pick = plan["kinds"]
+        return False
+
+    def _pick_key(self, key: str) -> bool:
+        """The key after the question of w: 1 2 3 chooses, anything else cancels. True = the screen moved to a window."""
+        from . import notify
+        kinds, self.state.window_pick = self.state.window_pick, []
+        self.status = ""
+        kind = notify.kind_of_key(key, kinds)
+        return bool(kind and self._open_window(kind))
 
     def _say(self, text: str, seconds: float = 6.0) -> None:
         self.status, self._status_until = text, time.monotonic() + seconds
@@ -1604,6 +1842,9 @@ class Dashboard:
         nodes = shown_nodes(self.collector.view, self.state)
         self._fetch_log(nodes)
         frame = render(self.collector.view, self.state, columns, lines, on, self.status)[:max(10, lines - 1)]
+        if self.state.window_pick:                                   # the question of key w replaces the screen until it is answered
+            from . import notify
+            frame = notify.pick_lines(self.state.window_pick, on, max(40, min(columns - 1, 100)))
         self._frame, self._frame_size = frame, (columns, lines)
         self.canvas.draw(frame)
 
@@ -1618,6 +1859,8 @@ class Dashboard:
         """Applies a key; False = leave the dashboard."""
         s = self.state
         nodes = shown_nodes(self.collector.view, s)
+        if s.window_pick:                                                 # the answer to "Open in: 1 … 2 … Esc"
+            return not self._pick_key(key)
         if s.typing:                                                      # the filter is being typed: every key is text
             if key == "enter":
                 s.typing = False
@@ -1632,6 +1875,8 @@ class Dashboard:
         if s.overlay:
             return self._overlay_key(key, nodes)
         key = key.lower() if len(key) == 1 else key                      # q Q, o O ...: both cases work
+        if key == "w":                                                    # the screen moves to a new window
+            return not self._w_key()
         name = nodes[s.selected].name if nodes and s.selected < len(nodes) else ""
 
         def keep_selected() -> None:                                       # after a sort / filter the same node stays selected
@@ -1773,8 +2018,9 @@ class Dashboard:
             signal.signal(signal.SIGWINCH, lambda *_a: resized.set())
         try:
             self.stream.write("\x1b[?25l")
-            ui.emit(f"{ui.ICON_STAGE} Starting the probes on the nodes (read-only, removed when you leave)…")
-            self.collector.start(lambda text: ui.emit("  " + text))
+            ui.emit(f"{ui.ICON_STAGE} Starting the probes on the nodes (read-only, "
+                    + (f"kept up to {self.collector.keep_hours} h after you leave; the master is always removed)…" if self.collector.keep_hours else "removed when you leave)…"))
+            self.collector.start(lambda text: self._say(text.strip(), 10.0), wait=False)       # the screen opens at once, the probes arrive one by one
             self._thread = threading.Thread(target=self._loop_data, daemon=True)
             self._thread.start()
             while True:
@@ -1793,7 +2039,7 @@ class Dashboard:
             self.stream.write("\x1b[?25h")
             self.canvas.reset()
             self.stream.flush()
-            ui.emit("\n🧹 Removing the probe pods…")
+            ui.emit("\n🧹 Removing the probe pods…" if not self.collector.keep_hours else "\n🧹 Leaving the probe pods running (./stress.sh --cleanup-probes removes them)…")
             self.collector.stop()
             if old is not None:
                 import termios
@@ -1801,9 +2047,40 @@ class Dashboard:
         return 0
 
 
-def run(only: Optional[list] = None) -> int:
+def run(only: Optional[list] = None, keep_hours: int = 0) -> int:
     """`--dashboard` / menu key D."""
     if not sys.stdout.isatty() or not sys.stdin.isatty():
         ui.emit("❌ The dashboard needs a terminal (stdin and stdout).")
         return 1
-    return Dashboard(Kubectl(), only).run()
+    return Dashboard(Kubectl(), only, keep_hours=keep_hours).run()
+
+
+def kept_probes(kube: Kubectl) -> list:
+    """The probe pods left by --keep-probes: [{name, node, role, age_s, left_s}] (read-only)."""
+    try:
+        items = kube.get_json("pods", "-l", f"app={DASHBOARD_LABEL},{KEEP_LABEL}=1").get("items", [])
+    except (KubectlError, ValueError):
+        return []
+    rows = []
+    for it in items:
+        meta, spec = it.get("metadata", {}), it.get("spec", {})
+        age = _pod_age(meta.get("creationTimestamp", ""))
+        life = spec.get("activeDeadlineSeconds") or 0
+        rows.append({"name": meta.get("name", ""), "node": spec.get("nodeName", ""),
+                     "role": (meta.get("labels") or {}).get("role", ""), "age_s": age or 0, "left_s": max(0, life - (age or 0))})
+    return sorted(rows, key=lambda r: (r["node"], r["role"]))
+
+
+def cleanup_probes(kube: Kubectl) -> int:
+    """`--cleanup-probes`: lists and deletes every probe pod of the dashboard (kept or not)."""
+    rows = kept_probes(kube)
+    if not rows:
+        ui.emit("✅ No kept probe pods in the cluster.")
+    else:
+        ui.emit(f"{ui.ICON_STAGE} Kept probe pods ({len(rows)}):")
+        for r in rows:
+            ui.emit(f"   {r['node']:<30} {r['role'].replace('dashboard-', ''):<6} made {format_duration(r['age_s'])} ago · {format_duration(r['left_s'])} left")
+        kube.delete_pods(*[r["name"] for r in rows])
+        ui.emit("🧹 Deleted.")
+    kube.run("delete", "pod", "-l", f"app={DASHBOARD_LABEL}", "--ignore-not-found", "--now", check=False, timeout=60)
+    return 0

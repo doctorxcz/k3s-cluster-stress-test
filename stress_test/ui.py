@@ -5,6 +5,7 @@ the same layout is printed as plain text.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -24,7 +25,14 @@ GREEN, YELLOW, RED, GREY, BOLD, CYAN = "38;5;79", "38;5;214", "38;5;203", "38;5;
 def color_enabled(is_tty: Optional[bool] = None) -> bool:
     if os.environ.get("NO_COLOR"):
         return False
+    if is_tty is None and os.environ.get("STRESS_FORCE_LIVE"):
+        is_tty = True                                           # detached with a viewer: colours are for the viewer's terminal
     return sys.stdout.isatty() if is_tty is None else is_tty
+
+
+def live_tty() -> bool:
+    """True on a terminal, and in a detached process whose output a viewer replays on a terminal."""
+    return sys.stdout.isatty() or bool(os.environ.get("STRESS_FORCE_LIVE"))
 
 
 def paint(text: str, code: str, on: bool) -> str:
@@ -200,12 +208,29 @@ def prompt_text(on: bool) -> str:
 
 
 # --- terminal width: three modes (compact / normal / wide) ----------------------------------------
+def view_size() -> Optional[tuple]:
+    """(columns, lines) of the terminal that WATCHES this process, when it runs detached with a viewer (the viewer keeps the size in a
+    small file up to date - the detached process has no terminal of its own); None otherwise."""
+    path = os.environ.get("STRESS_VIEW_SIZE_FILE")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            size = json.load(fh)
+        cols, lines = int(size["cols"]), int(size["lines"])
+        return (cols, lines) if cols > 0 and lines > 0 else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _env_cols() -> Optional[int]:
-    """STRESS_TEST_COLUMNS = a fixed number of columns (tests, pyte drivers); None when not set / not a number."""
+    """STRESS_TEST_COLUMNS = a fixed number of columns (tests, pyte drivers); None when not set / not a number.
+    A detached process with a viewer takes the width of the viewer's terminal."""
     raw = os.environ.get("STRESS_TEST_COLUMNS", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
-    return None
+    size = view_size()
+    return size[0] if size else None
 
 
 def term_cols(stream=None) -> Optional[int]:
@@ -235,6 +260,9 @@ def term_rows(stream=None) -> Optional[int]:
     raw = os.environ.get("STRESS_TEST_LINES", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
+    size = view_size()
+    if size:
+        return size[1]
     stream = stream or sys.stdout
     try:
         if stream.isatty():
@@ -555,24 +583,108 @@ def menu_box(version: str, status: list, sections: list, keys: list, on: bool, w
     return lines
 
 
+def split_question(text: str) -> tuple:
+    """"Run in the background? (survives closing the terminal)" -> ("Run in the background?", "survives closing the terminal");
+    a question without a closing explanation in brackets has no detail."""
+    text = " ".join(text.split())
+    if text.endswith(")") and " (" in text:
+        head, _, rest = text.partition(" (")
+        return head.strip(), rest[:-1].strip()
+    return text, ""
+
+
+def _question_frame(label: str, code: str, text: str, extra: list, on: bool, width: Optional[int] = None) -> list:
+    """The frame of every question: a coloured title in the top line, the question in bold, its explanation in grey, then `extra`
+    (the answers or the default and the range)."""
+    width = width or panel_width()
+    room = width - 4
+    head, detail = split_question(text)
+    top = paint("┏━━", GREY, on) + paint(label, BOLD + ";" + code, on) + paint("━" * max(1, width - 4 - visible_len(label)) + "┓", GREY, on)
+    rows = [_frame_row(paint(part, BOLD, on), on, width) for part in wrap(head, room)]
+    rows += [_frame_row(paint(part, GREY, on), on, width) for part in wrap(detail, room)] if detail else []
+    rows.append(_frame_row("", on, width))
+    rows += [_frame_row(item, on, width) for item in extra]
+    return [top, *rows, _rule("┗", "┛", on, width=width)]
+
+
+QUESTION_LABEL, WARNING_LABEL = " ❓ QUESTION ", " ▲ WARNING "
+
+
+def question(text: str, default_yes: bool, on: bool, width: Optional[int] = None, warning: bool = False) -> list:
+    """A yes/no question as a frame: the question in bold, its explanation in grey, then the two answers with the default
+    highlighted (a warning is red). The answer itself is typed on the prompt line below and confirmed with Enter."""
+    hint = paint("  ◀ default", GREEN, on)
+    yes = paint("y = yes", BOLD + ";" + GREEN, on) + hint if default_yes else paint("y = yes", GREY, on)
+    no = paint("n = no", BOLD + ";" + GREEN, on) + hint if not default_yes else paint("n = no", GREY, on)
+    return _question_frame(WARNING_LABEL if warning else QUESTION_LABEL, RED if warning else YELLOW, text,
+                           ["  " + yes + "      " + no, "  " + paint("✎ type y or n, then press Enter ⏎", GREY, on)], on, width)
+
+
+def input_question(text: str, default: Optional[str], on: bool, width: Optional[int] = None, hint: str = "",
+                   warning: bool = False) -> list:
+    """A question answered with a number, a time or a word: the question, its explanation, the default value (green) and an
+    optional hint (what is accepted). The answer is typed on the prompt line below."""
+    extra = []
+    if default not in (None, ""):
+        extra.append("  " + paint("default", GREY, on) + "  " + paint(str(default), BOLD + ";" + GREEN, on) + paint("   (Enter keeps it)", GREY, on))
+    if hint:
+        extra.append("  " + paint(hint, GREY, on))
+    extra.append("  " + paint("✎ type the answer, then press Enter ⏎", GREY, on))
+    return _question_frame(WARNING_LABEL if warning else QUESTION_LABEL, RED if warning else YELLOW, text, extra, on, width)
+
+
+def show_question(text: str, default_yes: bool, warning: bool = False) -> None:
+    on = color_enabled()
+    print("\n" + "\n".join(question(text, default_yes, on, warning=warning)))
+
+
+def show_input(text: str, default: Optional[str] = None, hint: str = "", warning: bool = False) -> None:
+    on = color_enabled()
+    print("\n" + "\n".join(input_question(text, default, on, hint=hint, warning=warning)))
+
+
+def answered_value(text: str, value: str) -> None:
+    """The line left on the screen after a question answered with a value."""
+    on = color_enabled()
+    print(f"{paint('✔', GREEN, on)} {split_question(text)[0]} {paint('→', GREY, on)} {paint(str(value), BOLD + ';' + GREEN, on)}")
+
+
+def answered(text: str, yes: bool) -> None:
+    """The line left on the screen after a yes/no question: what was asked and what was chosen."""
+    on = color_enabled()
+    head = split_question(text)[0]
+    print(f"{paint('✔', GREEN, on)} {head} {paint('→', GREY, on)} {paint('yes' if yes else 'no', BOLD + ';' + (GREEN if yes else YELLOW), on)}")
+
+
 def show_choices(title: str, entries: list, back: Optional[str] = None) -> None:
     on = color_enabled()
     print("\n" + "\n".join(panel(title, entries, on, back)))
 
 
-def prompt(label: str, default: Optional[str] = None) -> str:
-    """Text for input(): `stress@k3s:~$ label [default] ▸ ` (readline-safe escapes when coloured). When the question does
-    not fit one line of the terminal it is printed above, wrapped, and only the short prompt is left for input()."""
+KEY_BADGE, LINE_BADGE = "press a key", "type, then Enter ⏎"
+
+
+def prompt(label: str, default: Optional[str] = None, key: Optional[bool] = None) -> str:
+    """Text for input(): `stress@k3s:~$ label [default] · badge ▸ ` (readline-safe escapes when coloured). The badge says how the answer is
+    given: key=True "press a key" (no Enter), key=False "type, then Enter ⏎", None no badge. When the question does not fit one line of the
+    terminal it is printed above, wrapped, and only the short prompt is left for input(). An empty default shows no brackets."""
     on = color_enabled()
-    suffix = f" [{default}]" if default is not None else ""
+    shown = default not in (None, "")
+    suffix = f" [{default}]" if shown else ""
+    badge = "" if key is None else f" · {KEY_BADGE if key else LINE_BADGE}"
     c = term_cols()
-    if c is not None and visible_len(f"stress@k3s:~$ {label}{suffix} ▸ ") > c - 1:
-        for part in wrap(label, c - 1, "  ", "  "):
-            print(paint(part, GREY, on))
-        label = ""
-        if visible_len(f"stress@k3s:~$ {suffix.strip()} ▸ ") > c - 1:
-            suffix = f" [{fit(str(default), max(4, c - 24))}]"
-    text = f"{prompt_text(on)}{' ' + label if label else ''}{suffix} {paint('▸', GREY, on)} "
+    if c is not None and visible_len(f"stress@k3s:~$ {label}{suffix}{badge} ▸ ") > c - 1:
+        if visible_len(f"stress@k3s:~$ {label}{suffix} ▸ ") > c - 1:
+            for part in wrap(label, c - 1, "  ", "  "):
+                print(paint(part, GREY, on))
+            label = ""
+            if visible_len(f"stress@k3s:~$ {suffix.strip()}{badge} ▸ ") > c - 1:
+                suffix = f" [{fit(str(default), max(4, c - 24))}]" if shown else ""
+        if visible_len(f"stress@k3s:~$ {label}{suffix}{badge} ▸ ") > c - 1:
+            badge = " · key" if key else " · Enter ⏎" if key is not None else ""            # the short form on a narrow window
+        if visible_len(f"stress@k3s:~$ {label}{suffix}{badge} ▸ ") > c - 1:
+            badge = ""                                                                      # no room at all: the question matters more
+    text = f"{prompt_text(on)}{' ' + label if label else ''}{suffix}{paint(badge, GREY, on)} {paint('▸', GREY, on)} "
     return re.sub(r"(\x1b\[[0-9;]*m)", "\x01\\1\x02", text) if on else text
 
 
@@ -847,6 +959,9 @@ class Canvas:
         self._size = None
 
     def _term_size(self) -> tuple:
+        watched = view_size()
+        if watched:
+            return watched
         try:
             size = os.get_terminal_size(self.stream.fileno())
             return max(1, size.columns), max(1, size.lines)
@@ -861,9 +976,27 @@ class Canvas:
         else:
             move = f"\x1b[{len(self.widths)}A\x1b[J" if self.widths else ""
         self._size = size
+        if os.environ.get("STRESS_VIEWER"):                     # detached with a viewer: the hint is the last row of every live block
+            lines = [*lines, paint(fit("q  to the background  ·  w  new window  ·  Ctrl-C  stop it or keep it running", max(10, min(size[0] - 1, 100))), GREY, color_enabled())]
+            self._mark_frame()
         self.stream.write(move + "".join(f"\x1b[2K{line}\n" for line in lines))
         self.stream.flush()
         self.widths = [visible_len(line) for line in lines]
+
+    def _mark_frame(self) -> None:
+        """Remembers where in the output file the newest frame starts, so that a viewer that joins later can begin there."""
+        path = os.environ.get("STRESS_VIEW_FRAME_FILE")
+        if not path:
+            return
+        try:
+            self.stream.flush()
+            offset = os.lseek(self.stream.fileno(), 0, os.SEEK_CUR)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(str(offset))
+            os.replace(tmp, path)
+        except (OSError, ValueError, AttributeError):
+            pass
 
     def reset(self) -> None:
         """The block stays on the screen, the next one is written below it."""
@@ -904,6 +1037,8 @@ class LiveScreen:
 
     @staticmethod
     def wanted() -> bool:
+        if os.environ.get("STRESS_FORCE_LIVE") and not os.environ.get("STRESS_NO_LIVE"):
+            return True                                     # detached, its output is replayed on the screen of a viewer
         return sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb") \
             and not os.environ.get("STRESS_NO_LIVE")
 
